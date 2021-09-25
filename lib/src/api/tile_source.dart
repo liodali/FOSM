@@ -5,8 +5,10 @@ import 'package:dio/dio.dart';
 import '../common/utils.dart';
 
 Future<String> getTile(int z, int x, int y) async {
+  String url = "https://tile.openstreetmap.org/$z/$x/$y.png";
+  print(url);
   Response<Uint8List> response = await Dio().get(
-    "https://tile.openstreetmap.org/$z/$x/$y.png",
+    url,
     options: Options(
       responseType: ResponseType.bytes,
       validateStatus: (status) {

@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
-import 'package:fosm/src/api/geo_point.dart';
+import '../api/geo_point.dart';
+import '../common/utils.dart';
 
 import '../api/tile.dart';
 
-const tileWidth = 256;
-const tileHeight = 256;
+
 
 class RenderCanvasOSM extends CustomPainter {
   final int horizontalTileCount;

@@ -1,10 +1,8 @@
-import 'dart:ui' as ui;
-
 import 'package:flutter/material.dart';
 import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/tile_manager.dart';
 
 import '../api/tile.dart';
-import '../api/tile_source.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'render.dart';
@@ -22,7 +20,8 @@ class MapView extends StatefulWidget {
 
 class _MapViewState extends State<MapView> {
   List<Tile> tiles = [];
-  int maxSize = 38 * 1024 * 1024;
+
+  // int maxSize = 38 * 1024 * 1024;
   List<Tile> cacheTiles = [];
   late int horizontalTileCount;
   late int verticalTileCount;
@@ -41,12 +40,23 @@ class _MapViewState extends State<MapView> {
   late int zoom;
   bool isDrag = false;
   double? startPointXDrag, startPointYDrag, endPointXDrag, endPointYDrag;
+  TileManager? tileManager;
 
   @override
   void initState() {
     super.initState();
     latLng = widget.latLng;
     zoom = widget.zoom;
+    Future.delayed(Duration.zero, () async {
+      tileManager = TileManager.init(
+        width: width,
+        height: height,
+        centerLatLng: latLng,
+        zoom: zoom,
+      );
+      tileManager!.calculate((f) => setState(f));
+      setState(() {});
+    });
   }
 
   @override
@@ -54,11 +64,13 @@ class _MapViewState extends State<MapView> {
     super.didChangeDependencies();
     width = MediaQuery.of(context).size.width;
     height = MediaQuery.of(context).size.height;
-    centerCanvasX = width / 2;
-    centerCanvasY = height / 2;
-    centerTileLng = lon2TileX(latLng.longitude, zoom);
-    centerTileLat = lat2TileY(latLng.latitude, zoom);
-    drawMap(zoom, latLng);
+    // centerCanvasX = width / 2;
+    // centerCanvasY = height / 2;
+    // centerTileLng = lon2TileX(latLng.longitude, zoom);
+    // centerTileLat = lat2TileY(latLng.latitude, zoom);
+    // drawMap(
+    //   zoom,
+    // );
   }
 
   @override
@@ -83,15 +95,12 @@ class _MapViewState extends State<MapView> {
           endPointXDrag = details.globalPosition.dx;
           endPointYDrag = details.globalPosition.dy;
         });
-
-
       },
       onPanDown: (details) {
-        setState((){
+        setState(() {
           isDrag = true;
         });
       },
-
       onPanEnd: (details) {
         if (isDrag && startPointXDrag != null && startPointYDrag != null) {
           final lastPointerX = endPointXDrag!;
@@ -103,9 +112,9 @@ class _MapViewState extends State<MapView> {
           final pointerY = lastPointerY - startPointYDrag!;
 
           final pointerTileLongitudeNumber =
-              centerTileLng + -pointerX / tileWidth;
+              tileManager!.centerTileLng + -pointerX / tileWidth;
           final pointerTileLatitudeNumber =
-              centerTileLat + -pointerY / tileHeight;
+              tileManager!.centerTileLat + -pointerY / tileHeight;
 
           final lat = tileY2Lat(pointerTileLatitudeNumber, zoom);
           final lng = tileX2Lng(pointerTileLongitudeNumber, zoom);
@@ -114,9 +123,11 @@ class _MapViewState extends State<MapView> {
             endPointXDrag = null;
             endPointYDrag = null;
             latLng = LatLng(latitude: lat, longitude: lng);
-            centerTileLng = lon2TileX(latLng.longitude, zoom);
-            centerTileLat = lat2TileY(latLng.latitude, zoom);
-            drawMap(zoom, latLng);
+            tileManager!.setCenterTile(latLng: latLng);
+            tileManager!.calculate((f) => setState(f));
+            // centerTileLng = lon2TileX(latLng.longitude, zoom);
+            // centerTileLat = lat2TileY(latLng.latitude, zoom);
+            // drawMap(zoom);
           });
         }
 
@@ -126,28 +137,32 @@ class _MapViewState extends State<MapView> {
         //   endPointYDrag = null;
         // });
       },
-      child: CustomPaint(
-        child: Container(),
-        painter: RenderCanvasOSM(
-          horizontalTileCount: horizontalTileCount,
-          verticalTileCount: verticalTileCount,
-          leftColumnTilesLngIndex: leftColumnTilesLngIndex,
-          topRowTilesLatIndex: topRowTilesLatIndex,
-          leftColumnTilesCanvasX: leftColumnTilesCanvasX,
-          topRowTilesCanvasY: topRowTilesCanvasY,
-          tiles: tiles,
-          latLng: latLng,
-          zoom: zoom,
-        ),
-      ),
+      child: tileManager != null && tileManager!.renderTiles.isNotEmpty
+          ? CustomPaint(
+              child: Container(),
+              painter: RenderCanvasOSM(
+                horizontalTileCount: tileManager!.horizontalTileCount,
+                verticalTileCount: tileManager!.verticalTileCount,
+                leftColumnTilesLngIndex: tileManager!.leftColumnTilesLngIndex,
+                topRowTilesLatIndex: tileManager!.topRowTilesLatIndex,
+                leftColumnTilesCanvasX: tileManager!.leftColumnTilesCanvasX,
+                topRowTilesCanvasY: tileManager!.topRowTilesCanvasY,
+                tiles: tileManager!.renderTiles,
+                latLng: tileManager!.centerLatLng,
+                zoom: zoom,
+              ),
+            )
+          : Container(
+              width: width,
+              height: height,
+              color: Colors.grey,
+            ),
     );
   }
-
-  void drawMap(int zoom, LatLng latLng) {
+/*
+  void drawMap(int zoom) {
     setState(() {
-      Set<Tile> sets = tiles.toSet();
-      cacheTiles.addAll(sets.toList());
-      tiles.clear();
+
     });
     final centerPointTileX = (centerTileLng % 1) * tileWidth;
     final centerPointTileY = (centerTileLat % 1) * tileHeight;
@@ -177,12 +192,10 @@ class _MapViewState extends State<MapView> {
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileLatIndex = topRowTilesLatIndex + vIndex;
-
         // Draw a checker board pattern as a substrate for the tile while it is loading
         setState(() {
           for (var x = 0; x < tileWidth / 8; x++) {
             for (var y = 0; y < tileHeight / 8; y++) {
-              //canvas.fillStyle = x % 2 === 0 ^ y % 2 === 0 ? 'silver' : 'white';
               tiles.add(Tile(
                 null,
                 "$tileLngIndex-$tileLatIndex",
@@ -232,4 +245,6 @@ class _MapViewState extends State<MapView> {
       }
     }
   }
+
+ */
 }
