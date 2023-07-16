@@ -77,3 +77,4 @@ build/
 /example/ios/
 /example/linux/
 /example/web/
+.lock
