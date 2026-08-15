@@ -1,36 +1,33 @@
-import 'package:material_ui/material_ui.dart';
+import 'package:flutter/material.dart';
 import 'package:fosm/fosm.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initMap();
-  runApp(MyApp());
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  // This widget is the root of your application.
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Dart OSM Demo',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
-      ),
-      home: MyHomePage(),
+      title: 'FOSM Demo',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const MyHomePage(),
     );
   }
 }
 
 class MyHomePage extends StatelessWidget {
-  MyHomePage({
-    Key? key,
-  }) : super(key: key);
+  const MyHomePage({super.key});
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(),
-      body: MapView(
+      appBar: AppBar(title: const Text('FOSM Map')),
+      body: const MapView(
         latLng: LatLng(
           latitude: 47.4358055,
           longitude: 8.4737324,
