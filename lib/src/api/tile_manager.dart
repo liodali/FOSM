@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
-import 'dart:ui' show Size;
+import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
@@ -41,8 +41,9 @@ import 'tile_source.dart';
 ///   tile is no longer visible the image is still stored in the memory
 ///   cache for next time.
 class TileManager with CacheTiles {
-  static const int maxMemoryCachedTiles = 192;
+  static const int maxMemoryCachedTiles = 300;
   static const Duration failureBackoff = Duration(seconds: 5);
+  static const int defaultTilePadding = 2;
 
   /// Injectable tile fetcher. Defaults to [osmTileFetcher].
   final TileFetcher _fetcher;
@@ -84,6 +85,16 @@ class TileManager with CacheTiles {
   /// Tiles that failed recently; retried only after [failureBackoff].
   final Map<String, DateTime> _failedUntil = {};
 
+  // ── Padding & pre-loading ───────────────────────────────────────────
+  
+  /// Number of extra tiles to load beyond the visible viewport on each side.
+  /// This makes panning feel instant — tiles are already decoded in memory.
+  final int tilePadding;
+  
+  /// Whether to pre-load tiles at adjacent zoom levels (z±1).
+  /// This makes zooming in/out feel smooth.
+  final bool preloadAdjacentZoom;
+
   // ── Lifecycle ───────────────────────────────────────────────────────
   bool _disposed = false;
   int _revision = 0;
@@ -102,6 +113,8 @@ class TileManager with CacheTiles {
     required this.centerLatLng,
     required this.zoom,
     TileFetcher? fetcher,
+    this.tilePadding = defaultTilePadding,
+    this.preloadAdjacentZoom = true,
   }) : _fetcher = fetcher ?? osmTileFetcher {
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
@@ -161,6 +174,43 @@ class TileManager with CacheTiles {
     centerCanvasY = height / 2;
   }
 
+  /// Changes the zoom level and recalculates the grid.
+  /// The center geographic point is preserved.
+  void setZoom(int newZoom) {
+    if (newZoom == zoom) return;
+    zoom = newZoom;
+    setCenterTile(); // recompute centerTileLng/Lat at new zoom
+    calculate();
+  }
+
+  /// Changes the zoom level while keeping a specific screen point stationary.
+  /// Used during pinch-to-zoom so the geographic point under the fingers
+  /// stays under the fingers.
+  ///
+  /// [focalLocal] is the screen position (in local widget coordinates) that
+  /// should remain stationary. [oldZoom] is the zoom level before the change.
+  void setZoomWithFocalPoint(int newZoom, Offset focalLocal, int oldZoom) {
+    if (newZoom == zoom || newZoom == oldZoom) return;
+    
+    // Geographic point under the focal point at the old zoom
+    final focalTileLng = centerTileLng + (focalLocal.dx - centerCanvasX) / tileWidth;
+    final focalTileLat = centerTileLat + (focalLocal.dy - centerCanvasY) / tileHeight;
+    final focalLng = tileX2Lng(focalTileLng, oldZoom);
+    final focalLat = tileY2Lat(focalTileLat, oldZoom);
+    
+    // At the new zoom, where is this geographic point in tile coords?
+    final newFocalTileLng = lon2TileX(focalLng, newZoom);
+    final newFocalTileLat = lat2TileY(focalLat, newZoom);
+    
+    // New center: focal point stays at focalLocal on screen
+    final newCenterTileLng = newFocalTileLng - (focalLocal.dx - centerCanvasX) / tileWidth;
+    final newCenterTileLat = newFocalTileLat - (focalLocal.dy - centerCanvasY) / tileHeight;
+    
+    zoom = newZoom;
+    setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+    calculate();
+  }
+
   // ── Grid computation ────────────────────────────────────────────────
 
   /// Rebuilds the visible tile grid around the current center and
@@ -201,6 +251,25 @@ class TileManager with CacheTiles {
     verticalTileCount =
         ((height + -topRowTilesCanvasY) / tileHeight).ceil();
 
+    // Expand the grid by [tilePadding] tiles on each side for pre-loading.
+    // The painter will draw the expanded grid, but tiles outside the viewport
+    // are clipped by the canvas bounds. This makes panning feel instant.
+    final paddedHCount = horizontalTileCount + 2 * tilePadding;
+    final paddedVCount = verticalTileCount + 2 * tilePadding;
+    final paddedLeftLng = leftColumnTilesLngIndex - tilePadding;
+    final paddedTopLat = topRowTilesLatIndex - tilePadding;
+    final paddedLeftCanvasX = leftColumnTilesCanvasX - tilePadding * tileWidth;
+    final paddedTopCanvasY = topRowTilesCanvasY - tilePadding * tileHeight;
+
+    // Update the exported geometry to the padded grid.
+    // The painter uses these values, so it will draw the expanded grid.
+    horizontalTileCount = paddedHCount;
+    verticalTileCount = paddedVCount;
+    leftColumnTilesLngIndex = paddedLeftLng;
+    topRowTilesLatIndex = paddedTopLat;
+    leftColumnTilesCanvasX = paddedLeftCanvasX;
+    topRowTilesCanvasY = paddedTopCanvasY;
+
     _renderTiles.clear();
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
@@ -225,6 +294,11 @@ class TileManager with CacheTiles {
 
     _trimMemoryCache();
     _revision++;
+    
+    // Pre-load tiles at adjacent zoom levels (z±1) for smooth zooming.
+    if (preloadAdjacentZoom) {
+      _scheduleAdjacentZoomPreload();
+    }
   }
 
   // ── Async tile loading ──────────────────────────────────────────────
@@ -305,6 +379,115 @@ class TileManager with CacheTiles {
     _renderTiles[i] = tile;
     _revision++;
     onTilesChanged?.call();
+  }
+
+  // ── Adjacent zoom pre-loading ────────────────────────────────────────
+
+  /// Pre-loads tiles at z±1 for the visible area (not the padded area).
+  /// This makes zooming in/out feel smooth — tiles are already in cache.
+  void _scheduleAdjacentZoomPreload() {
+    // Only preload for the visible area (not the padded area).
+    // The visible area is the original grid before padding was applied.
+    final visibleLeftLng = leftColumnTilesLngIndex + tilePadding;
+    final visibleTopLat = topRowTilesLatIndex + tilePadding;
+    final visibleHCount = horizontalTileCount - 2 * tilePadding;
+    final visibleVCount = verticalTileCount - 2 * tilePadding;
+
+    for (final dz in [-1, 1]) {
+      final z = zoom + dz;
+      if (z < 0 || z > 19) continue; // OSM max zoom is typically 19
+
+      for (var h = 0; h < visibleHCount; h++) {
+        for (var v = 0; v < visibleVCount; v++) {
+          final lngIndex = visibleLeftLng + h;
+          final latIndex = visibleTopLat + v;
+
+          // Convert this tile's geographic extent to the other zoom level.
+          // A tile at (z, x, y) covers a geographic rectangle. At z±1, this
+          // rectangle maps to a different set of tiles.
+          final lng = tileX2Lng(lngIndex.toDouble(), zoom);
+          final lat = tileY2Lat(latIndex.toDouble(), zoom);
+          final otherLng = lon2TileX(lng, z).floor();
+          final otherLat = lat2TileY(lat, z).floor();
+
+          // Also include the adjacent tile at z+1 (since one tile at z
+          // maps to 4 tiles at z+1, we need to load all 4).
+          final otherKey = tileKey(z, otherLng, otherLat);
+          if (!_memoryCache.containsKey(otherKey) && !_inFlight.contains(otherKey)) {
+            _schedulePreload(otherKey, z, otherLng, otherLat);
+          }
+
+          // For z+1, also load the 3 adjacent tiles (2x2 block).
+          if (dz == 1) {
+            for (var dx = 0; dx <= 1; dx++) {
+              for (var dy = 0; dy <= 1; dy++) {
+                if (dx == 0 && dy == 0) continue; // already scheduled
+                final adjKey = tileKey(z, otherLng + dx, otherLat + dy);
+                if (!_memoryCache.containsKey(adjKey) && !_inFlight.contains(adjKey)) {
+                  _schedulePreload(adjKey, z, otherLng + dx, otherLat + dy);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /// Schedules a tile load that only populates the memory cache (not the
+  /// render list). Used for pre-loading adjacent zoom tiles.
+  void _schedulePreload(String key, int z, int x, int y) {
+    final n = 1 << z;
+    if (y < 0 || y >= n) return;
+    if (_inFlight.contains(key)) return;
+    final failedUntil = _failedUntil[key];
+    if (failedUntil != null && DateTime.now().isBefore(failedUntil)) return;
+
+    _inFlight.add(key);
+
+    if (hasStoredTile(key)) {
+      _preloadFromDisk(key);
+    } else {
+      _preloadFromNetwork(key, z, x, y);
+    }
+  }
+
+  Future<void> _preloadFromDisk(String key) async {
+    try {
+      final tile = await storedTile(key);
+      if (tile?.sourceTile != null) {
+        _completePreload(key, tile!);
+        return;
+      }
+      await deleteStoredTile(key);
+    } catch (_) {
+      try {
+        await deleteStoredTile(key);
+      } catch (_) {}
+    }
+    _inFlight.remove(key);
+  }
+
+  Future<void> _preloadFromNetwork(String key, int z, int x, int y) async {
+    try {
+      final bytes = await _fetcher(z, x, y);
+      final image = await Tile.decodeImage(bytes);
+      unawaited(storeTile(key, Tile(image, key, y, x), bytes));
+      _completePreload(key, Tile(image, key, y, x));
+    } catch (_) {
+      _inFlight.remove(key);
+      _failedUntil[key] = DateTime.now().add(failureBackoff);
+    }
+  }
+
+  void _completePreload(String key, Tile tile) {
+    _inFlight.remove(key);
+    if (_disposed || tile.sourceTile == null) return;
+
+    // Only store in memory cache — don't update render list.
+    _memoryCache.remove(key);
+    _memoryCache[key] = tile.sourceTile!;
+    _trimMemoryCache();
   }
 
   // ── Memory cache management ─────────────────────────────────────────
