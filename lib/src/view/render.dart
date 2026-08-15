@@ -1,9 +1,17 @@
-import 'package:material_ui/material_ui.dart';
-import '../api/geo_point.dart';
-import '../common/utils.dart';
+import 'package:flutter/material.dart';
 
 import '../api/tile.dart';
+import '../common/utils.dart';
 
+/// Paints the OSM tile grid onto a [CustomPaint] canvas.
+///
+/// Tiles with a loaded image are drawn directly; tiles still loading are
+/// drawn as a subtle checkerboard placeholder (matching the original JS
+/// implementation).
+///
+/// The [revision] counter (bumped by [TileManager] on every visible
+/// change) drives [shouldRepaint] — much cheaper than comparing image
+/// references one by one.
 class RenderCanvasOSM extends CustomPainter {
   final int horizontalTileCount;
   final int verticalTileCount;
@@ -12,9 +20,7 @@ class RenderCanvasOSM extends CustomPainter {
   final double leftColumnTilesCanvasX;
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
-
-  final LatLng latLng;
-  final int zoom;
+  final int revision;
 
   RenderCanvasOSM({
     required this.horizontalTileCount,
@@ -23,70 +29,101 @@ class RenderCanvasOSM extends CustomPainter {
     required this.topRowTilesLatIndex,
     required this.leftColumnTilesCanvasX,
     required this.topRowTilesCanvasY,
-    required this.latLng,
     required this.tiles,
-    required this.zoom,
+    required this.revision,
   });
+
+  static const Color _checkerLight = Color(0xFFF5F5F5);
+  static const Color _checkerDark = Color(0xFFDDDDDD);
+
+  static final Paint _imagePaint = Paint()
+    ..filterQuality = FilterQuality.medium;
+
+  static final Paint _checkerLightPaint = Paint()..color = _checkerLight;
+  static final Paint _checkerDarkPaint = Paint()..color = _checkerDark;
 
   @override
   void paint(Canvas canvas, Size size) {
-    Paint paint = Paint();
+    // Background fill so any sub-pixel gaps between tiles aren't black.
+    canvas.drawRect(Offset.zero & size, _checkerLightPaint);
+
+    const cell = 8.0;
+    final cellsPerTileX = tileWidth ~/ cell;
+    final cellsPerTileY = tileHeight ~/ cell;
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileCanvasX = leftColumnTilesCanvasX + hIndex * tileWidth;
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
+
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileCanvasY = topRowTilesCanvasY + vIndex * tileHeight;
         final tileLatIndex = topRowTilesLatIndex + vIndex;
-        final index = tiles.indexWhere(
-          (tile) =>
-              tile.latIndex == tileLatIndex && tile.lngIndex == tileLngIndex,
-        );
-        // Draw a checker board pattern as a substrate for the tile while it is loading
-        if ((index != -1 && tiles[index].sourceTile == null) || index == -1) {
-          for (var x = 0; x < tileWidth / 8; x++) {
-            for (var y = 0; y < tileHeight / 8; y++) {
-              //canvas.fillStyle = x % 2 === 0 ^ y % 2 === 0 ? 'silver' : 'white';
 
-              canvas.drawRect(
-                Rect.fromLTRB(tileCanvasX + x * 8, tileCanvasY + y * 8, 8, 8),
-                Paint()
-                  ..filterQuality = FilterQuality.medium
-                  ..color = Colors.grey[200]!,
-              );
-              // else if (index != -1 && tiles[index].sourceTile != null ) {
-              //   canvas.drawImage(tiles[index].sourceTile!,
-              //       Offset(tileCanvasX, tileCanvasY), paint);
-              //   canvas.restore();
-              //   canvas.drawRect(
-              //     Rect.fromLTRB(tileCanvasX + x * 8, tileCanvasY + y * 8, 8, 8),
-              //     Paint()
-              //       ..filterQuality = FilterQuality.medium
-              //       ..color = Colors.grey,
-              //   );
-            }
-          }
-        }
+        // tiles is row-major: h outer, v inner → index = h * verticalTileCount + v
+        final listIndex = hIndex * verticalTileCount + vIndex;
+        final tile =
+            (listIndex < tiles.length) ? tiles[listIndex] : null;
+        final image = tile?.sourceTile;
 
-        if (index != -1 && tiles[index].sourceTile != null) {
-          canvas.drawImage(tiles[index].sourceTile!,
-              Offset(tileCanvasX, tileCanvasY), paint);
-          //  canvas.restore();
+        if (image != null) {
+          canvas.drawImage(image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
+        } else {
+          // Checkerboard placeholder — alternating colors give a "loading"
+          // feel identical to the JS reference implementation.
+          _drawCheckerboard(
+            canvas,
+            tileCanvasX,
+            tileCanvasY,
+            tileLngIndex,
+            tileLatIndex,
+            cellsPerTileX,
+            cellsPerTileY,
+            cell,
+          );
         }
       }
     }
-    // canvas.drawImage(, Offset(0,0), paint);
+  }
+
+  void _drawCheckerboard(
+    Canvas canvas,
+    double originX,
+    double originY,
+    int lngIndex,
+    int latIndex,
+    int cellsX,
+    int cellsY,
+    double cell,
+  ) {
+    // Fill the whole tile with the light color first (halves draw calls).
+    canvas.drawRect(
+      Rect.fromLTWH(originX, originY, tileWidth.toDouble(), tileHeight.toDouble()),
+      _checkerLightPaint,
+    );
+
+    // Global cell coordinates so the pattern is stable across the world
+    // (doesn't "swim" relative to tiles during panning).
+    final baseColX = lngIndex * cellsX;
+    final baseColY = latIndex * cellsY;
+
+    for (var cx = 0; cx < cellsX; cx++) {
+      for (var cy = 0; cy < cellsY; cy++) {
+        final isDark = ((baseColX + cx) + (baseColY + cy)) % 2 == 0;
+        if (!isDark) continue;
+        canvas.drawRect(
+          Rect.fromLTWH(
+            originX + cx * cell,
+            originY + cy * cell,
+            cell,
+            cell,
+          ),
+          _checkerDarkPaint,
+        );
+      }
+    }
   }
 
   @override
-  bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) {
-    return oldDelegate.latLng != this.latLng ||
-        oldDelegate.zoom != zoom ||
-        tiles.isNotEmpty ||
-        oldDelegate.tiles.where((element) {
-          final index = tiles.indexWhere((tile) => tile.index == element.index);
-
-          return tiles[index].sourceTile != element.sourceTile;
-        }).isNotEmpty;
-  }
+  bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) =>
+      oldDelegate.revision != revision;
 }

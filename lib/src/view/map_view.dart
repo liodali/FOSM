@@ -1,259 +1,167 @@
-import 'package:material_ui/material_ui.dart';
-import 'package:fosm/src/api/geo_point.dart';
-import 'package:fosm/src/api/tile_manager.dart';
+import 'package:flutter/material.dart';
 
-import '../api/tile.dart';
-import '../common/osm_transformation_utilities.dart';
+import '../api/geo_point.dart';
+import '../api/tile_manager.dart';
+import '../api/tile_source.dart';
 import '../common/utils.dart';
 import 'render.dart';
 
+/// A native Flutter OSM map widget rendered entirely with [CustomPainter].
+///
+/// ### Usage
+/// ```dart
+/// MapView(
+///   latLng: LatLng(latitude: 47.4358, longitude: 8.4737),
+///   zoom: 7,
+/// )
+/// ```
+///
+/// Make sure to call [initMap] before using this widget (typically in
+/// `main()`) to initialize the Hive tile cache.
+///
+/// ### Gesture handling
+/// - **Pan / drag**: anchor-based — records the tile-space center at
+///   [onPanStart], then applies the total pixel delta on every update.
+///   This avoids the cumulative drift that an incremental lat↔lng
+///   round-trip produces.
+/// - The center is clamped to the Web Mercator valid range
+///   (±85.0511° latitude, ±180° longitude).
 class MapView extends StatefulWidget {
   final LatLng latLng;
   final int zoom;
 
-  const MapView({Key? key, required this.latLng, required this.zoom})
-      : super(key: key);
+  /// Optional custom tile fetcher. Defaults to [osmTileFetcher].
+  /// Useful for custom tile servers (Mapbox, Esri, etc.) or testing.
+  final TileFetcher? tileFetcher;
+
+  const MapView({
+    super.key,
+    required this.latLng,
+    required this.zoom,
+    this.tileFetcher,
+  });
 
   @override
-  State<StatefulWidget> createState() => _MapViewState();
+  State<MapView> createState() => _MapViewState();
 }
 
 class _MapViewState extends State<MapView> {
-  List<Tile> tiles = [];
+  TileManager? _tileManager;
 
-  // int maxSize = 38 * 1024 * 1024;
-  List<Tile> cacheTiles = [];
-  late int horizontalTileCount;
-  late int verticalTileCount;
-  late int leftColumnTilesLngIndex;
-  late int topRowTilesLatIndex;
-  late double leftColumnTilesCanvasX;
-  late double topRowTilesCanvasY;
-  late double centerTileLng;
-  late double centerTileLat;
-  late double centerCanvasX;
-  late double centerCanvasY;
-  late double width;
-  late double height;
-
-  late LatLng latLng;
-  late int zoom;
-  bool isDrag = false;
-  double? startPointXDrag, startPointYDrag, endPointXDrag, endPointYDrag;
-  TileManager? tileManager;
+  // ── Pan anchor ──────────────────────────────────────────────────────
+  Offset? _panStartLocal;
+  double? _panStartTileLng;
+  double? _panStartTileLat;
 
   @override
-  void initState() {
-    super.initState();
-    latLng = widget.latLng;
-    zoom = widget.zoom;
-    Future.delayed(Duration.zero, () async {
-      tileManager = TileManager.init(
-        width: width,
-        height: height,
-        centerLatLng: latLng,
-        zoom: zoom,
-      );
-      tileManager!.calculate((f) => setState(f));
+  void dispose() {
+    _tileManager?.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(MapView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.latLng != oldWidget.latLng) {
+      _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
-    });
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    width = MediaQuery.sizeOf(context).width;
-    height = MediaQuery.sizeOf(context).height;
-    // centerCanvasX = width / 2;
-    // centerCanvasY = height / 2;
-    // centerTileLng = lon2TileX(latLng.longitude, zoom);
-    // centerTileLat = lat2TileY(latLng.latitude, zoom);
-    // drawMap(
-    //   zoom,
-    // );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onPanStart: (details) {
-        setState(() {
-          isDrag = true;
-          startPointXDrag = details.globalPosition.dx;
-          startPointYDrag = details.globalPosition.dy;
-        });
-      },
-      onPanCancel: () {
-        setState(() {
-          isDrag = false;
-          endPointXDrag = null;
-          endPointYDrag = null;
-        });
-      },
-      onPanUpdate: (details) {
-        setState(() {
-          endPointXDrag = details.globalPosition.dx;
-          endPointYDrag = details.globalPosition.dy;
-        });
-        if (isDrag && startPointXDrag != null && startPointYDrag != null) {
-          final lastPointerX = endPointXDrag!;
-          //details.velocity.pixelsPerSecond.dx;
-          final lastPointerY = endPointYDrag!;
-          //details.velocity.pixelsPerSecond.dy;
-
-          final pointerX = lastPointerX - startPointXDrag!;
-          final pointerY = lastPointerY - startPointYDrag!;
-
-          final pointerTileLongitudeNumber =
-              tileManager!.centerTileLng + -pointerX / tileWidth;
-          final pointerTileLatitudeNumber =
-              tileManager!.centerTileLat + -pointerY / tileHeight;
-
-          final lat = tileY2Lat(pointerTileLatitudeNumber, zoom);
-          final lng = tileX2Lng(pointerTileLongitudeNumber, zoom);
-          debugPrint("lat:$lat,lng:$lng,zoom:$zoom");
-
-          setState(() {
-            isDrag = true;
-            startPointXDrag = endPointXDrag;
-            startPointYDrag = endPointYDrag;
-            latLng = LatLng(latitude: lat, longitude: lng);
-            tileManager!.setCenterTile(latLng: latLng);
-            tileManager!.calculate((f) => setState(f));
-            // centerTileLng = lon2TileX(latLng.longitude, zoom);
-            // centerTileLat = lat2TileY(latLng.latitude, zoom);
-            // drawMap(zoom);
-          });
-        }
-        debugPrint("dragX:$endPointXDrag,dragY:$endPointYDrag");
-      },
-      // onHorizontalDragUpdate: (details) {
-      //   setState(() {
-      //     isDrag = true;
-      //     endPointXDrag = details.globalPosition.dx;
-      //     endPointYDrag = details.globalPosition.dy;
-      //   });
-      // },
-      onPanDown: (details) {
-        setState(() {
-          isDrag = true;
-        });
-      },
-      onPanEnd: (details) {
-        setState(() {
-          isDrag = false;
-          endPointXDrag = null;
-          endPointYDrag = null;
-        });
-      },
-      child: tileManager != null && tileManager!.renderTiles.isNotEmpty
-          ? CustomPaint(
-              child: Container(),
-              painter: RenderCanvasOSM(
-                horizontalTileCount: tileManager!.horizontalTileCount,
-                verticalTileCount: tileManager!.verticalTileCount,
-                leftColumnTilesLngIndex: tileManager!.leftColumnTilesLngIndex,
-                topRowTilesLatIndex: tileManager!.topRowTilesLatIndex,
-                leftColumnTilesCanvasX: tileManager!.leftColumnTilesCanvasX,
-                topRowTilesCanvasY: tileManager!.topRowTilesCanvasY,
-                tiles: tileManager!.renderTiles,
-                latLng: tileManager!.centerLatLng,
-                zoom: zoom,
-              ),
-            )
-          : Container(
-              width: width,
-              height: height,
-              color: Colors.grey,
-            ),
-    );
-  }
-/*
-  void drawMap(int zoom) {
-    setState(() {
-
-    });
-    final centerPointTileX = (centerTileLng % 1) * tileWidth;
-    final centerPointTileY = (centerTileLat % 1) * tileHeight;
-
-    final centerCanvasTileX = centerCanvasX - centerPointTileX;
-    final centerCanvasTileY = centerCanvasY - centerPointTileY;
-
-    final leftColumnsBeforeCenterCount = (centerCanvasTileX / tileWidth).ceil();
-    leftColumnTilesCanvasX =
-        centerCanvasTileX - leftColumnsBeforeCenterCount * tileWidth;
-
-    final topRowsBeforeCenterCount = (centerCanvasTileY / tileHeight).ceil();
-    topRowTilesCanvasY =
-        centerCanvasTileY - topRowsBeforeCenterCount * tileHeight;
-
-    final centerTileLngIndex = centerTileLng.floor();
-    leftColumnTilesLngIndex = centerTileLngIndex - leftColumnsBeforeCenterCount;
-
-    final centerTileLatIndex = centerTileLat.floor();
-    topRowTilesLatIndex = centerTileLatIndex - topRowsBeforeCenterCount;
-
-    horizontalTileCount =
-        ((width + -leftColumnTilesCanvasX) / tileWidth).ceil();
-    verticalTileCount = ((height + -topRowTilesCanvasY) / tileHeight).ceil();
-
-    for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
-      final tileLngIndex = leftColumnTilesLngIndex + hIndex;
-      for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
-        final tileLatIndex = topRowTilesLatIndex + vIndex;
-        // Draw a checker board pattern as a substrate for the tile while it is loading
-        setState(() {
-          for (var x = 0; x < tileWidth / 8; x++) {
-            for (var y = 0; y < tileHeight / 8; y++) {
-              tiles.add(Tile(
-                null,
-                "$tileLngIndex-$tileLatIndex",
-                tileLatIndex,
-                tileLngIndex,
-              ));
-            }
-          }
-        });
-        Future.microtask(() async {
-          final index = tiles.indexWhere(
-              (element) => element.index == "$tileLngIndex-$tileLatIndex");
-          final indexOld = cacheTiles.indexWhere(
-              (element) => element.index == "$tileLngIndex-$tileLatIndex");
-          if (index == -1 && indexOld == -1) {
-            final imageTile = await getTile(zoom, tileLngIndex, tileLatIndex);
-            ui.Codec codec =
-                await ui.instantiateImageCodec(imageTile.toUint8List());
-            ui.FrameInfo fi = await codec.getNextFrame();
-            setState(() {
-              tiles.add(Tile(
-                fi.image,
-                "$tileLngIndex-$tileLatIndex",
-                tileLatIndex,
-                tileLngIndex,
-              ));
-            });
-          } else if (tiles[index].sourceTile == null && indexOld == -1) {
-            final imageTile = await getTile(zoom, tileLngIndex, tileLatIndex);
-            ui.Codec codec =
-                await ui.instantiateImageCodec(imageTile.toUint8List());
-            ui.FrameInfo fi = await codec.getNextFrame();
-            setState(() {
-              tiles[index] = Tile(
-                fi.image,
-                "$tileLngIndex-$tileLatIndex",
-                tileLatIndex,
-                tileLngIndex,
-              );
-            });
-          } else {
-            setState(() {
-              tiles[index] = cacheTiles[indexOld];
-            });
-          }
-        });
-      }
+    }
+    if (widget.zoom != oldWidget.zoom) {
+      // Zoom change invalidates all cached tile keys — rebuild the manager.
+      _tileManager?.dispose();
+      _tileManager = null;
     }
   }
 
- */
+  void _notify() {
+    if (mounted) setState(() {});
+  }
+
+  /// Lazily creates the [TileManager] with the real viewport size from
+  /// [LayoutBuilder]. Also handles viewport resizing (e.g. rotation).
+  TileManager _ensureManager(Size size) {
+    final existing = _tileManager;
+    if (existing != null) {
+      if (existing.width != size.width || existing.height != size.height) {
+        existing.resize(size);
+      }
+      return existing;
+    }
+    final manager = TileManager.init(
+      width: size.width,
+      height: size.height,
+      centerLatLng: widget.latLng,
+      zoom: widget.zoom,
+      fetcher: widget.tileFetcher,
+    );
+    manager.onTilesChanged = _notify;
+    _tileManager = manager;
+    return manager;
+  }
+
+  // ── Gesture handlers ────────────────────────────────────────────────
+
+  void _onPanStart(DragStartDetails details) {
+    final manager = _tileManager;
+    if (manager == null) return;
+    _panStartLocal = details.localPosition;
+    _panStartTileLng = manager.centerTileLng;
+    _panStartTileLat = manager.centerTileLat;
+  }
+
+  void _onPanUpdate(TileManager manager, DragUpdateDetails details) {
+    final start = _panStartLocal;
+    if (start == null) return;
+
+    final delta = details.localPosition - start;
+    final newTileLng = _panStartTileLng! - delta.dx / tileWidth;
+    final newTileLat = _panStartTileLat! - delta.dy / tileHeight;
+
+    manager.setCenterFromTileCoords(newTileLng, newTileLat);
+    setState(() {});
+  }
+
+  void _onPanCancel() {
+    _panStartLocal = null;
+  }
+
+  void _onPanEnd(DragEndDetails _) {
+    _panStartLocal = null;
+  }
+
+  // ── Build ───────────────────────────────────────────────────────────
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = Size(constraints.maxWidth, constraints.maxHeight);
+        final manager = _ensureManager(size);
+
+        // Rebuild the visible grid (cheap: integer math + cache hits).
+        manager.calculate();
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onPanStart: _onPanStart,
+          onPanUpdate: (d) => _onPanUpdate(manager, d),
+          onPanCancel: _onPanCancel,
+          onPanEnd: _onPanEnd,
+          child: CustomPaint(
+            size: size,
+            painter: RenderCanvasOSM(
+              horizontalTileCount: manager.horizontalTileCount,
+              verticalTileCount: manager.verticalTileCount,
+              leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
+              topRowTilesLatIndex: manager.topRowTilesLatIndex,
+              leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
+              topRowTilesCanvasY: manager.topRowTilesCanvasY,
+              tiles: manager.renderTiles,
+              revision: manager.revision,
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
