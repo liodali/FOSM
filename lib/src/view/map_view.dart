@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 
@@ -62,8 +62,8 @@ class _MapViewState extends State<MapView> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    width = MediaQuery.of(context).size.width;
-    height = MediaQuery.of(context).size.height;
+    width = MediaQuery.sizeOf(context).width;
+    height = MediaQuery.sizeOf(context).height;
     // centerCanvasX = width / 2;
     // centerCanvasY = height / 2;
     // centerTileLng = lon2TileX(latLng.longitude, zoom);
@@ -78,6 +78,7 @@ class _MapViewState extends State<MapView> {
     return GestureDetector(
       onPanStart: (details) {
         setState(() {
+          isDrag = true;
           startPointXDrag = details.globalPosition.dx;
           startPointYDrag = details.globalPosition.dy;
         });
@@ -91,17 +92,9 @@ class _MapViewState extends State<MapView> {
       },
       onPanUpdate: (details) {
         setState(() {
-          isDrag = true;
           endPointXDrag = details.globalPosition.dx;
           endPointYDrag = details.globalPosition.dy;
         });
-      },
-      onPanDown: (details) {
-        setState(() {
-          isDrag = true;
-        });
-      },
-      onPanEnd: (details) {
         if (isDrag && startPointXDrag != null && startPointYDrag != null) {
           final lastPointerX = endPointXDrag!;
           //details.velocity.pixelsPerSecond.dx;
@@ -118,10 +111,12 @@ class _MapViewState extends State<MapView> {
 
           final lat = tileY2Lat(pointerTileLatitudeNumber, zoom);
           final lng = tileX2Lng(pointerTileLongitudeNumber, zoom);
+          debugPrint("lat:$lat,lng:$lng,zoom:$zoom");
+
           setState(() {
-            isDrag = false;
-            endPointXDrag = null;
-            endPointYDrag = null;
+            isDrag = true;
+            startPointXDrag = endPointXDrag;
+            startPointYDrag = endPointYDrag;
             latLng = LatLng(latitude: lat, longitude: lng);
             tileManager!.setCenterTile(latLng: latLng);
             tileManager!.calculate((f) => setState(f));
@@ -130,12 +125,26 @@ class _MapViewState extends State<MapView> {
             // drawMap(zoom);
           });
         }
-
-        // setState((){
-        //   isDrag = false;
-        //   endPointXDrag = null;
-        //   endPointYDrag = null;
-        // });
+        debugPrint("dragX:$endPointXDrag,dragY:$endPointYDrag");
+      },
+      // onHorizontalDragUpdate: (details) {
+      //   setState(() {
+      //     isDrag = true;
+      //     endPointXDrag = details.globalPosition.dx;
+      //     endPointYDrag = details.globalPosition.dy;
+      //   });
+      // },
+      onPanDown: (details) {
+        setState(() {
+          isDrag = true;
+        });
+      },
+      onPanEnd: (details) {
+        setState(() {
+          isDrag = false;
+          endPointXDrag = null;
+          endPointYDrag = null;
+        });
       },
       child: tileManager != null && tileManager!.renderTiles.isNotEmpty
           ? CustomPaint(
