@@ -278,12 +278,23 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     if (manager == null) return;
 
     // Animation finished — snap to the target zoom level.
+    // The key insight: during the animation, we scaled the tiles visually.
+    // Now we need to switch to the actual new zoom level tiles, but ensure
+    // the same geographic area is visible.
+    
     final oldZoom = manager.zoom;
-    manager.setZoomWithFocalPoint(
-        _animTargetZoom, _visualScaleFocal, oldZoom);
-    _currentZoom = _animTargetZoom;
-    _visualScale = 1.0; // Reset scale
-    widget.onZoomChanged?.call(_animTargetZoom);
+    final newZoom = _animTargetZoom;
+    
+    // Calculate what geographic point is at the screen center
+    // This should remain constant throughout the zoom
+    final screenCenter = Offset(manager.centerCanvasX, manager.centerCanvasY);
+    
+    // Preserve the screen center geographic point
+    manager.setZoomWithFocalPoint(newZoom, screenCenter, oldZoom);
+    
+    _currentZoom = newZoom;
+    _visualScale = 1.0;
+    widget.onZoomChanged?.call(newZoom);
     setState(() {});
   }
 
