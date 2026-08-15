@@ -3,12 +3,48 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../api/geo_point.dart';
+import '../api/tile.dart';
 import '../api/tile_manager.dart';
 import '../api/tile_source.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'render.dart';
 import 'zoom_controls.dart';
+
+/// Captures a snapshot of the tile grid geometry and tiles for rendering
+/// an "old zoom" overlay during the crossfade animation.
+class _GridSnapshot {
+  final int horizontalTileCount;
+  final int verticalTileCount;
+  final int leftColumnTilesLngIndex;
+  final int topRowTilesLatIndex;
+  final double leftColumnTilesCanvasX;
+  final double topRowTilesCanvasY;
+  final List<Tile> tiles;
+  final int revision;
+
+  _GridSnapshot({
+    required this.horizontalTileCount,
+    required this.verticalTileCount,
+    required this.leftColumnTilesLngIndex,
+    required this.topRowTilesLatIndex,
+    required this.leftColumnTilesCanvasX,
+    required this.topRowTilesCanvasY,
+    required this.tiles,
+    required this.revision,
+  });
+
+  factory _GridSnapshot.from(TileManager m) => _GridSnapshot(
+        horizontalTileCount: m.horizontalTileCount,
+        verticalTileCount: m.verticalTileCount,
+        leftColumnTilesLngIndex: m.leftColumnTilesLngIndex,
+        topRowTilesLatIndex: m.topRowTilesLatIndex,
+        leftColumnTilesCanvasX: m.leftColumnTilesCanvasX,
+        topRowTilesCanvasY: m.topRowTilesCanvasY,
+        tiles: List<Tile>.from(m.renderTiles),
+        revision: m.revision,
+      );
+}
 
 /// A native Flutter OSM map widget rendered entirely with [CustomPainter].
 ///
@@ -26,56 +62,27 @@ import 'zoom_controls.dart';
 /// ### Gesture handling
 /// - **Pan / drag**: anchor-based — records the tile-space center at
 ///   [onScaleStart], then applies the total pixel delta on every update.
-///   This avoids the cumulative drift that an incremental lat↔lng
-///   round-trip produces.
 /// - **Pinch to zoom**: two-finger scale gesture changes the zoom level.
 ///   The geographic point under the focal point stays stationary.
-/// - **Double-tap**: zoom in one level with a smooth scale animation.
-/// - The center is clamped to the Web Mercator valid range
-///   (±85.0511° latitude, ±180° longitude).
+/// - **Double-tap**: zoom in one level with a smooth crossfade animation.
 ///
-/// ### Zoom animation
-/// When [animateZoom] is `true` (default), tapping the +/− buttons or
-/// double-tapping triggers a smooth visual zoom:
-/// - **Zoom in**: tiles scale from 1.0× → 2.0× (centered on focal point),
-///   then snap to the new zoom level at 1.0×. This creates the illusion of
-///   a continuous camera zoom, identical to Google Maps.
-/// - **Zoom out**: tiles scale from 1.0× → 0.5×, then snap to new zoom.
-/// Pinch-to-zoom is always instantaneous (continuous gesture).
+/// ### Zoom animation (Google Maps / Leaflet style)
+/// When [animateZoom] is `true` (default), tapping +/− or double-tapping
+/// triggers a **crossfade** between old and new zoom tiles:
+/// 1. Old tiles scale up (zoom in) or down (zoom out) while fading out
+/// 2. New tiles at the target zoom level are already rendered underneath
+///    at their native resolution, fading in
+/// 3. At the end, the old overlay is removed — seamless transition
 class MapView extends StatefulWidget {
   final LatLng latLng;
   final int zoom;
-
-  /// Minimum zoom level (default 1). OSM tiles are available from z=0.
   final int minZoom;
-
-  /// Maximum zoom level (default 19). OSM tiles are available up to z=19.
   final int maxZoom;
-
-  /// Optional custom tile fetcher. Defaults to [osmTileFetcher].
-  /// Useful for custom tile servers (Mapbox, Esri, etc.) or testing.
   final TileFetcher? tileFetcher;
-
-  /// Whether to show floating +/− zoom controls.
-  /// Defaults to `true`.
   final bool showZoomControls;
-
-  /// Called whenever the zoom level changes (via pinch, button, or
-  /// double-tap). The argument is the new zoom level.
   final ValueChanged<int>? onZoomChanged;
-
-  /// Position of the zoom controls overlay.
-  /// Defaults to [Alignment.bottomRight].
   final Alignment zoomControlsAlignment;
-
-  /// Whether to animate zoom transitions (button tap, double-tap) with a
-  /// smooth visual scale effect. Pinch-to-zoom is always smooth via the
-  /// continuous gesture.
-  /// Defaults to `true`.
   final bool animateZoom;
-
-  /// Duration of zoom animations.
-  /// Defaults to 300 milliseconds.
   final Duration zoomAnimationDuration;
 
   const MapView({
@@ -89,7 +96,7 @@ class MapView extends StatefulWidget {
     this.onZoomChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
     this.animateZoom = true,
-    this.zoomAnimationDuration = const Duration(milliseconds: 300),
+    this.zoomAnimationDuration = const Duration(milliseconds: 350),
   });
 
   @override
@@ -100,32 +107,24 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   TileManager? _tileManager;
   int _currentZoom = 0;
 
-  // ── Visual zoom animation ───────────────────────────────────────────
-  //
-  // During an animated zoom, we apply a Transform.scale to the canvas.
-  // This creates the illusion of a smooth camera zoom:
-  //
-  //   Zoom in (Z → Z+1):  scale 1.0 → 2.0, then snap to Z+1 at 1.0
-  //   Zoom out (Z → Z-1): scale 1.0 → 0.5, then snap to Z-1 at 1.0
-  //
-  // The scaled Z tiles look identical to the Z+1 tiles at the same
-  // geographic area, so the transition is seamless.
-
+  // ── Zoom animation ──────────────────────────────────────────────────
   late AnimationController _animController;
   Animation<double>? _scaleAnimation;
 
-  /// Current visual scale factor applied to the canvas. 1.0 = normal.
+  /// Visual scale applied to the OLD grid overlay during animation.
+  /// Zoom in: 1.0→2.0, Zoom out: 1.0→0.5.
   double _visualScale = 1.0;
 
-  /// The screen position (in local widget coordinates) that the scale
-  /// transform is anchored to. The geographic point under this position
-  /// stays stationary during the animation.
+  /// Focal point for the scale transform (in local widget coords).
   Offset _visualScaleFocal = Offset.zero;
 
-  /// The zoom level we're animating *toward*.
-  int _animTargetZoom = 0;
+  /// Snapshot of the OLD grid (before zoom change) rendered as an overlay
+  /// during the crossfade animation.
+  _GridSnapshot? _animOldSnapshot;
 
-  /// Whether an animation is currently in progress.
+  /// Whether we're zooming in (true) or out (false).
+  bool _animIsZoomIn = true;
+
   bool get _isAnimating => _animController.isAnimating;
 
   // ── Scale gesture state ─────────────────────────────────────────────
@@ -214,12 +213,10 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     if (newZoom == manager.zoom) return;
 
     if (!widget.animateZoom) {
-      // Instant zoom — no animation.
       _applyZoomInstantly(manager, newZoom, focalLocal);
       return;
     }
 
-    // Animated zoom: scale the canvas visually, then snap at the end.
     _startZoomAnimation(manager, newZoom, focalLocal);
   }
 
@@ -234,39 +231,56 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     setState(() {});
   }
 
-  // ── Animation lifecycle ─────────────────────────────────────────────
+  // ── Crossfade animation ─────────────────────────────────────────────
+  //
+  // Google Maps / Leaflet style zoom:
+  //
+  // 1. Snapshot the current (old) grid
+  // 2. Switch TileManager to the NEW zoom immediately
+  // 3. During animation:
+  //    - NEW tiles (TileManager's current state) rendered at 1.0× as background
+  //    - OLD tiles (snapshot) rendered with Transform.scale + opacity fade as overlay
+  // 4. At animation end: remove old overlay
+  //
+  // The old tiles scale up (zoom in: 1→2×) or down (zoom out: 1→0.5×)
+  // while fading out, revealing the crisp new tiles underneath.
 
   void _startZoomAnimation(
       TileManager manager, int targetZoom, Offset? focalLocal) {
     // Cancel any in-progress animation.
     _animController.stop();
+    _animOldSnapshot = null;
 
-    final isZoomIn = targetZoom > manager.zoom;
-    _animTargetZoom = targetZoom;
+    // 1. Ensure grid is up-to-date and snapshot the OLD grid.
+    manager.calculate();
+    _animOldSnapshot = _GridSnapshot.from(manager);
+    _animIsZoomIn = targetZoom > manager.zoom;
 
-    // Focal point: where the user tapped, or viewport center.
-    _visualScaleFocal =
+    // 2. Switch TileManager to the TARGET zoom immediately.
+    //    The new grid will be rendered as the background layer.
+    final focal =
         focalLocal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
+    _visualScaleFocal = focal;
+    manager.setZoomWithFocalPoint(targetZoom, focal, manager.zoom);
+    _currentZoom = targetZoom;
+    widget.onZoomChanged?.call(targetZoom);
 
-    // Scale animation:
-    //   Zoom in:  1.0 → 2.0  (tiles grow, then snap to Z+1 at 1.0)
-    //   Zoom out: 1.0 → 0.5  (tiles shrink, then snap to Z-1 at 1.0)
+    // 3. Set up the scale animation for the old grid overlay.
     _scaleAnimation = Tween<double>(
       begin: 1.0,
-      end: isZoomIn ? 2.0 : 0.5,
+      end: _animIsZoomIn ? 2.0 : 0.5,
     ).animate(CurvedAnimation(
       parent: _animController,
       curve: Curves.easeInOut,
     ));
 
+    _visualScale = 1.0;
     _animController.forward(from: 0.0);
   }
 
   void _onAnimTick() {
     if (!mounted) return;
-    final scale = _scaleAnimation?.value;
-    if (scale == null) return;
-    _visualScale = scale;
+    _visualScale = _scaleAnimation?.value ?? 1.0;
     setState(() {});
   }
 
@@ -274,27 +288,9 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     if (status != AnimationStatus.completed) return;
     if (!mounted) return;
 
-    final manager = _tileManager;
-    if (manager == null) return;
-
-    // Animation finished — snap to the target zoom level.
-    // The key insight: during the animation, we scaled the tiles visually.
-    // Now we need to switch to the actual new zoom level tiles, but ensure
-    // the same geographic area is visible.
-    
-    final oldZoom = manager.zoom;
-    final newZoom = _animTargetZoom;
-    
-    // Calculate what geographic point is at the screen center
-    // This should remain constant throughout the zoom
-    final screenCenter = Offset(manager.centerCanvasX, manager.centerCanvasY);
-    
-    // Preserve the screen center geographic point
-    manager.setZoomWithFocalPoint(newZoom, screenCenter, oldZoom);
-    
-    _currentZoom = newZoom;
+    // Animation done — remove old grid overlay.
+    _animOldSnapshot = null;
     _visualScale = 1.0;
-    widget.onZoomChanged?.call(newZoom);
     setState(() {});
   }
 
@@ -307,6 +303,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     // Cancel any ongoing zoom animation.
     if (_isAnimating) {
       _animController.stop();
+      _animOldSnapshot = null;
       _visualScale = 1.0;
     }
 
@@ -383,14 +380,25 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
         // Rebuild the visible grid (cheap: integer math + cache hits).
         manager.calculate();
 
-        // Compute the Transform alignment from the focal point.
-        // Transform.alignment is in the range [0,1] relative to the child size.
+        // During crossfade animation, render two layers.
+        final isCrossfade = _isAnimating && _animOldSnapshot != null;
+
+        // Compute scale alignment from focal point.
         final alignmentX =
             (size.width > 0) ? _visualScaleFocal.dx / size.width : 0.5;
         final alignmentY =
             (size.height > 0) ? _visualScaleFocal.dy / size.height : 0.5;
-        final scaleAlignment =
-            Alignment(alignmentX.clamp(0, 1), alignmentY.clamp(0, 1));
+        final scaleAlignment = Alignment(
+          alignmentX.clamp(0.0, 1.0),
+          alignmentY.clamp(0.0, 1.0),
+        );
+
+        // Compute crossfade progress (0→1) from the scale value.
+        final crossfadeProgress = isCrossfade
+            ? (_animIsZoomIn
+                ? (_visualScale - 1.0).clamp(0.0, 1.0)
+                : ((1.0 - _visualScale) / 0.5).clamp(0.0, 1.0))
+            : 0.0;
 
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
@@ -403,30 +411,61 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
           onDoubleTap: () => _zoomInAt(_doubleTapLocal),
           child: Stack(
             children: [
-              // Tile canvas — wrapped in Transform.scale during animation.
+              // ── NEW zoom tiles (background, always at 1.0×) ───────
               Positioned.fill(
-                child: Transform.scale(
-                  scale: _visualScale,
-                  alignment: scaleAlignment,
-                  child: CustomPaint(
-                    size: size,
-                    painter: RenderCanvasOSM(
-                      horizontalTileCount: manager.horizontalTileCount,
-                      verticalTileCount: manager.verticalTileCount,
-                      leftColumnTilesLngIndex:
-                          manager.leftColumnTilesLngIndex,
-                      topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                      leftColumnTilesCanvasX:
-                          manager.leftColumnTilesCanvasX,
-                      topRowTilesCanvasY: manager.topRowTilesCanvasY,
-                      tiles: manager.renderTiles,
-                      revision: manager.revision,
-                    ),
+                child: CustomPaint(
+                  size: size,
+                  painter: RenderCanvasOSM(
+                    horizontalTileCount: manager.horizontalTileCount,
+                    verticalTileCount: manager.verticalTileCount,
+                    leftColumnTilesLngIndex:
+                        manager.leftColumnTilesLngIndex,
+                    topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                    leftColumnTilesCanvasX:
+                        manager.leftColumnTilesCanvasX,
+                    topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                    tiles: manager.renderTiles,
+                    revision: manager.revision,
                   ),
                 ),
               ),
 
-              // Zoom controls overlay (not affected by the scale transform).
+              // ── OLD zoom tiles (overlay, scaled + fading out) ─────
+              if (isCrossfade)
+                Positioned.fill(
+                  child: Transform.scale(
+                    scale: _visualScale,
+                    alignment: scaleAlignment,
+                    child: Opacity(
+                      // Old tiles fade out as new tiles appear.
+                      // Use easeIn curve so old tiles stay visible longer
+                      // at the start, then fade quickly at the end.
+                      opacity: (1.0 - Curves.easeIn.transform(crossfadeProgress))
+                          .clamp(0.0, 1.0),
+                      child: CustomPaint(
+                        size: size,
+                        painter: RenderCanvasOSM(
+                          horizontalTileCount:
+                              _animOldSnapshot!.horizontalTileCount,
+                          verticalTileCount:
+                              _animOldSnapshot!.verticalTileCount,
+                          leftColumnTilesLngIndex:
+                              _animOldSnapshot!.leftColumnTilesLngIndex,
+                          topRowTilesLatIndex:
+                              _animOldSnapshot!.topRowTilesLatIndex,
+                          leftColumnTilesCanvasX:
+                              _animOldSnapshot!.leftColumnTilesCanvasX,
+                          topRowTilesCanvasY:
+                              _animOldSnapshot!.topRowTilesCanvasY,
+                          tiles: _animOldSnapshot!.tiles,
+                          revision: _animOldSnapshot!.revision,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+              // ── Zoom controls (not affected by scale) ────────────
               if (widget.showZoomControls)
                 Positioned.fill(
                   child: MapZoomControls(
