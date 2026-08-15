@@ -497,18 +497,18 @@ void main() {
         fetcher: trackingFetcher,
         tilePadding: 0,
         preloadAdjacentZoom: true,
+        preloadDebounce: Duration.zero,
       );
 
       manager.calculate();
-      await tester.runAsync(() async {
-        await Future<void>.delayed(const Duration(seconds: 1));
-      });
-      await tester.pump();
+
+      // Wait for all async operations to complete
+      await tester.pumpAndSettle();
 
       // Should have fetched tiles at z=5 (visible) and z=4, z=6 (adjacent).
-      expect(fetchedZooms.contains(5), isTrue);
-      expect(fetchedZooms.contains(4), isTrue);
-      expect(fetchedZooms.contains(6), isTrue);
+      expect(fetchedZooms.contains(5), isTrue, reason: 'Should fetch visible tiles at z=5');
+      expect(fetchedZooms.contains(4), isTrue, reason: 'Should preload z=4');
+      expect(fetchedZooms.contains(6), isTrue, reason: 'Should preload z=6');
 
       manager.dispose();
     });
@@ -528,6 +528,7 @@ void main() {
         fetcher: countingFetcher,
         tilePadding: 0,
         preloadAdjacentZoom: true,
+        preloadDebounce: Duration.zero,
       );
 
       manager.calculate();
