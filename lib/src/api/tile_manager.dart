@@ -10,9 +10,9 @@ import '../common/cache_tile_mixin.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'geo_point.dart';
-import 'preload_isolate.dart'
-    if (dart.library.io) 'preload_isolate_native.dart'
-    if (dart.library.js_interop) 'preload_isolate_web.dart';
+import '../isolate/preload_isolate.dart'
+    if (dart.library.io) '../isolate/preload_isolate_native.dart'
+    if (dart.library.js_interop) '../isolate/preload_isolate_web.dart';
 import 'tile.dart';
 import 'tile_source.dart';
 
