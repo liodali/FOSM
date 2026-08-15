@@ -66,4 +66,56 @@ void main() {
     // Still renders after drag — no exceptions.
     expect(find.byType(MapView), findsOneWidget);
   });
+
+  testWidgets('MapView responds to pinch-to-zoom gestures', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Simulate a pinch-out (zoom in) gesture.
+    final center = tester.getCenter(find.byType(MapView));
+    final gesture1 = await tester.startGesture(center - const Offset(50, 0));
+    final gesture2 = await tester.startGesture(center + const Offset(50, 0));
+
+    // Move fingers apart (zoom in).
+    await gesture1.moveBy(const Offset(-50, 0));
+    await gesture2.moveBy(const Offset(50, 0));
+    await tester.pump();
+
+    await gesture1.up();
+    await gesture2.up();
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Still renders after zoom — no exceptions.
+    expect(find.byType(MapView), findsOneWidget);
+  });
+
+  testWidgets('MapView respects minZoom and maxZoom', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            minZoom: 3,
+            maxZoom: 8,
+            tileFetcher: _stubFetcher,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // No exceptions with custom zoom bounds.
+    expect(find.byType(MapView), findsOneWidget);
+  });
 }

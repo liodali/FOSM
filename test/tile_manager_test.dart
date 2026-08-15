@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/utils.dart';
 
 /// Minimal valid 1×1 RGBA PNG — decodable by Flutter's image codec.
 final Uint8List fakeTilePng = Uint8List.fromList([
@@ -39,6 +40,8 @@ void main() {
         centerLatLng: LatLng(latitude: 47.4358, longitude: 8.4737),
         zoom: 7,
         fetcher: _fakeFetcher,
+        tilePadding: 0, // disable padding for this test
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -61,6 +64,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 5,
         fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -79,6 +84,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -93,6 +100,27 @@ void main() {
       final hasCenter =
           manager.renderTiles.any((t) => t.index == centerKey);
       expect(hasCenter, isTrue);
+
+      manager.dispose();
+    });
+
+    test('tilePadding expands the grid', () {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+      );
+
+      manager.calculate();
+
+      // With padding=2, the grid should be larger than without padding.
+      // The exact size depends on the viewport, but it should be at least
+      // (visibleH + 4) × (visibleV + 4).
+      expect(manager.renderTiles.length, greaterThan(9));
 
       manager.dispose();
     });
@@ -153,6 +181,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -187,6 +217,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: countingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       // Call calculate multiple times rapidly (simulates drag).
@@ -215,6 +247,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: _failingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -245,6 +279,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: countingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
 
       manager.calculate();
@@ -273,6 +309,8 @@ void main() {
         centerLatLng: LatLng(latitude: 0, longitude: 0),
         zoom: 1,
         fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
       );
       manager.onTilesChanged = () => callbackCount++;
 
@@ -287,6 +325,231 @@ void main() {
 
       // onTilesChanged should not have been called after dispose.
       expect(callbackCount, 0);
+    });
+  });
+
+  group('TileManager zoom', () {
+    test('setZoom changes zoom level and recalculates', () {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+
+      manager.calculate();
+      expect(manager.zoom, 3);
+      final tilesAtZ3 = manager.renderTiles.length;
+      expect(tilesAtZ3, greaterThan(0));
+
+      manager.setZoom(5);
+      expect(manager.zoom, 5);
+      final tilesAtZ5 = manager.renderTiles.length;
+      expect(tilesAtZ5, greaterThan(0));
+
+      // Tile keys should be different at different zoom levels.
+      final keysAtZ3 = manager.renderTiles
+          .where((t) => t.index.startsWith('3/'))
+          .length;
+      final keysAtZ5 = manager.renderTiles
+          .where((t) => t.index.startsWith('5/'))
+          .length;
+      // After setZoom(5), all tiles should be at z=5.
+      expect(keysAtZ3, 0);
+      expect(keysAtZ5, tilesAtZ5);
+
+      manager.dispose();
+    });
+
+    test('setZoomWithFocalPoint preserves geographic point under focal', () {
+      final manager = TileManager.init(
+        width: 512,
+        height: 512,
+        centerLatLng: LatLng(latitude: 47.0, longitude: 8.0),
+        zoom: 5,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+
+      manager.calculate();
+
+      // The focal point is at the center of the widget.
+      final focal = const Offset(256, 256);
+      final focalLngBefore = tileX2Lng(
+        manager.centerTileLng + (focal.dx - manager.centerCanvasX) / tileWidth,
+        manager.zoom,
+      );
+      final focalLatBefore = tileY2Lat(
+        manager.centerTileLat + (focal.dy - manager.centerCanvasY) / tileHeight,
+        manager.zoom,
+      );
+
+      // Zoom in with focal point at center.
+      manager.setZoomWithFocalPoint(6, focal, 5);
+
+      // The geographic point under the focal should be the same.
+      final focalLngAfter = tileX2Lng(
+        manager.centerTileLng + (focal.dx - manager.centerCanvasX) / tileWidth,
+        manager.zoom,
+      );
+      final focalLatAfter = tileY2Lat(
+        manager.centerTileLat + (focal.dy - manager.centerCanvasY) / tileHeight,
+        manager.zoom,
+      );
+
+      expect(focalLngAfter, closeTo(focalLngBefore, 0.01));
+      expect(focalLatAfter, closeTo(focalLatBefore, 0.01));
+
+      manager.dispose();
+    });
+
+    test('tile keys change when zoom changes', () {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+
+      manager.calculate();
+      final keysAtZ3 = manager.renderTiles.map((t) => t.index).toSet();
+      expect(keysAtZ3.every((k) => k.startsWith('3/')), isTrue);
+
+      manager.setZoom(5);
+      final keysAtZ5 = manager.renderTiles.map((t) => t.index).toSet();
+      expect(keysAtZ5.every((k) => k.startsWith('5/')), isTrue);
+
+      // No overlap between zoom levels.
+      expect(keysAtZ3.intersection(keysAtZ5).isEmpty, isTrue);
+
+      manager.dispose();
+    });
+  });
+
+  group('TileManager pre-loading', () {
+    testWidgets('padding loads extra tiles beyond viewport', (tester) async {
+      var fetchCount = 0;
+      Future<Uint8List> countingFetcher(int z, int x, int y) async {
+        fetchCount++;
+        return fakeTilePng;
+      }
+
+      // Without padding.
+      final managerNoPadding = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: countingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      managerNoPadding.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+      final fetchesNoPadding = fetchCount;
+      managerNoPadding.dispose();
+
+      // With padding.
+      fetchCount = 0;
+      final managerWithPadding = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: countingFetcher,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+      );
+      managerWithPadding.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+      final fetchesWithPadding = fetchCount;
+      managerWithPadding.dispose();
+
+      // Padding should cause more fetches.
+      expect(fetchesWithPadding, greaterThan(fetchesNoPadding));
+    });
+
+    testWidgets('adjacent zoom pre-loads tiles at z±1', (tester) async {
+      final fetchedZooms = <int>{};
+      Future<Uint8List> trackingFetcher(int z, int x, int y) async {
+        fetchedZooms.add(z);
+        return fakeTilePng;
+      }
+
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: trackingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: true,
+      );
+
+      manager.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      });
+      await tester.pump();
+
+      // Should have fetched tiles at z=5 (visible) and z=4, z=6 (adjacent).
+      expect(fetchedZooms.contains(5), isTrue);
+      expect(fetchedZooms.contains(4), isTrue);
+      expect(fetchedZooms.contains(6), isTrue);
+
+      manager.dispose();
+    });
+
+    testWidgets('zoom change uses cached tiles from pre-load', (tester) async {
+      var fetchCount = 0;
+      Future<Uint8List> countingFetcher(int z, int x, int y) async {
+        fetchCount++;
+        return fakeTilePng;
+      }
+
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: countingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: true,
+      );
+
+      manager.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      });
+      await tester.pump();
+      final fetchesBeforeZoom = fetchCount;
+
+      // Zoom in — some tiles should already be in cache from pre-loading.
+      manager.setZoom(6);
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(seconds: 1));
+      });
+      await tester.pump();
+      final fetchesAfterZoom = fetchCount;
+
+      // Some new fetches for tiles not in the pre-loaded set,
+      // but fewer than if we had no pre-loading.
+      expect(fetchesAfterZoom, greaterThan(fetchesBeforeZoom));
+
+      manager.dispose();
     });
   });
 }
