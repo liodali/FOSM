@@ -1,8 +1,11 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../api/geo_point.dart';
 import '../api/tile_manager.dart';
 import '../api/tile_source.dart';
+import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'render.dart';
 
@@ -21,14 +24,22 @@ import 'render.dart';
 ///
 /// ### Gesture handling
 /// - **Pan / drag**: anchor-based — records the tile-space center at
-///   [onPanStart], then applies the total pixel delta on every update.
+///   [onScaleStart], then applies the total pixel delta on every update.
 ///   This avoids the cumulative drift that an incremental lat↔lng
 ///   round-trip produces.
+/// - **Pinch to zoom**: two-finger scale gesture changes the zoom level.
+///   The geographic point under the focal point stays stationary.
 /// - The center is clamped to the Web Mercator valid range
 ///   (±85.0511° latitude, ±180° longitude).
 class MapView extends StatefulWidget {
   final LatLng latLng;
   final int zoom;
+  
+  /// Minimum zoom level (default 1). OSM tiles are available from z=0.
+  final int minZoom;
+  
+  /// Maximum zoom level (default 19). OSM tiles are available up to z=19.
+  final int maxZoom;
 
   /// Optional custom tile fetcher. Defaults to [osmTileFetcher].
   /// Useful for custom tile servers (Mapbox, Esri, etc.) or testing.
@@ -38,6 +49,8 @@ class MapView extends StatefulWidget {
     super.key,
     required this.latLng,
     required this.zoom,
+    this.minZoom = 1,
+    this.maxZoom = 19,
     this.tileFetcher,
   });
 
@@ -47,11 +60,19 @@ class MapView extends StatefulWidget {
 
 class _MapViewState extends State<MapView> {
   TileManager? _tileManager;
+  int _currentZoom = 0; // initialized in initState
 
-  // ── Pan anchor ──────────────────────────────────────────────────────
-  Offset? _panStartLocal;
-  double? _panStartTileLng;
-  double? _panStartTileLat;
+  // ── Scale gesture state ─────────────────────────────────────────────
+  double? _scaleStartTileLng;
+  double? _scaleStartTileLat;
+  int? _scaleStartZoom;
+  Offset? _scaleStartFocal;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentZoom = widget.zoom;
+  }
 
   @override
   void dispose() {
@@ -66,10 +87,11 @@ class _MapViewState extends State<MapView> {
       _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
     }
-    if (widget.zoom != oldWidget.zoom) {
-      // Zoom change invalidates all cached tile keys — rebuild the manager.
-      _tileManager?.dispose();
-      _tileManager = null;
+    if (widget.zoom != oldWidget.zoom && widget.zoom != _currentZoom) {
+      // External zoom change (e.g. from a zoom button)
+      _tileManager?.setZoom(widget.zoom);
+      _currentZoom = widget.zoom;
+      setState(() {});
     }
   }
 
@@ -99,34 +121,68 @@ class _MapViewState extends State<MapView> {
     return manager;
   }
 
-  // ── Gesture handlers ────────────────────────────────────────────────
+  // ── Scale gesture handlers (pan + pinch-to-zoom) ────────────────────
 
-  void _onPanStart(DragStartDetails details) {
+  void _onScaleStart(ScaleStartDetails details) {
     final manager = _tileManager;
     if (manager == null) return;
-    _panStartLocal = details.localPosition;
-    _panStartTileLng = manager.centerTileLng;
-    _panStartTileLat = manager.centerTileLat;
+    _scaleStartTileLng = manager.centerTileLng;
+    _scaleStartTileLat = manager.centerTileLat;
+    _scaleStartZoom = manager.zoom;
+    _scaleStartFocal = details.localFocalPoint;
   }
 
-  void _onPanUpdate(TileManager manager, DragUpdateDetails details) {
-    final start = _panStartLocal;
-    if (start == null) return;
+  void _onScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
+    final startZoom = _scaleStartZoom;
+    final startTileLng = _scaleStartTileLng;
+    final startTileLat = _scaleStartTileLat;
+    if (startZoom == null || startTileLng == null || startTileLat == null) return;
 
-    final delta = details.localPosition - start;
-    final newTileLng = _panStartTileLng! - delta.dx / tileWidth;
-    final newTileLat = _panStartTileLat! - delta.dy / tileHeight;
+    // Compute new zoom from scale factor.
+    // Tile zoom is logarithmic: scale 2.0 = zoom + 1, scale 0.5 = zoom - 1.
+    final scale = details.scale;
+    final zoomDelta = (scale > 0) ? (math.log(scale) / math.log(2)) : 0.0;
+    final newZoom = (startZoom + zoomDelta).round().clamp(widget.minZoom, widget.maxZoom);
 
-    manager.setCenterFromTileCoords(newTileLng, newTileLat);
+    // Current focal point in local coords.
+    final focalLocal = details.localFocalPoint;
+
+    if (newZoom != manager.zoom) {
+      // Zoom changed — use focal-point-preserving zoom.
+      // Geographic point under the focal at start zoom.
+      final focalTileLng = startTileLng + (_scaleStartFocal!.dx - manager.centerCanvasX) / tileWidth;
+      final focalTileLat = startTileLat + (_scaleStartFocal!.dy - manager.centerCanvasY) / tileHeight;
+      final focalLng = tileX2Lng(focalTileLng, startZoom);
+      final focalLat = tileY2Lat(focalTileLat, startZoom);
+
+      // At the new zoom, where is this geographic point in tile coords?
+      final newFocalTileLng = lon2TileX(focalLng, newZoom);
+      final newFocalTileLat = lat2TileY(focalLat, newZoom);
+
+      // New center: focal point stays at current focalLocal on screen.
+      final newCenterTileLng = newFocalTileLng - (focalLocal.dx - manager.centerCanvasX) / tileWidth;
+      final newCenterTileLat = newFocalTileLat - (focalLocal.dy - manager.centerCanvasY) / tileHeight;
+
+      manager.zoom = newZoom;
+      _currentZoom = newZoom;
+      manager.setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+    } else {
+      // No zoom change — pure pan.
+      // Compute pan delta from the start focal point.
+      final delta = focalLocal - _scaleStartFocal!;
+      final newTileLng = startTileLng - delta.dx / tileWidth;
+      final newTileLat = startTileLat - delta.dy / tileHeight;
+      manager.setCenterFromTileCoords(newTileLng, newTileLat);
+    }
+
     setState(() {});
   }
 
-  void _onPanCancel() {
-    _panStartLocal = null;
-  }
-
-  void _onPanEnd(DragEndDetails _) {
-    _panStartLocal = null;
+  void _onScaleEnd(ScaleEndDetails details) {
+    _scaleStartTileLng = null;
+    _scaleStartTileLat = null;
+    _scaleStartZoom = null;
+    _scaleStartFocal = null;
   }
 
   // ── Build ───────────────────────────────────────────────────────────
@@ -143,10 +199,9 @@ class _MapViewState extends State<MapView> {
 
         return GestureDetector(
           behavior: HitTestBehavior.opaque,
-          onPanStart: _onPanStart,
-          onPanUpdate: (d) => _onPanUpdate(manager, d),
-          onPanCancel: _onPanCancel,
-          onPanEnd: _onPanEnd,
+          onScaleStart: _onScaleStart,
+          onScaleUpdate: (d) => _onScaleUpdate(manager, d),
+          onScaleEnd: _onScaleEnd,
           child: CustomPaint(
             size: size,
             painter: RenderCanvasOSM(
