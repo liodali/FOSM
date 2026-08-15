@@ -1,7 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:io';
-import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
@@ -12,117 +10,11 @@ import '../common/cache_tile_mixin.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'geo_point.dart';
+import 'preload_isolate.dart'
+    if (dart.library.io) 'preload_isolate_native.dart'
+    if (dart.library.js_interop) 'preload_isolate_web.dart';
 import 'tile.dart';
 import 'tile_source.dart';
-
-// ─── Pre-load isolate ────────────────────────────────────────────────────────
-
-/// Manages a long-lived background isolate dedicated to pre-loading tiles.
-///
-/// The isolate owns its own [HttpClient] so TCP connections are reused across
-/// hundreds of tile requests — much cheaper than spawning a fresh isolate per
-/// tile via [compute].
-///
-/// Protocol (main → isolate):  `[SendPort replyPort, int z, int x, int y]`
-/// Protocol (isolate → main):  `Uint8List` on success, `String` on error.
-class _PreloadIsolate {
-  Isolate? _isolate;
-  SendPort? _sendPort;
-  final ReceivePort _receivePort = ReceivePort();
-  bool _ready = false;
-
-  bool get isReady => _ready;
-
-  /// Spawns the background isolate and waits for the handshake.
-  Future<void> spawn() async {
-    if (_ready) return;
-
-    final completer = Completer<SendPort>();
-    _receivePort.listen((message) {
-      if (message is SendPort) {
-        _sendPort = message;
-        _ready = true;
-        if (!completer.isCompleted) completer.complete(message);
-      }
-    });
-
-    await Isolate.spawn(_entryPoint, _receivePort.sendPort);
-    await completer.future;
-  }
-
-  /// Sends a fetch command and returns the raw PNG bytes.
-  /// Throws a [String] error message on failure.
-  Future<Uint8List> fetch(int z, int x, int y) {
-    final responsePort = ReceivePort();
-    _sendPort!.send([responsePort.sendPort, z, x, y]);
-    return responsePort.first.then((response) {
-      responsePort.close();
-      if (response is Uint8List) return response;
-      throw response is String ? response : 'Unknown error';
-    });
-  }
-
-  /// Kills the isolate and cleans up ports.
-  void dispose() {
-    _ready = false;
-    _isolate?.kill(priority: Isolate.immediate);
-    _isolate = null;
-    _receivePort.close();
-    _sendPort = null;
-  }
-
-  // ── Isolate entry point (runs on the background thread) ─────────────
-
-  static void _entryPoint(SendPort mainSendPort) {
-    final receivePort = ReceivePort();
-    mainSendPort.send(receivePort.sendPort);
-
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 10);
-
-    receivePort.listen((message) async {
-      final parts = message as List;
-      final replyPort = parts[0] as SendPort;
-      final z = parts[1] as int;
-      final x = parts[2] as int;
-      final y = parts[3] as int;
-
-      try {
-        replyPort.send(await _fetchOsmTile(client, z, x, y));
-      } catch (e) {
-        replyPort.send(e.toString());
-      }
-    });
-  }
-
-  /// Fetches a tile from OpenStreetMap using the isolate's persistent
-  /// [HttpClient] (keeps TCP connections alive across requests).
-  static Future<Uint8List> _fetchOsmTile(
-      HttpClient client, int z, int x, int y) async {
-    final n = 1 << z;
-    final wrappedX = ((x % n) + n) % n;
-    final uri = Uri.parse(
-        'https://tile.openstreetmap.org/$z/$wrappedX/$y.png');
-
-    final request = await client.getUrl(uri);
-    request.headers.set('User-Agent',
-        'fosm/0.0.1 (Flutter OSM map; +https://github.com/fosm)');
-    request.headers.set('Accept', 'image/png,image/*');
-
-    final response = await request.close();
-
-    if (response.statusCode != 200) {
-      response.drain<void>();
-      throw 'HTTP ${response.statusCode}';
-    }
-
-    final chunks = <List<int>>[];
-    await for (final chunk in response) {
-      chunks.add(chunk);
-    }
-    return Uint8List.fromList(chunks.expand((c) => c).toList());
-  }
-}
 
 // ─── Tile manager ────────────────────────────────────────────────────────────
 
@@ -199,12 +91,13 @@ class TileManager with CacheTiles {
   int _lastPreloadCenterX = 0;
   int _lastPreloadCenterY = 0;
 
-  // ── Pre-load isolate ────────────────────────────────────────────────
-  final _PreloadIsolate _preloadIsolate = _PreloadIsolate();
+  // ── Pre-load worker ─────────────────────────────────────────────────
+  final PreloadIsolateImpl _preloadIsolate = PreloadIsolateImpl();
 
   /// Whether to use the persistent isolate for pre-load fetches.
   /// Only enabled when using the default OSM fetcher — custom fetchers
   /// go through the regular async path (which may already use compute).
+  /// On web, the isolate is a no-op so [isReady] is always false.
   final bool _usePreloadIsolate;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
@@ -224,14 +117,14 @@ class TileManager with CacheTiles {
     this.preloadAdjacentZoom = true,
     this.preloadDebounce = const Duration(milliseconds: 500),
   })  : _fetcher = fetcher ?? osmTileFetcher,
-        _usePreloadIsolate = identical(fetcher ?? osmTileFetcher, osmTileFetcher) {
+        _usePreloadIsolate =
+            identical(fetcher ?? osmTileFetcher, osmTileFetcher) {
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
 
     // Spawn the pre-load isolate only for the default OSM fetcher.
-    // Custom fetchers use the regular async path (which may already use
-    // compute) — the isolate only benefits the built-in OSM pipeline.
+    // On web, this is a no-op (PreloadIsolateImpl.isReady stays false).
     if (_usePreloadIsolate) {
       _preloadIsolate.spawn();
     }
@@ -493,7 +386,7 @@ class TileManager with CacheTiles {
     onTilesChanged?.call();
   }
 
-  // ── Adjacent zoom pre-loading (debounced, bytes-only, isolate) ──────
+  // ── Adjacent zoom pre-loading (debounced, bytes-only) ───────────────
 
   /// Schedules adjacent zoom pre-loading with a debounce timer.
   /// Only fires after the user stops panning for [preloadDebounce].
@@ -597,14 +490,15 @@ class TileManager with CacheTiles {
     }
   }
 
-  /// Pre-loads a single tile via the background isolate.
+  /// Pre-loads a single tile.
   ///
-  /// The isolate handles the HTTP fetch with a persistent [HttpClient],
-  /// keeping TCP connections alive across hundreds of requests. Only raw
-  /// PNG bytes are returned — no image decoding happens here.
+  /// On native: fetches via the background isolate (persistent HttpClient,
+  /// TCP connection reuse). On web: falls back to the regular [_fetcher]
+  /// (browser fetch API with automatic connection pooling).
   ///
-  /// When a pre-loaded tile later becomes visible, [_scheduleLoad] finds
-  /// the bytes in [_byteCache] and decodes them on-demand.
+  /// Only stores compressed PNG bytes — no image decoding. When a pre-loaded
+  /// tile becomes visible, [_scheduleLoad] finds the bytes in [_byteCache]
+  /// and decodes on-demand.
   void _preloadTile(String key, int z, int x, int y) {
     if (_inFlight.contains(key)) return;
     _inFlight.add(key);
@@ -622,7 +516,8 @@ class TileManager with CacheTiles {
         }
 
         // Fetch bytes — via the persistent isolate when available,
-        // otherwise fall back to the main-thread fetcher.
+        // otherwise fall back to the regular fetcher (which on web
+        // uses the browser's fetch API with connection pooling).
         bytes ??= (_usePreloadIsolate && _preloadIsolate.isReady)
             ? await _preloadIsolate.fetch(z, x, y)
             : await _fetcher(z, x, y);
