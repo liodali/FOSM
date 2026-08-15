@@ -118,4 +118,157 @@ void main() {
     // No exceptions with custom zoom bounds.
     expect(find.byType(MapView), findsOneWidget);
   });
+
+  testWidgets('MapView shows zoom controls by default', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Zoom controls should be visible.
+    expect(find.byType(MapZoomControls), findsOneWidget);
+    expect(find.byIcon(Icons.add), findsOneWidget);
+    expect(find.byIcon(Icons.remove), findsOneWidget);
+  });
+
+  testWidgets('MapView hides zoom controls when showZoomControls is false',
+      (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            showZoomControls: false,
+            tileFetcher: _stubFetcher,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    expect(find.byType(MapZoomControls), findsNothing);
+  });
+
+  testWidgets('MapView onZoomChanged fires on zoom button tap',
+      (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Tap the zoom in button.
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    expect(lastZoom, 6);
+  });
+
+  testWidgets('MapView double-tap zooms in', (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Double-tap to zoom in.
+    final center = tester.getCenter(find.byType(MapView));
+    await tester.tapAt(center);
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tapAt(center);
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    expect(lastZoom, 6);
+  });
+
+  testWidgets('MapZoomControls standalone widget works', (tester) async {
+    var zoomInTapped = false;
+    var zoomOutTapped = false;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapZoomControls(
+            zoom: 5,
+            minZoom: 1,
+            maxZoom: 19,
+            onZoomIn: () => zoomInTapped = true,
+            onZoomOut: () => zoomOutTapped = true,
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.byIcon(Icons.add));
+    expect(zoomInTapped, isTrue);
+
+    await tester.tap(find.byIcon(Icons.remove));
+    expect(zoomOutTapped, isTrue);
+  });
+
+  testWidgets('MapZoomControls disables buttons at bounds', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapZoomControls(
+            zoom: 1,
+            minZoom: 1,
+            maxZoom: 19,
+            onZoomIn: () {},
+            onZoomOut: () {},
+          ),
+        ),
+      ),
+    );
+
+    // At min zoom, zoom out should be disabled (gray).
+    final removeIcon = tester.widget<Icon>(find.byIcon(Icons.remove));
+    expect(removeIcon.color, isNotNull); // gray color
+
+    // At max zoom
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapZoomControls(
+            zoom: 19,
+            minZoom: 1,
+            maxZoom: 19,
+            onZoomIn: () {},
+            onZoomOut: () {},
+          ),
+        ),
+      ),
+    );
+
+    // Zoom in should be disabled.
+    final addIcon = tester.widget<Icon>(find.byIcon(Icons.add));
+    expect(addIcon.color, isNotNull); // gray color
+  });
 }
