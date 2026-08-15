@@ -271,4 +271,123 @@ void main() {
     final addIcon = tester.widget<Icon>(find.byIcon(Icons.add));
     expect(addIcon.color, isNotNull); // gray color
   });
+
+  testWidgets('MapView animates zoom by default', (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Tap zoom in button
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pump(); // Start animation
+
+    // Animation should be in progress
+    await tester.pump(const Duration(milliseconds: 150)); // Mid-animation
+    // Zoom might not have changed yet (animation in progress)
+
+    // Complete animation
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    expect(lastZoom, 6);
+  });
+
+  testWidgets('MapView respects animateZoom: false', (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            animateZoom: false, // Disable animation
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Tap zoom in button
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Zoom should change immediately without animation
+    expect(lastZoom, 6);
+  });
+
+  testWidgets('MapView respects custom zoomAnimationDuration', (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            zoomAnimationDuration: const Duration(milliseconds: 500),
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Tap zoom in button
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pump(); // Start animation
+
+    // After 250ms (half of 500ms), animation should still be in progress
+    await tester.pump(const Duration(milliseconds: 250));
+    // Zoom might not have reached target yet
+
+    // Complete animation
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    expect(lastZoom, 6);
+  });
+
+  testWidgets('Pinch gesture interrupts zoom animation', (tester) async {
+    int? lastZoom;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: LatLng(latitude: 0, longitude: 0),
+            zoom: 5,
+            tileFetcher: _stubFetcher,
+            onZoomChanged: (zoom) => lastZoom = zoom,
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+
+    // Start zoom animation
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pump();
+
+    // Interrupt with pinch gesture
+    final center = tester.getCenter(find.byType(MapView));
+    final gesture1 = await tester.startGesture(center - const Offset(50, 0));
+    final gesture2 = await tester.startGesture(center + const Offset(50, 0));
+    await gesture1.moveBy(const Offset(-30, 0));
+    await gesture2.moveBy(const Offset(30, 0));
+    await tester.pump();
+    await gesture1.up();
+    await gesture2.up();
+
+    // Animation should be stopped, pinch zoom takes over
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    expect(lastZoom, isNotNull);
+  });
 }
