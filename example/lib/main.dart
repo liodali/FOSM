@@ -29,6 +29,7 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   int _zoom = 7;
+  bool _animateZoom = true; // Toggle for zoom animation
 
   @override
   Widget build(BuildContext context) {
@@ -46,6 +47,8 @@ class _MyHomePageState extends State<MyHomePage> {
             minZoom: 1,
             maxZoom: 19,
             showZoomControls: true,
+            animateZoom: _animateZoom, // Control animation
+            zoomAnimationDuration: const Duration(milliseconds: 300),
             onZoomChanged: (zoom) {
               setState(() => _zoom = zoom);
             },
@@ -75,6 +78,49 @@ class _MyHomePageState extends State<MyHomePage> {
                   fontWeight: FontWeight.w600,
                   color: Colors.black87,
                 ),
+              ),
+            ),
+          ),
+
+          // Animation toggle (top-right)
+          Positioned(
+            top: 16,
+            right: 16,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.1),
+                    blurRadius: 4,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.animation, size: 18, color: Colors.black87),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Animate',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.black87,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Switch(
+                    value: _animateZoom,
+                    onChanged: (value) {
+                      setState(() => _animateZoom = value);
+                    },
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ],
               ),
             ),
           ),

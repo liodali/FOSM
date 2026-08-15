@@ -58,6 +58,15 @@ class MapView extends StatefulWidget {
   /// Defaults to [Alignment.bottomRight].
   final Alignment zoomControlsAlignment;
 
+  /// Whether to animate zoom transitions (button tap, double-tap).
+  /// Pinch-to-zoom is always smooth (continuous gesture).
+  /// Defaults to `true`.
+  final bool animateZoom;
+
+  /// Duration of zoom animations.
+  /// Defaults to 300 milliseconds.
+  final Duration zoomAnimationDuration;
+
   const MapView({
     super.key,
     required this.latLng,
@@ -68,15 +77,23 @@ class MapView extends StatefulWidget {
     this.showZoomControls = true,
     this.onZoomChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
+    this.animateZoom = true,
+    this.zoomAnimationDuration = const Duration(milliseconds: 300),
   });
 
   @override
   State<MapView> createState() => _MapViewState();
 }
 
-class _MapViewState extends State<MapView> {
+class _MapViewState extends State<MapView> with TickerProviderStateMixin {
   TileManager? _tileManager;
   int _currentZoom = 0; // initialized in initState
+
+  // ── Zoom animation ──────────────────────────────────────────────────
+  late AnimationController _zoomAnimationController;
+  late Animation<double> _zoomAnimation;
+  int _zoomAnimationStartZoom = 0;
+  int _zoomAnimationTargetZoom = 0;
 
   // ── Scale gesture state ─────────────────────────────────────────────
   double? _scaleStartTileLng;
@@ -88,10 +105,19 @@ class _MapViewState extends State<MapView> {
   void initState() {
     super.initState();
     _currentZoom = widget.zoom;
+    
+    // Initialize zoom animation controller.
+    _zoomAnimationController = AnimationController(
+      duration: widget.zoomAnimationDuration,
+      vsync: this,
+    );
+    _zoomAnimationController.addListener(_onZoomAnimationTick);
   }
 
   @override
   void dispose() {
+    _zoomAnimationController.removeListener(_onZoomAnimationTick);
+    _zoomAnimationController.dispose();
     _tileManager?.dispose();
     super.dispose();
   }
@@ -148,12 +174,48 @@ class _MapViewState extends State<MapView> {
     final newZoom = (manager.zoom + delta).clamp(widget.minZoom, widget.maxZoom);
     if (newZoom == manager.zoom) return;
 
-    // Zoom centered on the viewport center.
+    if (widget.animateZoom) {
+      // Animated zoom transition.
+      _zoomAnimationStartZoom = manager.zoom;
+      _zoomAnimationTargetZoom = newZoom;
+      
+      // Stop any ongoing animation and start a new one.
+      _zoomAnimationController.stop();
+      _zoomAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+        CurvedAnimation(
+          parent: _zoomAnimationController,
+          curve: Curves.easeInOut,
+        ),
+      );
+      _zoomAnimationController.forward(from: 0.0);
+    } else {
+      // Instant zoom (no animation).
+      final oldZoom = manager.zoom;
+      final centerLocal = Offset(manager.centerCanvasX, manager.centerCanvasY);
+      manager.setZoomWithFocalPoint(newZoom, centerLocal, oldZoom);
+      _currentZoom = newZoom;
+      widget.onZoomChanged?.call(newZoom);
+      setState(() {});
+    }
+  }
+
+  void _onZoomAnimationTick() {
+    final manager = _tileManager;
+    if (manager == null) return;
+
+    final progress = _zoomAnimation.value;
+    final interpolatedZoom = _zoomAnimationStartZoom +
+        (_zoomAnimationTargetZoom - _zoomAnimationStartZoom) * progress;
+    
+    // Round to nearest integer zoom for tile loading.
+    final roundedZoom = interpolatedZoom.round();
+    if (roundedZoom == manager.zoom) return;
+
     final oldZoom = manager.zoom;
     final centerLocal = Offset(manager.centerCanvasX, manager.centerCanvasY);
-    manager.setZoomWithFocalPoint(newZoom, centerLocal, oldZoom);
-    _currentZoom = newZoom;
-    widget.onZoomChanged?.call(newZoom);
+    manager.setZoomWithFocalPoint(roundedZoom, centerLocal, oldZoom);
+    _currentZoom = roundedZoom;
+    widget.onZoomChanged?.call(roundedZoom);
     setState(() {});
   }
 
@@ -162,6 +224,10 @@ class _MapViewState extends State<MapView> {
   void _onScaleStart(ScaleStartDetails details) {
     final manager = _tileManager;
     if (manager == null) return;
+    
+    // Cancel any ongoing zoom animation when user starts a new gesture.
+    _zoomAnimationController.stop();
+    
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
     _scaleStartZoom = manager.zoom;
