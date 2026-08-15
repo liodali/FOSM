@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
@@ -12,6 +14,117 @@ import '../common/utils.dart';
 import 'geo_point.dart';
 import 'tile.dart';
 import 'tile_source.dart';
+
+// ─── Pre-load isolate ────────────────────────────────────────────────────────
+
+/// Manages a long-lived background isolate dedicated to pre-loading tiles.
+///
+/// The isolate owns its own [HttpClient] so TCP connections are reused across
+/// hundreds of tile requests — much cheaper than spawning a fresh isolate per
+/// tile via [compute].
+///
+/// Protocol (main → isolate):  `[SendPort replyPort, int z, int x, int y]`
+/// Protocol (isolate → main):  `Uint8List` on success, `String` on error.
+class _PreloadIsolate {
+  Isolate? _isolate;
+  SendPort? _sendPort;
+  final ReceivePort _receivePort = ReceivePort();
+  bool _ready = false;
+
+  bool get isReady => _ready;
+
+  /// Spawns the background isolate and waits for the handshake.
+  Future<void> spawn() async {
+    if (_ready) return;
+
+    final completer = Completer<SendPort>();
+    _receivePort.listen((message) {
+      if (message is SendPort) {
+        _sendPort = message;
+        _ready = true;
+        if (!completer.isCompleted) completer.complete(message);
+      }
+    });
+
+    await Isolate.spawn(_entryPoint, _receivePort.sendPort);
+    await completer.future;
+  }
+
+  /// Sends a fetch command and returns the raw PNG bytes.
+  /// Throws a [String] error message on failure.
+  Future<Uint8List> fetch(int z, int x, int y) {
+    final responsePort = ReceivePort();
+    _sendPort!.send([responsePort.sendPort, z, x, y]);
+    return responsePort.first.then((response) {
+      responsePort.close();
+      if (response is Uint8List) return response;
+      throw response is String ? response : 'Unknown error';
+    });
+  }
+
+  /// Kills the isolate and cleans up ports.
+  void dispose() {
+    _ready = false;
+    _isolate?.kill(priority: Isolate.immediate);
+    _isolate = null;
+    _receivePort.close();
+    _sendPort = null;
+  }
+
+  // ── Isolate entry point (runs on the background thread) ─────────────
+
+  static void _entryPoint(SendPort mainSendPort) {
+    final receivePort = ReceivePort();
+    mainSendPort.send(receivePort.sendPort);
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+
+    receivePort.listen((message) async {
+      final parts = message as List;
+      final replyPort = parts[0] as SendPort;
+      final z = parts[1] as int;
+      final x = parts[2] as int;
+      final y = parts[3] as int;
+
+      try {
+        replyPort.send(await _fetchOsmTile(client, z, x, y));
+      } catch (e) {
+        replyPort.send(e.toString());
+      }
+    });
+  }
+
+  /// Fetches a tile from OpenStreetMap using the isolate's persistent
+  /// [HttpClient] (keeps TCP connections alive across requests).
+  static Future<Uint8List> _fetchOsmTile(
+      HttpClient client, int z, int x, int y) async {
+    final n = 1 << z;
+    final wrappedX = ((x % n) + n) % n;
+    final uri = Uri.parse(
+        'https://tile.openstreetmap.org/$z/$wrappedX/$y.png');
+
+    final request = await client.getUrl(uri);
+    request.headers.set('User-Agent',
+        'fosm/0.0.1 (Flutter OSM map; +https://github.com/fosm)');
+    request.headers.set('Accept', 'image/png,image/*');
+
+    final response = await request.close();
+
+    if (response.statusCode != 200) {
+      response.drain<void>();
+      throw 'HTTP ${response.statusCode}';
+    }
+
+    final chunks = <List<int>>[];
+    await for (final chunk in response) {
+      chunks.add(chunk);
+    }
+    return Uint8List.fromList(chunks.expand((c) => c).toList());
+  }
+}
+
+// ─── Tile manager ────────────────────────────────────────────────────────────
 
 /// Manages the visible tile grid, in-memory image cache, and network
 /// fetches for an OSM map view.
@@ -86,6 +199,14 @@ class TileManager with CacheTiles {
   int _lastPreloadCenterX = 0;
   int _lastPreloadCenterY = 0;
 
+  // ── Pre-load isolate ────────────────────────────────────────────────
+  final _PreloadIsolate _preloadIsolate = _PreloadIsolate();
+
+  /// Whether to use the persistent isolate for pre-load fetches.
+  /// Only enabled when using the default OSM fetcher — custom fetchers
+  /// go through the regular async path (which may already use compute).
+  final bool _usePreloadIsolate;
+
   // ── Lifecycle ───────────────────────────────────────────────────────
   bool _disposed = false;
   int _revision = 0;
@@ -102,10 +223,18 @@ class TileManager with CacheTiles {
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
     this.preloadDebounce = const Duration(milliseconds: 500),
-  }) : _fetcher = fetcher ?? osmTileFetcher {
+  })  : _fetcher = fetcher ?? osmTileFetcher,
+        _usePreloadIsolate = identical(fetcher ?? osmTileFetcher, osmTileFetcher) {
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
+
+    // Spawn the pre-load isolate only for the default OSM fetcher.
+    // Custom fetchers use the regular async path (which may already use
+    // compute) — the isolate only benefits the built-in OSM pipeline.
+    if (_usePreloadIsolate) {
+      _preloadIsolate.spawn();
+    }
   }
 
   void dispose() {
@@ -113,6 +242,7 @@ class TileManager with CacheTiles {
     _disposed = true;
     _preloadTimer?.cancel();
     _preloadTimer = null;
+    _preloadIsolate.dispose();
     onTilesChanged = null;
     _renderTiles.clear();
     _inFlight.clear();
@@ -363,7 +493,7 @@ class TileManager with CacheTiles {
     onTilesChanged?.call();
   }
 
-  // ── Adjacent zoom pre-loading (debounced, bytes-only) ───────────────
+  // ── Adjacent zoom pre-loading (debounced, bytes-only, isolate) ──────
 
   /// Schedules adjacent zoom pre-loading with a debounce timer.
   /// Only fires after the user stops panning for [preloadDebounce].
@@ -411,9 +541,6 @@ class TileManager with CacheTiles {
     _lastPreloadCenterY = centerTileLat.floor();
 
     // Visible area (before padding).
-    // Subtract 1 from padded counts because the padded grid can include
-    // one extra row/column at tile boundaries (e.g. center exactly on a
-    // tile edge at zoom=5 with a 256×256 viewport).
     final visibleLeftLng = leftColumnTilesLngIndex + tilePadding;
     final visibleTopLat = topRowTilesLatIndex + tilePadding;
     final visibleHCount =
@@ -470,37 +597,58 @@ class TileManager with CacheTiles {
     }
   }
 
-  /// Pre-loads a single tile. Only stores bytes in the byte cache —
-  /// does NOT decode into the memory cache (avoids competing with
-  /// visible tiles for decode slots).
+  /// Pre-loads a single tile via the background isolate.
+  ///
+  /// The isolate handles the HTTP fetch with a persistent [HttpClient],
+  /// keeping TCP connections alive across hundreds of requests. Only raw
+  /// PNG bytes are returned — no image decoding happens here.
+  ///
+  /// When a pre-loaded tile later becomes visible, [_scheduleLoad] finds
+  /// the bytes in [_byteCache] and decodes them on-demand.
   void _preloadTile(String key, int z, int x, int y) {
     if (_inFlight.contains(key)) return;
     _inFlight.add(key);
     _activePreloads++;
 
     () async {
+      Uint8List? bytes;
       try {
-        // Check Hive cache first.
+        // Check Hive disk cache first (synchronous check).
         if (hasStoredTile(key)) {
-          final bytes = cachedTileBytes(key);
-          if (bytes != null) {
-            _storeInByteCache(key, bytes);
-            _inFlight.remove(key);
-            return;
+          final cached = cachedTileBytes(key);
+          if (cached != null) {
+            bytes = cached;
           }
         }
 
-        // Fetch from network.
-        final bytes = await _fetcher(z, x, y);
-        _storeInByteCache(key, bytes);
-        // Persist to Hive (fire and forget).
-        unawaited(
-            storeTile(key, Tile(null, key, y, x), bytes));
+        // Fetch bytes — via the persistent isolate when available,
+        // otherwise fall back to the main-thread fetcher.
+        bytes ??= (_usePreloadIsolate && _preloadIsolate.isReady)
+            ? await _preloadIsolate.fetch(z, x, y)
+            : await _fetcher(z, x, y);
       } catch (_) {
-        _failedUntil[key] = DateTime.now().add(failureBackoff);
-      } finally {
         _inFlight.remove(key);
         _activePreloads--;
+        _failedUntil[key] = DateTime.now().add(failureBackoff);
+        return;
+      }
+
+      // Store compressed bytes (no decode).
+      _storeInByteCache(key, bytes);
+
+      // Persist to Hive disk cache (fire and forget).
+      unawaited(storeTile(key, Tile(null, key, y, x), bytes));
+
+      _inFlight.remove(key);
+      _activePreloads--;
+
+      // If the tile is currently visible, decode it immediately
+      // instead of waiting for the next calculate() call.
+      final renderIndex = _renderTiles.indexWhere((t) => t.index == key);
+      if (renderIndex != -1 &&
+          _renderTiles[renderIndex].sourceTile == null) {
+        _inFlight.add(key);
+        _decodeFromByteCache(key, bytes, z, x, y);
       }
     }();
   }
