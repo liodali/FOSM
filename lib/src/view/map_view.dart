@@ -8,6 +8,7 @@ import '../api/tile_source.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'render.dart';
+import 'zoom_controls.dart';
 
 /// A native Flutter OSM map widget rendered entirely with [CustomPainter].
 ///
@@ -45,6 +46,18 @@ class MapView extends StatefulWidget {
   /// Useful for custom tile servers (Mapbox, Esri, etc.) or testing.
   final TileFetcher? tileFetcher;
 
+  /// Whether to show floating +/− zoom controls.
+  /// Defaults to `true`.
+  final bool showZoomControls;
+
+  /// Called whenever the zoom level changes (via pinch, button, or
+  /// double-tap). The argument is the new zoom level.
+  final ValueChanged<int>? onZoomChanged;
+
+  /// Position of the zoom controls overlay.
+  /// Defaults to [Alignment.bottomRight].
+  final Alignment zoomControlsAlignment;
+
   const MapView({
     super.key,
     required this.latLng,
@@ -52,6 +65,9 @@ class MapView extends StatefulWidget {
     this.minZoom = 1,
     this.maxZoom = 19,
     this.tileFetcher,
+    this.showZoomControls = true,
+    this.onZoomChanged,
+    this.zoomControlsAlignment = Alignment.bottomRight,
   });
 
   @override
@@ -121,6 +137,26 @@ class _MapViewState extends State<MapView> {
     return manager;
   }
 
+  // ── Zoom helpers ────────────────────────────────────────────────────
+
+  void _zoomIn() => _zoomBy(1);
+  void _zoomOut() => _zoomBy(-1);
+
+  void _zoomBy(int delta) {
+    final manager = _tileManager;
+    if (manager == null) return;
+    final newZoom = (manager.zoom + delta).clamp(widget.minZoom, widget.maxZoom);
+    if (newZoom == manager.zoom) return;
+
+    // Zoom centered on the viewport center.
+    final oldZoom = manager.zoom;
+    final centerLocal = Offset(manager.centerCanvasX, manager.centerCanvasY);
+    manager.setZoomWithFocalPoint(newZoom, centerLocal, oldZoom);
+    _currentZoom = newZoom;
+    widget.onZoomChanged?.call(newZoom);
+    setState(() {});
+  }
+
   // ── Scale gesture handlers (pan + pinch-to-zoom) ────────────────────
 
   void _onScaleStart(ScaleStartDetails details) {
@@ -166,6 +202,7 @@ class _MapViewState extends State<MapView> {
       manager.zoom = newZoom;
       _currentZoom = newZoom;
       manager.setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+      widget.onZoomChanged?.call(newZoom);
     } else {
       // No zoom change — pure pan.
       // Compute pan delta from the start focal point.
@@ -202,18 +239,36 @@ class _MapViewState extends State<MapView> {
           onScaleStart: _onScaleStart,
           onScaleUpdate: (d) => _onScaleUpdate(manager, d),
           onScaleEnd: _onScaleEnd,
-          child: CustomPaint(
-            size: size,
-            painter: RenderCanvasOSM(
-              horizontalTileCount: manager.horizontalTileCount,
-              verticalTileCount: manager.verticalTileCount,
-              leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
-              topRowTilesLatIndex: manager.topRowTilesLatIndex,
-              leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
-              topRowTilesCanvasY: manager.topRowTilesCanvasY,
-              tiles: manager.renderTiles,
-              revision: manager.revision,
-            ),
+          onDoubleTap: _zoomIn,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: CustomPaint(
+                  size: size,
+                  painter: RenderCanvasOSM(
+                    horizontalTileCount: manager.horizontalTileCount,
+                    verticalTileCount: manager.verticalTileCount,
+                    leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
+                    topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                    leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
+                    topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                    tiles: manager.renderTiles,
+                    revision: manager.revision,
+                  ),
+                ),
+              ),
+              if (widget.showZoomControls)
+                Positioned.fill(
+                  child: MapZoomControls(
+                    zoom: _currentZoom,
+                    minZoom: widget.minZoom,
+                    maxZoom: widget.maxZoom,
+                    alignment: widget.zoomControlsAlignment,
+                    onZoomIn: _zoomIn,
+                    onZoomOut: _zoomOut,
+                  ),
+                ),
+            ],
           ),
         );
       },
