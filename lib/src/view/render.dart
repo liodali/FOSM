@@ -1,10 +1,8 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import '../api/geo_point.dart';
 import '../common/utils.dart';
 
 import '../api/tile.dart';
-
-
 
 class RenderCanvasOSM extends CustomPainter {
   final int horizontalTileCount;
@@ -40,9 +38,10 @@ class RenderCanvasOSM extends CustomPainter {
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileCanvasY = topRowTilesCanvasY + vIndex * tileHeight;
         final tileLatIndex = topRowTilesLatIndex + vIndex;
-        final index = tiles.indexWhere((element) =>
-            element.latIndex == tileLatIndex &&
-            element.lngIndex == tileLngIndex);
+        final index = tiles.indexWhere(
+          (tile) =>
+              tile.latIndex == tileLatIndex && tile.lngIndex == tileLngIndex,
+        );
         // Draw a checker board pattern as a substrate for the tile while it is loading
         if ((index != -1 && tiles[index].sourceTile == null) || index == -1) {
           for (var x = 0; x < tileWidth / 8; x++) {
@@ -53,7 +52,7 @@ class RenderCanvasOSM extends CustomPainter {
                 Rect.fromLTRB(tileCanvasX + x * 8, tileCanvasY + y * 8, 8, 8),
                 Paint()
                   ..filterQuality = FilterQuality.medium
-                  ..color = Colors.grey,
+                  ..color = Colors.grey[200]!,
               );
               // else if (index != -1 && tiles[index].sourceTile != null ) {
               //   canvas.drawImage(tiles[index].sourceTile!,

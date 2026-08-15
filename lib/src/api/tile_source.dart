@@ -1,12 +1,8 @@
-import 'dart:typed_data';
-
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+import 'package:fosm/src/common/utils.dart';
 
-import '../common/utils.dart';
-
-Future<String> getTile(int z, int x, int y) async {
-  String url = "https://tile.openstreetmap.org/$z/$x/$y.png";
-  print(url);
+Future<String> downloadTile(String url) async {
   Response<Uint8List> response = await Dio().get(
     url,
     options: Options(
@@ -17,6 +13,11 @@ Future<String> getTile(int z, int x, int y) async {
       },
     ),
   );
-
   return response.data!.convertToString();
+}
+
+Future<String> getTile(int z, int x, int y) async {
+  String url = "https://tile.openstreetmap.org/$z/$x/$y.png";
+  print(url);
+  return compute(downloadTile, url);
 }

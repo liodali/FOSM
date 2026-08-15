@@ -2,13 +2,14 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:fosm/fosm.dart';
+import 'package:fosm/src/common/cache_tile_mixin.dart';
 
-import '../common/osm_transformation_utilities.dart';
-import '../common/utils.dart';
-import 'tile.dart';
-import 'tile_source.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/api/tile_source.dart';
 
-class TileManager {
+class TileManager with CacheTiles {
   int maxSizeTileCached = 1024 * 1024 * 12;
 
   List<Tile> _renderTiles = [];
@@ -50,8 +51,9 @@ class TileManager {
 
   void calculate(Function(VoidCallback fn) action) {
     action(() {
-      Set<Tile> sets = _renderTiles.toSet();
-      _cachedTiles.addAll(sets.toList());
+      /*Set<Tile> sets = _renderTiles.toSet();
+      storeTile(tile);
+      _cachedTiles.addAll(sets.toList());*/
       _renderTiles.clear();
     });
     final centerPointTileX = (centerTileLng % 1) * tileWidth;
@@ -115,25 +117,33 @@ class TileManager {
                 tileLngIndex,
               ));
             });
-          } else if (_renderTiles[index].sourceTile == null && indexOld == -1) {
-            final imageTile = await getTile(zoom, tileLngIndex, tileLatIndex);
-            ui.Codec codec =
-                await ui.instantiateImageCodec(imageTile.toUint8List());
-            ui.FrameInfo fi = await codec.getNextFrame();
+          } else if (box.containsKey(renderTiles[index].index)) {
+            final tile = await storedTile(renderTiles[index].index);
             action(() {
-              _renderTiles[index] = Tile(
-                fi.image,
-                "$tileLngIndex-$tileLatIndex",
-                tileLatIndex,
-                tileLngIndex,
-              );
+              _renderTiles[index] = tile;
+            });
+          } else if (_renderTiles[index].sourceTile == null && indexOld == -1) {
+            //final imageTile = await ;
+            getTile(zoom, tileLngIndex, tileLatIndex).then((imageTile) {
+              Future.sync(() async {
+                ui.Codec codec =
+                    await ui.instantiateImageCodec(imageTile.toUint8List());
+                ui.FrameInfo fi = await codec.getNextFrame();
+                action(() {
+                  final tile = Tile(
+                    fi.image,
+                    "$tileLngIndex-$tileLatIndex",
+                    tileLatIndex,
+                    tileLngIndex,
+                  );
+                  storeTile(tile, imageTile);
+                  _renderTiles[index] = tile;
+                });
+              });
             });
           } else {
-            if (_cachedTiles.isNotEmpty) {
-              action(() {
-                _renderTiles[index] = _cachedTiles[indexOld];
-              });
-            }
+            final tile = await storedTile(renderTiles[indexOld].index);
+            _renderTiles[index] = tile;
           }
         });
       }

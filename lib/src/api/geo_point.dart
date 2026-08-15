@@ -2,15 +2,21 @@ class LatLng {
   final double latitude;
   final double longitude;
 
-
-  LatLng({required this.latitude, required this.longitude});
+  LatLng({
+    required this.latitude,
+    required this.longitude,
+  });
 
   @override
   bool operator ==(Object other) {
-    LatLng obj = other as LatLng;
-    return latitude == obj.latitude && longitude == obj.longitude;
+    if (identical(this, other)) {
+      return true;
+    }
+    return other is LatLng &&
+        latitude == other.latitude &&
+        longitude == other.longitude;
   }
 
   @override
-  int get hashCode => latitude.hashCode * longitude.hashCode;
+  int get hashCode => latitude.hashCode ^ longitude.hashCode;
 }

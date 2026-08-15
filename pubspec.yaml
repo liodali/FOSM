@@ -5,13 +5,15 @@ homepage:
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
-  flutter: ">=1.17.0"
+  flutter: ">=3.47.0"
 
 dependencies:
   flutter:
     sdk: flutter
-  dio: ^4.0.0
-
+  dio: ^5.11.0
+  hive_ce: ^2.19.3
+  hive_ce_flutter: ^2.3.4
+  material_ui: any
 dev_dependencies:
   flutter_test:
     sdk: flutter
