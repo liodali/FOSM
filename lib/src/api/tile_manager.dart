@@ -41,7 +41,8 @@ import 'tile_source.dart';
 ///   tile is no longer visible the image is still stored in the memory
 ///   cache for next time.
 class TileManager with CacheTiles {
-  static const int maxMemoryCachedTiles = 300;
+  static const int maxMemoryCachedTiles = 200; // ~50MB decoded images
+  static const int maxByteCacheBytes = 50 * 1024 * 1024; // 50MB compressed
   static const Duration failureBackoff = Duration(seconds: 5);
   static const int defaultTilePadding = 2;
 
@@ -78,6 +79,12 @@ class TileManager with CacheTiles {
   /// insertion order, so removing + re-inserting on access gives us LRU
   /// eviction with O(1) bookkeeping.
   final LinkedHashMap<String, ui.Image> _memoryCache = LinkedHashMap();
+
+  /// Compressed PNG bytes for pre-loaded tiles at adjacent zoom levels.
+  /// Much more memory-efficient than decoded images (~20KB vs 256KB per tile).
+  /// Used for fast zoom transitions without re-downloading.
+  final LinkedHashMap<String, Uint8List> _byteCache = LinkedHashMap();
+  int _byteCacheSize = 0;
 
   /// Tile keys currently being fetched or decoded.
   final Set<String> _inFlight = {};
@@ -131,6 +138,8 @@ class TileManager with CacheTiles {
       image.dispose();
     }
     _memoryCache.clear();
+    _byteCache.clear();
+    _byteCacheSize = 0;
   }
 
   // ── Center helpers ──────────────────────────────────────────────────
@@ -315,11 +324,33 @@ class TileManager with CacheTiles {
     final failedUntil = _failedUntil[key];
     if (failedUntil != null && DateTime.now().isBefore(failedUntil)) return;
 
+    // Check byte cache first (fastest path — in-memory compressed bytes)
+    final bytes = _byteCache[key];
+    if (bytes != null) {
+      _inFlight.add(key);
+      _decodeFromByteCache(key, bytes, z, x, y);
+      return;
+    }
+
     _inFlight.add(key);
 
     if (hasStoredTile(key)) {
       _loadFromDisk(key);
     } else {
+      _loadFromNetwork(key, z, x, y);
+    }
+  }
+
+  /// Decodes a tile from compressed bytes in the byte cache.
+  /// Much faster than loading from Hive disk cache.
+  Future<void> _decodeFromByteCache(String key, Uint8List bytes, int z, int x, int y) async {
+    try {
+      final image = await Tile.decodeImage(bytes);
+      _complete(key, Tile(image, key, y, x));
+    } catch (_) {
+      // Corrupt bytes — remove from cache and fall back to network
+      _byteCache.remove(key);
+      _inFlight.remove(key);
       _loadFromNetwork(key, z, x, y);
     }
   }
@@ -352,6 +383,7 @@ class TileManager with CacheTiles {
   Future<void> _loadFromNetwork(String key, int z, int x, int y) async {
     try {
       final bytes = await _fetcher(z, x, y);
+      _storeInByteCache(key, bytes);
       final image = await Tile.decodeImage(bytes);
       // Best-effort persistence — don't block the paint path on Hive I/O.
       unawaited(storeTile(key, Tile(image, key, y, x), bytes));
@@ -383,7 +415,7 @@ class TileManager with CacheTiles {
 
   // ── Adjacent zoom pre-loading ────────────────────────────────────────
 
-  /// Pre-loads tiles at z±1 for the visible area (not the padded area).
+  /// Pre-loads tiles at z±1, z±2, z±3 for the visible area (not the padded area).
   /// This makes zooming in/out feel smooth — tiles are already in cache.
   void _scheduleAdjacentZoomPreload() {
     // Only preload for the visible area (not the padded area).
@@ -393,7 +425,8 @@ class TileManager with CacheTiles {
     final visibleHCount = horizontalTileCount - 2 * tilePadding;
     final visibleVCount = verticalTileCount - 2 * tilePadding;
 
-    for (final dz in [-1, 1]) {
+    // Pre-load at z±1, z±2, z±3 (prioritize closer zoom levels)
+    for (final dz in [-1, 1, -2, 2, -3, 3]) {
       final z = zoom + dz;
       if (z < 0 || z > 19) continue; // OSM max zoom is typically 19
 
@@ -403,29 +436,27 @@ class TileManager with CacheTiles {
           final latIndex = visibleTopLat + v;
 
           // Convert this tile's geographic extent to the other zoom level.
-          // A tile at (z, x, y) covers a geographic rectangle. At z±1, this
+          // A tile at (z, x, y) covers a geographic rectangle. At z±n, this
           // rectangle maps to a different set of tiles.
           final lng = tileX2Lng(lngIndex.toDouble(), zoom);
           final lat = tileY2Lat(latIndex.toDouble(), zoom);
           final otherLng = lon2TileX(lng, z).floor();
           final otherLat = lat2TileY(lat, z).floor();
 
-          // Also include the adjacent tile at z+1 (since one tile at z
-          // maps to 4 tiles at z+1, we need to load all 4).
-          final otherKey = tileKey(z, otherLng, otherLat);
-          if (!_memoryCache.containsKey(otherKey) && !_inFlight.contains(otherKey)) {
-            _schedulePreload(otherKey, z, otherLng, otherLat);
-          }
+          // Calculate the tile multiplier for this zoom difference
+          final tileMultiplier = 1 << dz.abs(); // 2^|dz|
 
-          // For z+1, also load the 3 adjacent tiles (2x2 block).
-          if (dz == 1) {
-            for (var dx = 0; dx <= 1; dx++) {
-              for (var dy = 0; dy <= 1; dy++) {
-                if (dx == 0 && dy == 0) continue; // already scheduled
-                final adjKey = tileKey(z, otherLng + dx, otherLat + dy);
-                if (!_memoryCache.containsKey(adjKey) && !_inFlight.contains(adjKey)) {
-                  _schedulePreload(adjKey, z, otherLng + dx, otherLat + dy);
-                }
+          // Load all tiles that cover this geographic area at the target zoom
+          for (var dx = 0; dx < tileMultiplier; dx++) {
+            for (var dy = 0; dy < tileMultiplier; dy++) {
+              final targetX = otherLng + dx;
+              final targetY = otherLat + dy;
+              final otherKey = tileKey(z, targetX, targetY);
+              
+              if (!_memoryCache.containsKey(otherKey) && 
+                  !_byteCache.containsKey(otherKey) && 
+                  !_inFlight.contains(otherKey)) {
+                _schedulePreload(otherKey, z, targetX, targetY);
               }
             }
           }
@@ -471,6 +502,7 @@ class TileManager with CacheTiles {
   Future<void> _preloadFromNetwork(String key, int z, int x, int y) async {
     try {
       final bytes = await _fetcher(z, x, y);
+      _storeInByteCache(key, bytes);
       final image = await Tile.decodeImage(bytes);
       unawaited(storeTile(key, Tile(image, key, y, x), bytes));
       _completePreload(key, Tile(image, key, y, x));
@@ -488,6 +520,30 @@ class TileManager with CacheTiles {
     _memoryCache.remove(key);
     _memoryCache[key] = tile.sourceTile!;
     _trimMemoryCache();
+  }
+
+  // ── Byte cache management ───────────────────────────────────────────
+
+  /// Stores compressed PNG bytes in the byte cache.
+  /// Used for fast zoom transitions without re-downloading.
+  void _storeInByteCache(String key, Uint8List bytes) {
+    // Remove old entry if exists
+    final old = _byteCache.remove(key);
+    if (old != null) _byteCacheSize -= old.length;
+
+    _byteCache[key] = bytes;
+    _byteCacheSize += bytes.length;
+
+    _trimByteCache();
+  }
+
+  /// Evicts oldest entries from byte cache when over budget.
+  void _trimByteCache() {
+    while (_byteCacheSize > maxByteCacheBytes && _byteCache.isNotEmpty) {
+      final oldestKey = _byteCache.keys.first;
+      final oldestBytes = _byteCache.remove(oldestKey);
+      if (oldestBytes != null) _byteCacheSize -= oldestBytes.length;
+    }
   }
 
   // ── Memory cache management ─────────────────────────────────────────
