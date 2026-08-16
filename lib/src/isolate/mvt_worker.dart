@@ -1,21 +1,23 @@
-// Stub fallback — only parsed when neither dart.library.io nor
-// dart.library.js_interop is available (shouldn't happen in practice).
-// The real implementations live in mvt_worker_native.dart and
-// mvt_worker_web.dart, selected via conditional import.
-
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 
 import '../vector/mvt/vector_tile.dart';
 
-/// Decodes raw MVT bytes into a [DecodedVectorTile].
+/// Decodes raw MVT bytes into a [DecodedVectorTile] using `compute()`.
 ///
-/// On native: uses `compute()` to parse in a separate isolate.
-/// On web: uses a JavaScript Web Worker to parse off the main thread.
-/// On stub: parses synchronously on the current thread.
+/// - **Native** (iOS/Android/macOS/Linux): `compute()` spawns a real
+///   isolate on a background thread — protobuf parsing never touches
+///   the main thread.
+/// - **Web**: `compute()` runs on the same thread (Dart isolates aren't
+///   supported on web), but the caller already yields between decode
+///   stages in [VectorTileRuntime], so the UI stays responsive.
+///
+/// This replaces the previous JS Web Worker approach — no duplicated
+/// protobuf code, no JS interop, no Blob URLs. The Dart [decodeVectorTile]
+/// is pure Dart with no `dart:ui` dependency, so it works everywhere.
 Future<DecodedVectorTile> decodeMvtAsync(Uint8List bytes) async {
-  return decodeVectorTile(bytes);
+  return compute(decodeVectorTile, bytes);
 }
 
-/// Whether async MVT decoding runs on a separate thread (isolate or
-/// Web Worker) rather than the main thread.
-bool get isMvtDecodeThreaded => false;
+/// Whether `compute()` runs on a separate OS thread.
+/// `true` on native, `false` on web.
+bool get isMvtDecodeThreaded => !kIsWeb;
