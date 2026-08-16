@@ -7,6 +7,9 @@ import 'package:flutter/foundation.dart';
 import '../../api/tile.dart' show Tile;
 import '../../api/tile_source.dart'
     show TileDecoder, TileFetcher, downloadTileBytes;
+import '../../isolate/mvt_worker.dart'
+    if (dart.library.io) '../../isolate/mvt_worker_native.dart'
+    if (dart.library.js_interop) '../../isolate/mvt_worker_web.dart';
 import '../mvt/vector_tile.dart';
 import '../style/map_style.dart' show StyleLayerType;
 import '../style/style_loader.dart';
@@ -32,14 +35,15 @@ class VectorTileRuntime {
   final LoadedVectorStyle loaded;
   final String namespace;
 
-  /// Parse MVT bytes in an isolate (native only — `compute` is a no-op
-  /// wrapper on the platform thread on web).
-  final bool parseInIsolate;
+  /// Parse MVT bytes off the main thread (native isolate or web Worker).
+  /// When true, [decodeMvtAsync] runs the protobuf decoder on a
+  /// background thread — native uses `compute()`, web uses a JS Worker.
+  final bool parseOffThread;
 
   VectorTileRuntime({
     required this.loaded,
     required this.namespace,
-    this.parseInIsolate = !kIsWeb,
+    this.parseOffThread = true,
   }) {
     _loadSprite();
   }
@@ -220,8 +224,8 @@ class VectorTileRuntime {
   }
 
   Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord) async {
-    final decoded = parseInIsolate
-        ? await compute(decodeVectorTile, bytes)
+    final decoded = parseOffThread
+        ? await decodeMvtAsync(bytes)
         : decodeVectorTile(bytes);
     final parsed = ParsedVectorTile(decoded: decoded, srcZ: coord.z);
     if (_disposed) return parsed;
