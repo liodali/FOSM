@@ -79,3 +79,4 @@ build/
 /example/web/
 *.lock
 .commandcode
+.zcode
