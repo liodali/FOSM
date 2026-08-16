@@ -78,3 +78,4 @@ build/
 /example/linux/
 /example/web/
 *.lock
+.commandcode
