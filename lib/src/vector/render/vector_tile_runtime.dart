@@ -33,9 +33,9 @@ class VectorTileRuntime {
   final LoadedVectorStyle loaded;
   final String namespace;
 
-  /// Parse MVT bytes off the main thread (native isolate or web Worker).
-  /// When true, [decodeMvtAsync] runs the protobuf decoder on a
-  /// background thread — native uses `compute()`, web uses a JS Worker.
+  /// Whether to parse MVT bytes on a background thread via `compute()`.
+  /// Set to `false` in tests where the Flutter test framework doesn't
+  /// drain isolate messages properly.
   final bool parseOffThread;
 
   VectorTileRuntime({
@@ -227,9 +227,10 @@ class VectorTileRuntime {
   }
 
   Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord) async {
-    final decoded = parseOffThread
-        ? await decodeMvtAsync(bytes)
-        : decodeVectorTile(bytes);
+    // decodeMvtAsync uses compute() on native (real isolate) and falls
+    // back to synchronous parsing on web. Set parseOffThread=false in
+    // tests to avoid isolate message draining issues.
+    final decoded = await decodeMvtAsync(bytes, useIsolate: parseOffThread);
     final parsed = ParsedVectorTile(decoded: decoded, srcZ: coord.z);
     if (_disposed) return parsed;
 

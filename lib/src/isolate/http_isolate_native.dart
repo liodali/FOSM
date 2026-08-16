@@ -17,17 +17,26 @@ import 'dart:typed_data';
 class HttpIsolate {
   Isolate? _isolate;
   SendPort? _sendPort;
-  final ReceivePort _receivePort = ReceivePort();
+  ReceivePort? _receivePort;
   bool _ready = false;
+
+  /// Guards against concurrent spawn() calls.
+  Future<void>? _spawnFuture;
 
   bool get isReady => _ready;
 
   /// Spawns the background isolate and waits for the handshake.
-  Future<void> spawn() async {
+  Future<void> spawn() {
+    return _spawnFuture ??= _doSpawn();
+  }
+
+  Future<void> _doSpawn() async {
     if (_ready) return;
 
+    // Create a fresh ReceivePort each time.
+    _receivePort = ReceivePort();
     final completer = Completer<SendPort>();
-    _receivePort.listen((message) {
+    _receivePort!.listen((message) {
       if (message is SendPort) {
         _sendPort = message;
         _ready = true;
@@ -35,7 +44,7 @@ class HttpIsolate {
       }
     });
 
-    _isolate = await Isolate.spawn(_entryPoint, _receivePort.sendPort);
+    _isolate = await Isolate.spawn(_entryPoint, _receivePort!.sendPort);
     await completer.future;
   }
 
@@ -59,8 +68,10 @@ class HttpIsolate {
     _ready = false;
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
-    _receivePort.close();
+    _receivePort?.close();
+    _receivePort = null;
     _sendPort = null;
+    _spawnFuture = null;
   }
 
   // ── Isolate entry point (runs on the background thread) ─────────────
