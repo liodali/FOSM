@@ -1,9 +1,11 @@
 import 'dart:collection';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/painting.dart' show TextPainter, TextSpan, TextStyle;
 
 import '../../api/tile.dart';
+import '../mvt/vector_tile.dart';
 import '../style/expression.dart';
 import '../style/map_style.dart';
 import 'vector_tile_renderer.dart';
@@ -18,15 +20,20 @@ import 'vector_tile_runtime.dart';
 /// collision each frame — first-come-first-served in style layer order,
 /// matching MapLibre's priority semantics.
 ///
-/// Only point placements are supported; `symbol-placement: line` (road
-/// names along paths) is a follow-up.
+/// Point labels are placed at the feature's anchor position.
+/// Line labels are sampled along geometry at regular intervals and
+/// rotated to follow the path direction.
 class LabelOverlay {
   final VectorTileRuntime runtime;
 
   LabelOverlay(this.runtime);
 
-  static const int maxLabelsPerFrame = 400;
+  static const int maxLabelsPerFrame = 500;
   static const int _maxPreparedTiles = 64;
+
+  /// Pixel distance between sampled line label placements.
+  /// Roads typically need ~200-300px gaps to avoid clutter.
+  static const double _lineLabelSpacing = 250.0;
 
   /// Prepared labels keyed by tile index + zoom (stable across pans).
   final LinkedHashMap<String, List<_PreparedLabel>> _prepared =
@@ -118,14 +125,32 @@ class LabelOverlay {
         }
         if (!collision.tryPlace(rect)) continue;
 
-        if (label.icon != null && sprite != null) {
-          sprite.draw(canvas, label.icon!, anchor, label.iconSize);
-        }
-        if (haloPainter != null) {
-          haloPainter.paint(canvas, anchor + _textOffsetFor(label, haloPainter));
-        }
-        if (textPainter != null) {
-          textPainter.paint(canvas, anchor + _textOffsetFor(label, textPainter));
+        // Apply rotation for line labels.
+        if (label.angle != 0) {
+          canvas.save();
+          canvas.translate(anchor.dx, anchor.dy);
+          canvas.rotate(label.angle);
+          final origin = ui.Offset.zero;
+          if (label.icon != null && sprite != null) {
+            sprite.draw(canvas, label.icon!, origin, label.iconSize);
+          }
+          if (haloPainter != null) {
+            haloPainter.paint(canvas, origin + _textOffsetFor(label, haloPainter));
+          }
+          if (textPainter != null) {
+            textPainter.paint(canvas, origin + _textOffsetFor(label, textPainter));
+          }
+          canvas.restore();
+        } else {
+          if (label.icon != null && sprite != null) {
+            sprite.draw(canvas, label.icon!, anchor, label.iconSize);
+          }
+          if (haloPainter != null) {
+            haloPainter.paint(canvas, anchor + _textOffsetFor(label, haloPainter));
+          }
+          if (textPainter != null) {
+            textPainter.paint(canvas, anchor + _textOffsetFor(label, textPainter));
+          }
         }
         drawn++;
       }
@@ -173,7 +198,6 @@ class LabelOverlay {
     for (final layer in style.layers) {
       if (layer.type != StyleLayerType.symbol || !layer.isVisible) continue;
       if (zoom < layer.minZoom || zoom > layer.maxZoom) continue;
-      if (layer.layout['symbol-placement'] == 'line') continue; // v1: points
       final sourceLayer = layer.sourceLayer;
       if (sourceLayer == null) continue;
       final data = parsed.decoded.layerByName(sourceLayer);
@@ -186,6 +210,17 @@ class LabelOverlay {
         srcZ: parsed.srcZ,
         extent: data.extent,
       );
+
+      // Determine if this layer uses line placement. Liberty uses
+      // ["step", ["zoom"], "point", N, "line"] for shields, plus
+      // plain "line" for road/water names.
+      final placementExpr = layer.layout['symbol-placement'];
+      final isLineLayer = placementExpr == 'line' ||
+          (placementExpr is List &&
+              evaluateStringExpr(placementExpr, EvaluationContext(
+                zoom: zoom.toDouble(),
+                properties: null,
+              )) == 'line');
 
       for (final feature in data.features) {
         if (feature.geometry.isEmpty || feature.geometry.first.length < 2) {
@@ -201,46 +236,58 @@ class LabelOverlay {
         final icon = _resolveIcon(layer, ctx);
         if (text == null && icon == null) continue;
 
-        final first = feature.geometry.first;
-        labels.add(_PreparedLabel(
-          text: text,
-          icon: icon,
-          dedupeKey: '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
-          localX: transform.x(first[0]),
-          localY: transform.y(first[1]),
-          fontSize: evaluateNumExpr(
-            layer.layout['text-size'],
-            ctx,
-            fallback: 16,
-            min: 6,
-            max: 64,
-          ),
-          color: evaluateColorExpr(layer.paint['text-color'], ctx) ??
-              const ui.Color(0xFF000000),
-          haloColor: evaluateColorExpr(layer.paint['text-halo-color'], ctx),
-          haloWidth: evaluateNumExpr(
-            layer.paint['text-halo-width'],
-            ctx,
-            fallback: 0,
-            min: 0,
-            max: 8,
-          ),
-          letterSpacing: evaluateNumExpr(
-            layer.layout['text-letter-spacing'],
-            ctx,
-            fallback: 0,
-          ),
-          anchor: evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center',
-          offsetDx: _offsetEms(layer, ctx, 0),
-          offsetDy: _offsetEms(layer, ctx, 1),
-          iconSize: evaluateNumExpr(
-            layer.layout['icon-size'],
-            ctx,
-            fallback: 1,
-            min: 0.5,
-            max: 4,
-          ),
-        ));
+        final fontSize = evaluateNumExpr(
+          layer.layout['text-size'], ctx,
+          fallback: 16, min: 6, max: 64,
+        );
+        final color = evaluateColorExpr(layer.paint['text-color'], ctx) ??
+            const ui.Color(0xFF000000);
+        final haloColor = evaluateColorExpr(layer.paint['text-halo-color'], ctx);
+        final haloWidth = evaluateNumExpr(
+          layer.paint['text-halo-width'], ctx,
+          fallback: 0, min: 0, max: 8,
+        );
+        final letterSpacing = evaluateNumExpr(
+          layer.layout['text-letter-spacing'], ctx, fallback: 0,
+        );
+        final anchor = evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
+        final offsetDx = _offsetEms(layer, ctx, 0);
+        final offsetDy = _offsetEms(layer, ctx, 1);
+        final iconSize = evaluateNumExpr(
+          layer.layout['icon-size'], ctx,
+          fallback: 1, min: 0.5, max: 4,
+        );
+
+        if (isLineLayer && feature.geomType == MvtGeomType.lineString) {
+          // Line label: sample placements along the geometry.
+          _addLineLabels(
+            labels, layer.id, feature, transform,
+            text: text, icon: icon,
+            fontSize: fontSize, color: color,
+            haloColor: haloColor, haloWidth: haloWidth,
+            letterSpacing: letterSpacing,
+            iconSize: iconSize,
+          );
+        } else {
+          // Point label: place at the first coordinate.
+          final first = feature.geometry.first;
+          labels.add(_PreparedLabel(
+            text: text,
+            icon: icon,
+            dedupeKey: '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
+            localX: transform.x(first[0]),
+            localY: transform.y(first[1]),
+            fontSize: fontSize,
+            color: color,
+            haloColor: haloColor,
+            haloWidth: haloWidth,
+            letterSpacing: letterSpacing,
+            anchor: anchor,
+            offsetDx: offsetDx,
+            offsetDy: offsetDy,
+            iconSize: iconSize,
+          ));
+        }
       }
     }
 
@@ -275,13 +322,119 @@ class LabelOverlay {
   String? _resolveIcon(StyleLayer layer, EvaluationContext ctx) {
     final raw = layer.layout['icon-image'];
     if (raw == null) return null;
-    // Template icons like "{maki}-11" are unsupported — the text label
-    // still renders. Name→atlas resolution happens at paint time, once
-    // the sprite may have loaded.
-    if (raw is String && raw.contains('{')) return null;
+    // Template strings like "{maki}-11" need interpolation. We handle
+    // the common "{property}" pattern.
+    if (raw is String) {
+      if (raw.contains('{')) {
+        return _interpolateTemplate(raw, ctx.properties);
+      }
+      return raw.isEmpty ? null : raw;
+    }
     final name = stringifyStyleValue(evaluateExpression(raw, ctx));
     if (name.isEmpty || name == 'null') return null;
     return name;
+  }
+
+  /// Replaces `{property}` tokens in a template string with feature values.
+  /// e.g. `"{maki}-11"` with `maki: "park"` → `"park-11"`.
+  String? _interpolateTemplate(String template, Map<String, dynamic>? props) {
+    if (props == null) return null;
+    final result = template.replaceAllMapped(
+      RegExp(r'\{([^}]+)\}'),
+      (m) => stringifyStyleValue(props[m.group(1)]),
+    );
+    return result.isEmpty ? null : result;
+  }
+
+  /// Samples line label placements along a line feature's geometry at
+  /// regular intervals. Each placement captures the local direction so
+  /// the label can be rotated to follow the road/waterway.
+  void _addLineLabels(
+    List<_PreparedLabel> labels,
+    String layerId,
+    DecodedFeature feature,
+    TileTransform transform, {
+    required String? text,
+    required String? icon,
+    required double fontSize,
+    required ui.Color color,
+    required ui.Color? haloColor,
+    required double haloWidth,
+    required double letterSpacing,
+    required double iconSize,
+  }) {
+    for (var partIdx = 0; partIdx < feature.geometry.length; partIdx++) {
+      final part = feature.geometry[partIdx];
+      if (part.length < 4) continue; // Need at least 2 points
+
+      // Compute total path length and cumulative distances.
+      final dists = <double>[0.0];
+      for (var i = 2; i + 1 < part.length; i += 2) {
+        final dx = transform.x(part[i]) - transform.x(part[i - 2]);
+        final dy = transform.y(part[i + 1]) - transform.y(part[i - 1]);
+        dists.add(dists.last + math.sqrt(dx * dx + dy * dy));
+      }
+      final totalLen = dists.last;
+      if (totalLen < 30) continue; // Too short to label
+
+      // Sample placements along the path.
+      var nextDist = _lineLabelSpacing / 2;
+      while (nextDist < totalLen) {
+        // Binary search for the segment containing nextDist.
+        var lo = 0, hi = dists.length - 1;
+        while (lo < hi) {
+          final mid = (lo + hi) >> 1;
+          if (dists[mid] < nextDist) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        final segIdx = (lo - 1).clamp(0, dists.length - 2);
+        final segStart = dists[segIdx];
+        final segEnd = dists[segIdx + 1];
+        final segLen = segEnd - segStart;
+        if (segLen < 0.01) {
+          nextDist += _lineLabelSpacing;
+          continue;
+        }
+
+        final t = ((nextDist - segStart) / segLen).clamp(0.0, 1.0);
+        final pi = segIdx * 2;
+        final px = transform.x(part[pi]) +
+            t * (transform.x(part[pi + 2]) - transform.x(part[pi]));
+        final py = transform.y(part[pi + 1]) +
+            t * (transform.y(part[pi + 3]) - transform.y(part[pi + 1]));
+
+        // Direction angle from the segment.
+        final dx = transform.x(part[pi + 2]) - transform.x(part[pi]);
+        final dy = transform.y(part[pi + 3]) - transform.y(part[pi + 1]);
+        var angle = math.atan2(dy, dx);
+        // Keep text readable: flip if upside down.
+        if (angle > math.pi / 2) angle -= math.pi;
+        if (angle < -math.pi / 2) angle += math.pi;
+
+        labels.add(_PreparedLabel(
+          text: text,
+          icon: icon,
+          dedupeKey: '$layerId:${feature.id > 0 ? feature.id : text ?? icon}:$partIdx:$nextDist',
+          localX: px,
+          localY: py,
+          fontSize: fontSize,
+          color: color,
+          haloColor: haloColor,
+          haloWidth: haloWidth,
+          letterSpacing: letterSpacing,
+          anchor: 'center',
+          offsetDx: 0,
+          offsetDy: 0,
+          iconSize: iconSize,
+          angle: angle,
+        ));
+
+        nextDist += _lineLabelSpacing;
+      }
+    }
   }
 
   double _offsetEms(StyleLayer layer, EvaluationContext ctx, int index) {
@@ -312,6 +465,9 @@ class _PreparedLabel {
   final double localX;
   final double localY;
 
+  /// Rotation angle in radians (0 = horizontal, used for line labels).
+  final double angle;
+
   final double fontSize;
   final ui.Color color;
   final ui.Color? haloColor;
@@ -340,6 +496,7 @@ class _PreparedLabel {
     required this.offsetDx,
     required this.offsetDy,
     required this.iconSize,
+    this.angle = 0,
   });
 
   TextPainter painter() => _textPainter ??= _build(foreground: null);

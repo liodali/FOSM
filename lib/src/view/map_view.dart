@@ -518,8 +518,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                     tiles: manager.renderTiles,
                     revision: manager.revision,
                     zoom: manager.zoom,
-                    // TEMP: overlay disabled for wasm-abort bisect
-                    overlay: null, // runtime?.createLabelOverlay(),
+                    overlay: runtime?.createLabelOverlay(),
                   ),
                 ),
               ),
