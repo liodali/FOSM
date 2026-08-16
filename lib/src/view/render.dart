@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api/tile.dart';
 import '../common/utils.dart';
+import '../vector/render/label_overlay.dart';
 
 /// Paints the OSM tile grid onto a [CustomPaint] canvas.
 ///
@@ -22,6 +23,13 @@ class RenderCanvasOSM extends CustomPainter {
   final List<Tile> tiles;
   final int revision;
 
+  /// Current zoom — vector styles evaluate paint properties per zoom.
+  final int zoom;
+
+  /// Vector label overlay, painted above the tile grid. Null in raster
+  /// mode (and for the zoom-animation snapshot, where labels pause).
+  final LabelOverlay? overlay;
+
   RenderCanvasOSM({
     required this.horizontalTileCount,
     required this.verticalTileCount,
@@ -31,6 +39,8 @@ class RenderCanvasOSM extends CustomPainter {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
+    this.zoom = 0,
+    this.overlay,
   });
 
   static const Color _checkerLight = Color(0xFFF5F5F5);
@@ -83,6 +93,19 @@ class RenderCanvasOSM extends CustomPainter {
         }
       }
     }
+
+    // Vector labels sit above every tile (they need viewport-level
+    // collision, not per-tile rendering).
+    overlay?.paint(
+      canvas,
+      size,
+      zoom: zoom,
+      leftColumnTilesCanvasX: leftColumnTilesCanvasX,
+      topRowTilesCanvasY: topRowTilesCanvasY,
+      leftColumnTilesLngIndex: leftColumnTilesLngIndex,
+      topRowTilesLatIndex: topRowTilesLatIndex,
+      tiles: tiles,
+    );
   }
 
   void _drawCheckerboard(

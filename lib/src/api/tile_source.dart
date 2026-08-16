@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
@@ -7,6 +9,18 @@ import 'package:flutter/foundation.dart';
 /// servers (Mapbox, Esri, self-hosted, etc.) and so tests can stub the
 /// network layer.
 typedef TileFetcher = Future<Uint8List> Function(int z, int x, int y);
+
+/// Turns fetched tile bytes into a displayable image.
+///
+/// Raster tiles decode via an image codec; vector tiles run the
+/// parse → style → rasterize pipeline. Injectable so the vector runtime can
+/// replace it and tests can stub decoding.
+typedef TileDecoder = Future<ui.Image> Function(
+  Uint8List bytes,
+  int z,
+  int x,
+  int y,
+);
 
 // Shared Dio — reused within a single isolate. Inside [compute] a fresh
 // isolate is spawned per call, so the cache is per-request there, but on
