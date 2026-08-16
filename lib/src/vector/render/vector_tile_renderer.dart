@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 import '../mvt/vector_tile.dart';
 import '../style/css_color.dart';
@@ -71,6 +74,82 @@ class VectorTileRenderer {
 
   static const double tileSize = 256;
 
+  /// How many layers to paint before yielding to the event loop.
+  /// OpenFreeMap Liberty has ~111 layers; at typical zooms ~50-70 are
+  /// visible. A batch of 8 keeps each chunk under ~2ms on web CanvasKit
+  /// so the browser can paint between chunks.
+  static const int _layersPerBatch = 8;
+
+  /// Renders the tile asynchronously, yielding between layer batches so
+  /// the UI thread stays responsive. [PictureRecorder] and [Canvas] are
+  /// plain Dart objects — they survive across async yields within the
+  /// same isolate without issue.
+  ///
+  /// On native, [kIsWeb] is false so no yields occur and this runs
+  /// synchronously (the caller already isolates the decode via
+  /// `compute`). On web, every [_layersPerBatch] layers yields one
+  /// frame so the browser can handle input and paint.
+  Future<ui.Picture> renderAsync({
+    required DecodedVectorTile decoded,
+    required int srcZ,
+    required int z,
+    required int x,
+    required int y,
+    Map<String, ui.Image> rasterTiles = const {},
+    Map<String, TileCoord> rasterCoords = const {},
+  }) async {
+    final recorder = ui.PictureRecorder();
+    final canvas =
+        ui.Canvas(recorder, const ui.Rect.fromLTWH(0, 0, tileSize, tileSize));
+    final ctx = EvaluationContext(zoom: z.toDouble());
+
+    // Pre-filter: collect only the layers that will actually draw at
+    // this zoom. OpenFreeMap Liberty has 111 layers but typically
+    // 50-70 are visible at any zoom — skipping invisible ones up-front
+    // avoids re-checking per batch.
+    final visible = <StyleLayer>[
+      for (final layer in loaded.style.layers)
+        if (layer.isVisible && z >= layer.minZoom && z <= layer.maxZoom)
+          layer,
+    ];
+
+    var painted = 0;
+    for (final layer in visible) {
+      switch (layer.type) {
+        case StyleLayerType.background:
+          _paintBackground(canvas, layer, ctx);
+        case StyleLayerType.raster:
+          _paintRaster(canvas, layer, ctx, z, x, y, rasterTiles, rasterCoords);
+        case StyleLayerType.fill:
+          _paintFillLike(canvas, layer, decoded, srcZ, z, x, y, ctx,
+              extrusion: false);
+        case StyleLayerType.line:
+          _paintLines(canvas, layer, decoded, srcZ, z, x, y, ctx);
+        case StyleLayerType.circle:
+          _paintCircles(canvas, layer, decoded, srcZ, z, x, y, ctx);
+        case StyleLayerType.fillExtrusion:
+          // Rendered flat (no 3D yet) — still gives building footprints.
+          _paintFillLike(canvas, layer, decoded, srcZ, z, x, y, ctx,
+              extrusion: true);
+        case StyleLayerType.symbol:
+          continue; // label overlay
+        case StyleLayerType.unknown:
+          continue;
+      }
+
+      painted++;
+      // Yield every N layers on web so the browser can paint between
+      // chunks. On native this is a no-op branch (kIsWeb is false).
+      if (kIsWeb && painted % _layersPerBatch == 0) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    return recorder.endRecording();
+  }
+
+  /// Synchronous render for callers that don't need chunking (tests,
+  /// or native code paths that already isolate the decode).
   ui.Picture render({
     required DecodedVectorTile decoded,
     required int srcZ,
@@ -89,7 +168,6 @@ class VectorTileRenderer {
       if (!layer.isVisible) continue;
       if (z < layer.minZoom || z > layer.maxZoom) continue;
 
-
       switch (layer.type) {
         case StyleLayerType.background:
           _paintBackground(canvas, layer, ctx);
@@ -103,11 +181,10 @@ class VectorTileRenderer {
         case StyleLayerType.circle:
           _paintCircles(canvas, layer, decoded, srcZ, z, x, y, ctx);
         case StyleLayerType.fillExtrusion:
-          // Rendered flat (no 3D yet) — still gives building footprints.
           _paintFillLike(canvas, layer, decoded, srcZ, z, x, y, ctx,
               extrusion: true);
         case StyleLayerType.symbol:
-          break; // label overlay
+          break;
         case StyleLayerType.unknown:
           break;
       }
@@ -369,7 +446,7 @@ class VectorTileRenderer {
         ..strokeWidth = batch.width
         ..strokeCap = cap
         ..strokeJoin = join;
-      if (hasDash) {
+      if (hasDash && batch.width >= 0.5) {
         _drawDashed(canvas, batch.path, paint, dashRaw, batch.width);
       } else {
         canvas.drawPath(batch.path, paint);

@@ -136,20 +136,33 @@ class VectorTileRuntime {
       // runs on the main thread.
       if (kIsWeb) await Future<void>.delayed(Duration.zero);
 
+      // Only fetch raster tiles if there are actually visible raster
+      // layers at this zoom. Liberty has one raster layer (natural
+      // earth relief) that's only visible at very low zooms — skip
+      // the entire loop for the common case.
+      final hasVisibleRaster = loaded.style.layers.any((l) =>
+          l.type == StyleLayerType.raster &&
+          l.isVisible &&
+          z >= l.minZoom &&
+          z <= l.maxZoom);
+
       final rasterImages = <String, ui.Image>{};
       final rasterCoords = <String, TileCoord>{};
-      for (final layer in loaded.style.layers) {
-        if (_disposed) break;
-        if (layer.type != StyleLayerType.raster || !layer.isVisible) continue;
-        final sourceName = layer.source;
-        if (sourceName == null) continue;
-        final rasterSource = loaded.sources[sourceName];
-        if (rasterSource == null) continue;
+      if (hasVisibleRaster) {
+        for (final layer in loaded.style.layers) {
+          if (_disposed) break;
+          if (layer.type != StyleLayerType.raster || !layer.isVisible) continue;
+          if (z < layer.minZoom || z > layer.maxZoom) continue;
+          final sourceName = layer.source;
+          if (sourceName == null) continue;
+          final rasterSource = loaded.sources[sourceName];
+          if (rasterSource == null) continue;
 
-        final rasterCoord = rasterSource.resolve(z, x, y);
-        rasterCoords[sourceName] = rasterCoord;
-        final image = await _rasterTileFor(rasterSource, rasterCoord);
-        if (image != null) rasterImages[sourceName] = image;
+          final rasterCoord = rasterSource.resolve(z, x, y);
+          rasterCoords[sourceName] = rasterCoord;
+          final image = await _rasterTileFor(rasterSource, rasterCoord);
+          if (image != null) rasterImages[sourceName] = image;
+        }
       }
       if (_disposed) {
         throw StateError('runtime disposed during decode');
@@ -158,7 +171,11 @@ class VectorTileRuntime {
       // Yield before the heavy Canvas path-building step.
       if (kIsWeb) await Future<void>.delayed(Duration.zero);
 
-      final picture = VectorTileRenderer(loaded).render(
+      // Use the async renderer which yields between layer batches.
+      // OpenFreeMap Liberty has ~111 layers (~50-70 visible per zoom);
+      // the async renderer chunks them into batches of 8 with frame
+      // yields on web, so the browser stays responsive.
+      final picture = await VectorTileRenderer(loaded).renderAsync(
         decoded: parsed.decoded,
         srcZ: parsed.srcZ,
         z: z,
