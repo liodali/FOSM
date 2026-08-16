@@ -53,25 +53,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
   // ── Markers ─────────────────────────────────────────────────────────
   // Owned by the page so markers survive raster/vector mode switches.
-  final MarkerManager _markers = MarkerManager()
-    ..add(
-      const Marker(
-        point: initialCenter,
-        alignment: Alignment.bottomCenter,
-        child: Icon(Icons.location_on, size: 40, color: Colors.red),
-      ),
-    )
-    ..add(
-      Marker.text(
-        'Munich',
-        const LatLng(latitude: 48.1351, longitude: 11.5820),
-        style: const TextStyle(
-          fontSize: 13,
-          fontWeight: FontWeight.w600,
-          color: Colors.black87,
-        ),
-      ),
-    );
+  // Built in initState — the overlay builders close over `this`.
+  late final MarkerManager _markers;
 
   static const List<Color> _pinColors = [
     Colors.red,
@@ -83,7 +66,115 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
+    _markers = MarkerManager()
+      ..add(
+        Marker(
+          point: initialCenter,
+          alignment: Alignment.bottomCenter,
+          // Follows the marker by default — pan/zoom with it open.
+          overlayBuilder: (context) =>
+              _infoCard('Home pin', initialCenter, Colors.red),
+          child: const Icon(Icons.location_on, size: 40, color: Colors.red),
+        ),
+      )
+      ..add(
+        Marker(
+          point: const LatLng(latitude: 48.1351, longitude: 11.5820),
+          // This one demonstrates config: dismiss on the first camera
+          // move, and hang below the marker instead of above.
+          overlayConfig: const MarkerOverlayConfig(
+            removeOnMove: true,
+            anchor: MarkerOverlayAnchor.below,
+            offset: Offset(0, 6),
+          ),
+          overlayBuilder: (context) =>
+              _infoCard('Munich', const LatLng(latitude: 48.1351, longitude: 11.5820), Colors.blue),
+          child: const Text(
+            'Munich',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Colors.black87,
+            ),
+          ),
+        ),
+      );
     _markers.addListener(_onMarkersChanged);
+  }
+
+  /// The overlay ("info window") shown when a marker is tapped — a plain
+  /// Flutter widget, so it can hold any content (here: a close button).
+  Widget _infoCard(String title, LatLng point, Color accent) {
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 220),
+      padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.18),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 4,
+            height: 34,
+            decoration: BoxDecoration(
+              color: accent,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.black87,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '${point.latitude.toStringAsFixed(4)}, '
+                  '${point.longitude.toStringAsFixed(4)}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.black.withValues(alpha: 0.55),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            iconSize: 16,
+            onPressed: _markers.hideOverlay,
+            icon: const Icon(Icons.close, color: Colors.black45),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        duration: const Duration(milliseconds: 900),
+        content: Text(message),
+      ));
   }
 
   @override
@@ -99,13 +190,25 @@ class _MyHomePageState extends State<MyHomePage> {
 
   void _addPinAtCenter() {
     final color = _pinColors[_markers.length % _pinColors.length];
-    _markers.add(
-      Marker(
-        point: _center,
-        alignment: Alignment.bottomCenter,
-        child: Icon(Icons.location_on, size: 40, color: color),
+    final point = _center;
+    Marker? pin;
+    pin = Marker(
+      point: point,
+      alignment: Alignment.bottomCenter,
+      onTap: () => _showSnack(
+        'Tapped pin at '
+        '${point.latitude.toStringAsFixed(2)}, '
+        '${point.longitude.toStringAsFixed(2)}',
       ),
+      onLongPress: () {
+        _showSnack('Pin removed');
+        _markers.remove(pin!);
+      },
+      overlayBuilder: (context) =>
+          _infoCard('Pin #${_markers.length + 1}', point, color),
+      child: Icon(Icons.location_on, size: 40, color: color),
     );
+    _markers.add(pin);
   }
 
   void _addTextAtCenter() {
@@ -194,7 +297,8 @@ class _MyHomePageState extends State<MyHomePage> {
                 ],
               ),
               child: Text(
-                'Zoom: $_zoom · ${_markers.length} markers',
+                'Zoom: $_zoom · ${_markers.length} markers'
+                '${_markers.overlayMarker != null ? ' · overlay' : ''}',
                 style: const TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.w600,

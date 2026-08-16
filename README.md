@@ -9,7 +9,7 @@ A high-performance Flutter map library with native raster and vector tile render
 ## ✨ Features
 
 - 🗺️ **Dual Rendering Modes**: Native raster (OSM) and vector (Mapbox Vector Tiles) rendering
-- 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager`
+- 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager` — with tap/long-press gestures and marker-following overlays
 - 🚀 **High Performance**: Persistent HTTP isolate with TCP connection reuse
 - 🎯 **Smart Caching**: Memory + disk (Hive) with intelligent eviction
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
@@ -126,6 +126,57 @@ again. `alignment` picks which point of the widget sits on the
 coordinate (default: center; use `Alignment.bottomCenter` for pins).
 Marker children are ordinary widgets, so buttons and gesture handlers
 work inside them.
+
+### Marker gestures & overlays
+
+Markers accept `onTap` / `onLongPress` callbacks, and any marker with an
+`overlayBuilder` gets a tap-to-toggle overlay ("info window") — any
+Flutter widget, anchored to the marker and following it across pans and
+zooms:
+
+```dart
+markers.add(
+  Marker(
+    point: const LatLng(latitude: 47.4358, longitude: 8.4737),
+    alignment: Alignment.bottomCenter,
+    onTap: () => print('tapped'),           // fires alongside the toggle
+    onLongPress: () => print('long press'),
+    overlayBuilder: (context) => const Card(
+      child: Padding(
+        padding: EdgeInsets.all(8),
+        child: Text('Hello from Zurich'),
+      ),
+    ),
+    child: const Icon(Icons.location_on, size: 40, color: Colors.red),
+  ),
+);
+```
+
+Behavior is shaped per-marker with `MarkerOverlayConfig`:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `removeOnMove` | `false` | `true` dismisses the overlay as soon as the camera changes (pan, zoom, or programmatic); `false` keeps it anchored while it follows the marker |
+| `closeOnMapTap` | `true` | dismisses the overlay when the user taps the bare map or a marker without its own overlay; taps inside the overlay never dismiss it |
+| `anchor` | `above` | side of the marker the overlay sits on: `above`, `below` or `center` |
+| `offset` | `Offset(0, 8)` | extra gap between marker and overlay |
+| `animationDuration` | `200 ms` | fade + scale entrance; `Duration.zero` shows instantly |
+
+One overlay is visible at a time. The manager exposes programmatic
+control and listeners (which also fire for automatic dismissals like
+`removeOnMove` and map taps):
+
+```dart
+markers.showOverlay(myMarker);   // returns false if marker has no overlayBuilder
+markers.hideOverlay();
+markers.overlayMarker;           // whose overlay is open, or null
+
+markers.onOverlayShown = (marker) { /* … */ };
+markers.onOverlayHidden = (marker) { /* … */ };
+```
+
+Removing a marker (or clearing the manager) while its overlay is open
+hides the overlay automatically.
 
 ## 🏗️ Architecture
 
