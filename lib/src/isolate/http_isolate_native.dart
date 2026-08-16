@@ -3,14 +3,18 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
-/// Native implementation: spawns a long-lived isolate with a persistent
-/// [HttpClient] so TCP connections are reused across hundreds of tile
-/// requests — much cheaper than spawning a fresh isolate per tile via
-/// [compute].
+/// Persistent HTTP isolate for tile downloads (native implementation).
 ///
-/// Protocol (main → isolate):  `[SendPort replyPort, int z, int x, int y]`
+/// Spawns a long-lived isolate with a persistent [HttpClient] so TCP
+/// connections are reused across hundreds of requests — much cheaper
+/// than spawning a fresh isolate per tile via [compute].
+///
+/// Accepts arbitrary URL strings, so it works for both raster (OSM) and
+/// vector (OpenFreeMap, Mapbox, etc.) tile URLs.
+///
+/// Protocol (main → isolate):  `[SendPort replyPort, String url]`
 /// Protocol (isolate → main):  `Uint8List` on success, `String` on error.
-class PreloadIsolateImpl {
+class HttpIsolate {
   Isolate? _isolate;
   SendPort? _sendPort;
   final ReceivePort _receivePort = ReceivePort();
@@ -35,11 +39,14 @@ class PreloadIsolateImpl {
     await completer.future;
   }
 
-  /// Sends a fetch command and returns the raw PNG bytes.
+  /// Fetches [url] and returns the raw bytes.
   /// Throws a [String] error message on failure.
-  Future<Uint8List> fetch(int z, int x, int y) {
+  Future<Uint8List> fetchUrl(String url) {
+    if (!_ready) {
+      throw StateError('HttpIsolate not ready — call spawn() first');
+    }
     final responsePort = ReceivePort();
-    _sendPort!.send([responsePort.sendPort, z, x, y]);
+    _sendPort!.send([responsePort.sendPort, url]);
     return responsePort.first.then((response) {
       responsePort.close();
       if (response is Uint8List) return response;
@@ -62,43 +69,37 @@ class PreloadIsolateImpl {
     final receivePort = ReceivePort();
     mainSendPort.send(receivePort.sendPort);
 
+    // Persistent HttpClient reuses TCP connections across requests.
     final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 10);
+      ..connectionTimeout = const Duration(seconds: 10)
+      ..idleTimeout = const Duration(seconds: 30);
 
     receivePort.listen((message) async {
       final parts = message as List;
       final replyPort = parts[0] as SendPort;
-      final z = parts[1] as int;
-      final x = parts[2] as int;
-      final y = parts[3] as int;
+      final url = parts[1] as String;
 
       try {
-        replyPort.send(await _fetchOsmTile(client, z, x, y));
+        replyPort.send(await _fetch(client, url));
       } catch (e) {
         replyPort.send(e.toString());
       }
     });
   }
 
-  /// Fetches a tile from OpenStreetMap using the isolate's persistent
-  /// [HttpClient] (keeps TCP connections alive across requests).
-  static Future<Uint8List> _fetchOsmTile(
-      HttpClient client, int z, int x, int y) async {
-    final n = 1 << z;
-    final wrappedX = ((x % n) + n) % n;
-    final uri = Uri.parse(
-        'https://tile.openstreetmap.org/$z/$wrappedX/$y.png');
-
+  static Future<Uint8List> _fetch(HttpClient client, String url) async {
+    final uri = Uri.parse(url);
     final request = await client.getUrl(uri);
-    request.headers.set('User-Agent',
-        'fosm/0.0.1 (Flutter OSM map; +https://github.com/fosm)');
-    request.headers.set('Accept', 'image/png,image/*');
+    request.headers.set(
+      'User-Agent',
+      'fosm/0.0.1 (Flutter OSM map; +https://github.com/fosm)',
+    );
+    request.headers.set('Accept', '*/*');
 
     final response = await request.close();
-
     if (response.statusCode != 200) {
       response.drain<void>();
-      throw 'HTTP ${response.statusCode}';
+      throw 'HTTP ${response.statusCode} for $url';
     }
 
     final chunks = <List<int>>[];

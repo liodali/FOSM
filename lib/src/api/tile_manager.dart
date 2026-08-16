@@ -10,9 +10,9 @@ import '../common/cache_tile_mixin.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import 'geo_point.dart';
-import '../isolate/preload_isolate.dart'
-    if (dart.library.io) '../isolate/preload_isolate_native.dart'
-    if (dart.library.js_interop) '../isolate/preload_isolate_web.dart';
+import '../isolate/http_isolate.dart'
+    if (dart.library.io) '../isolate/http_isolate_native.dart'
+    if (dart.library.js_interop) '../isolate/http_isolate.dart';
 import 'tile.dart';
 import 'tile_source.dart';
 
@@ -99,14 +99,13 @@ class TileManager with CacheTiles {
   int _lastPreloadCenterX = 0;
   int _lastPreloadCenterY = 0;
 
-  // ── Pre-load worker ─────────────────────────────────────────────────
-  final PreloadIsolateImpl _preloadIsolate = PreloadIsolateImpl();
+  // ── HTTP isolate (persistent background isolate for all network I/O) ─
+  final HttpIsolate _httpIsolate = HttpIsolate();
 
-  /// Whether to use the persistent isolate for pre-load fetches.
-  /// Only enabled when using the default OSM fetcher — custom fetchers
-  /// go through the regular async path (which may already use compute).
-  /// On web, the isolate is a no-op so [isReady] is always false.
-  final bool _usePreloadIsolate;
+  /// Builds a tile URL from coordinates. When set, network requests
+  /// go through the HTTP isolate for TCP connection reuse. When null,
+  /// falls back to the [_fetcher] function.
+  final String Function(int z, int x, int y)? _urlBuilder;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
   bool _disposed = false;
@@ -122,22 +121,23 @@ class TileManager with CacheTiles {
     required this.zoom,
     TileFetcher? fetcher,
     TileDecoder? decoder,
+    String Function(int z, int x, int y)? urlBuilder,
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
     this.preloadDebounce = const Duration(milliseconds: 500),
   })  : _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
-        _usePreloadIsolate =
-            identical(fetcher ?? osmTileFetcher, osmTileFetcher) {
+        _urlBuilder = urlBuilder {
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
 
-    // Spawn the pre-load isolate only for the default OSM fetcher.
-    // On web, this is a no-op (PreloadIsolateImpl.isReady stays false).
-    if (_usePreloadIsolate) {
-      _preloadIsolate.spawn();
+    // Spawn the HTTP isolate when a URL builder is provided so that
+    // visible tile fetches and preloads use the persistent background
+    // isolate (TCP connection reuse). On web this is a no-op.
+    if (urlBuilder != null) {
+      _httpIsolate.spawn();
     }
   }
 
@@ -146,7 +146,7 @@ class TileManager with CacheTiles {
     _disposed = true;
     _preloadTimer?.cancel();
     _preloadTimer = null;
-    _preloadIsolate.dispose();
+    _httpIsolate.dispose();
     onTilesChanged = null;
     _renderTiles.clear();
     _inFlight.clear();
@@ -411,7 +411,14 @@ class TileManager with CacheTiles {
 
   Future<void> _loadFromNetwork(String key, int z, int x, int y) async {
     try {
-      final bytes = await _fetcher(z, x, y);
+      final Uint8List bytes;
+      if (_httpIsolate.isReady && _urlBuilder != null) {
+        // Use persistent HTTP isolate (native) — reuses TCP connections.
+        bytes = await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y));
+      } else {
+        // Fall back to fetcher (web or custom).
+        bytes = await _fetcher(z, x, y);
+      }
       _storeInByteCache(key, bytes);
       final image = await _decoder(bytes, z, x, y);
       unawaited(storeTile(key, Tile(image, key, y, x), bytes));
@@ -569,11 +576,11 @@ class TileManager with CacheTiles {
           }
         }
 
-        // Fetch bytes — via the persistent isolate when available,
-        // otherwise fall back to the regular fetcher (which on web
-        // uses the browser's fetch API with connection pooling).
-        bytes ??= (_usePreloadIsolate && _preloadIsolate.isReady)
-            ? await _preloadIsolate.fetch(z, x, y)
+        // Fetch bytes — via the persistent HTTP isolate when available
+        // (native, reuses TCP connections), otherwise fall back to the
+        // regular fetcher (web uses browser fetch API).
+        bytes ??= (_httpIsolate.isReady && _urlBuilder != null)
+            ? await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y))
             : await _fetcher(z, x, y);
       } catch (_) {
         _inFlight.remove(key);
