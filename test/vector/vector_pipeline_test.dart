@@ -182,7 +182,7 @@ void main() {
       final runtime = VectorTileRuntime(
         loaded: buildLoadedStyle(),
         namespace: 'pipeline-test',
-        parseInIsolate: false,
+        parseOffThread: false,
       );
 
       final manager = TileManager.init(
