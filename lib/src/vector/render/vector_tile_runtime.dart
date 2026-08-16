@@ -7,9 +7,7 @@ import 'package:flutter/foundation.dart';
 import '../../api/tile.dart' show Tile;
 import '../../api/tile_source.dart'
     show TileDecoder, TileFetcher, downloadTileBytes;
-import '../../isolate/mvt_worker.dart'
-    if (dart.library.io) '../../isolate/mvt_worker_native.dart'
-    if (dart.library.js_interop) '../../isolate/mvt_worker_web.dart';
+import '../../isolate/mvt_worker.dart';
 import '../mvt/vector_tile.dart';
 import '../style/map_style.dart' show StyleLayerType;
 import '../style/style_loader.dart';
