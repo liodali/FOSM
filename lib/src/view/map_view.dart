@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../api/geo_point.dart';
+import '../api/marker_manager.dart';
 import '../api/tile.dart';
 import '../api/tile_manager.dart';
 import '../api/tile_source.dart';
@@ -10,6 +11,7 @@ import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import '../vector/render/vector_tile_runtime.dart';
 import '../vector/style/style_loader.dart';
+import 'marker_layer.dart';
 import 'render.dart';
 import 'zoom_controls.dart';
 
@@ -24,7 +26,6 @@ class _GridSnapshot {
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
   final int revision;
-  final int zoom;
 
   _GridSnapshot({
     required this.horizontalTileCount,
@@ -35,7 +36,6 @@ class _GridSnapshot {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
-    required this.zoom,
   });
 
   factory _GridSnapshot.from(TileManager m) => _GridSnapshot(
@@ -47,7 +47,6 @@ class _GridSnapshot {
         topRowTilesCanvasY: m.topRowTilesCanvasY,
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
-        zoom: m.zoom,
       );
 }
 
@@ -71,6 +70,12 @@ class _GridSnapshot {
 ///   The geographic point under the focal point stays stationary.
 /// - **Double-tap**: zoom in one level with a smooth crossfade animation.
 ///
+/// ### Markers
+/// Pass a [MarkerManager] to [markers] and mutate it at runtime — markers
+/// (any widget, or plain text) render above the tile grid and below the
+/// vector label overlay, and are culled when their anchor leaves the
+/// viewport.
+///
 /// ### Zoom animation (Google Maps / Leaflet style)
 /// When [animateZoom] is `true` (default), tapping +/− or double-tapping
 /// triggers a **crossfade** between old and new zoom tiles:
@@ -85,6 +90,11 @@ class MapView extends StatefulWidget {
   final int maxZoom;
   final TileFetcher? tileFetcher;
 
+  /// Markers rendered above the tile grid (and below the vector label
+  /// overlay). Mutating the manager at runtime updates the map — pass it
+  /// once and call [MarkerManager.add] / [MarkerManager.clear] anywhere.
+  final MarkerManager? markers;
+
   /// Renders a hosted vector style instead of raster tiles (e.g.
   /// [openFreeMapLiberty]). When set, [tileFetcher] is ignored — the
   /// style document defines all tile sources. Raster mode remains the
@@ -93,6 +103,12 @@ class MapView extends StatefulWidget {
 
   final bool showZoomControls;
   final ValueChanged<int>? onZoomChanged;
+
+  /// Called after the user pans or zooms the map. Lets the host track the
+  /// camera (e.g. to restore it after switching tile sources). Not called
+  /// for programmatic [latLng]/[zoom] widget changes.
+  final void Function(LatLng center, int zoom)? onCameraChanged;
+
   final Alignment zoomControlsAlignment;
   final bool animateZoom;
   final Duration zoomAnimationDuration;
@@ -104,9 +120,11 @@ class MapView extends StatefulWidget {
     this.minZoom = 1,
     this.maxZoom = 19,
     this.tileFetcher,
+    this.markers,
     this.vectorStyle,
     this.showZoomControls = true,
     this.onZoomChanged,
+    this.onCameraChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
@@ -232,6 +250,10 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     if (mounted) setState(() {});
   }
 
+  void _notifyCamera(TileManager manager) {
+    widget.onCameraChanged?.call(manager.centerLatLng, manager.zoom);
+  }
+
   TileManager _ensureManager(Size size) {
     final existing = _tileManager;
     if (existing != null) {
@@ -285,6 +307,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     manager.setZoomWithFocalPoint(newZoom, focal, oldZoom);
     _currentZoom = newZoom;
     widget.onZoomChanged?.call(newZoom);
+    _notifyCamera(manager);
     setState(() {});
   }
 
@@ -321,6 +344,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     manager.setZoomWithFocalPoint(targetZoom, focal, manager.zoom);
     _currentZoom = targetZoom;
     widget.onZoomChanged?.call(targetZoom);
+    _notifyCamera(manager);
 
     // 3. Set up the scale animation for the old grid overlay.
     _scaleAnimation = Tween<double>(
@@ -408,11 +432,13 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
       _currentZoom = newZoom;
       manager.setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
       widget.onZoomChanged?.call(newZoom);
+      _notifyCamera(manager);
     } else {
       final delta = focalLocal - _scaleStartFocal!;
       final newTileLng = startTileLng - delta.dx / tileWidth;
       final newTileLat = startTileLat - delta.dy / tileHeight;
       manager.setCenterFromTileCoords(newTileLng, newTileLat);
+      _notifyCamera(manager);
     }
 
     setState(() {});
@@ -518,8 +544,6 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                     topRowTilesCanvasY: manager.topRowTilesCanvasY,
                     tiles: manager.renderTiles,
                     revision: manager.revision,
-                    zoom: manager.zoom,
-                    overlay: runtime?.createLabelOverlay(),
                   ),
                 ),
               ),
@@ -553,8 +577,42 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                               _animOldSnapshot!.topRowTilesCanvasY,
                           tiles: _animOldSnapshot!.tiles,
                           revision: _animOldSnapshot!.revision,
-                          zoom: _animOldSnapshot!.zoom,
                         ),
+                      ),
+                    ),
+                  ),
+                ),
+
+              // ── Markers (above tiles + crossfade, below labels) ───
+              if (widget.markers != null)
+                Positioned.fill(
+                  child: MarkerLayer(
+                    markers: widget.markers!,
+                    manager: manager,
+                  ),
+                ),
+
+              // ── Vector labels (above markers; need viewport-level ──
+              // ── collision, not per-tile rendering). Ignored for  ───
+              // ── hit testing so markers stay tappable.             ───
+              if (runtime != null)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: CustomPaint(
+                      size: size,
+                      painter: VectorLabelPainter(
+                        horizontalTileCount: manager.horizontalTileCount,
+                        verticalTileCount: manager.verticalTileCount,
+                        leftColumnTilesLngIndex:
+                            manager.leftColumnTilesLngIndex,
+                        topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                        leftColumnTilesCanvasX:
+                            manager.leftColumnTilesCanvasX,
+                        topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                        tiles: manager.renderTiles,
+                        revision: manager.revision,
+                        zoom: manager.zoom,
+                        overlay: runtime.createLabelOverlay(),
                       ),
                     ),
                   ),

@@ -9,6 +9,7 @@ A high-performance Flutter map library with native raster and vector tile render
 ## ✨ Features
 
 - 🗺️ **Dual Rendering Modes**: Native raster (OSM) and vector (Mapbox Vector Tiles) rendering
+- 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager`
 - 🚀 **High Performance**: Persistent HTTP isolate with TCP connection reuse
 - 🎯 **Smart Caching**: Memory + disk (Hive) with intelligent eviction
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
@@ -85,6 +86,46 @@ MapView(
   vectorStyle: customStyle,
 )
 ```
+
+### Markers
+
+Own a `MarkerManager`, pass it to the map, and mutate it at runtime — the
+map re-renders on every change:
+
+```dart
+final markers = MarkerManager();
+
+MapView(
+  latLng: const LatLng(latitude: 47.4358, longitude: 8.4737),
+  zoom: 10,
+  markers: markers,
+);
+
+// Any widget, anchored so its bottom-center tip sits on the coordinate:
+markers.add(
+  const Marker(
+    point: LatLng(latitude: 47.4358, longitude: 8.4737),
+    alignment: Alignment.bottomCenter,
+    child: Icon(Icons.location_on, size: 40, color: Colors.red),
+  ),
+);
+
+// Or plain text:
+markers.add(Marker.text('Zurich', const LatLng(latitude: 47.3769, longitude: 8.5417)));
+
+// Remove individually (by identity), filter, or clear:
+markers.remove(firstMarker);
+markers.removeWhere((m) => /* … */);
+markers.clear();
+```
+
+Markers render above the tile grid (below vector labels) and track the
+camera on every pan and zoom. Markers whose anchor leaves the viewport
+are culled — they are not built, laid out, or painted until visible
+again. `alignment` picks which point of the widget sits on the
+coordinate (default: center; use `Alignment.bottomCenter` for pins).
+Marker children are ordinary widgets, so buttons and gesture handlers
+work inside them.
 
 ## 🏗️ Architecture
 
@@ -513,11 +554,14 @@ lib/
     │   ├── tile.dart                  # Tile data class
     │   ├── tile_manager.dart          # Grid calculation & loading
     │   ├── tile_source.dart           # TileFetcher typedef
-    │   └── geo_point.dart             # LatLng class
+    │   ├── geo_point.dart             # LatLng class
+    │   ├── marker.dart                # Marker model
+    │   └── marker_manager.dart        # Marker collection (ChangeNotifier)
     │
     ├── view/
     │   ├── map_view.dart              # Main map widget
-    │   ├── render.dart                # CustomPainter
+    │   ├── render.dart                # CustomPainters (tiles, labels)
+    │   ├── marker_layer.dart          # Widget markers + viewport culling
     │   └── zoom_controls.dart         # +/- buttons
     │
     ├── vector/
@@ -551,6 +595,8 @@ test/
 │   ├── vector_tile_test.dart
 │   ├── style_parser_test.dart
 │   └── expression_test.dart
+├── marker_manager_test.dart
+├── marker_layer_test.dart
 └── tile_manager_test.dart
 ```
 

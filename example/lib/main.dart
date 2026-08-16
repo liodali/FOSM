@@ -31,21 +31,95 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   static const String defaultStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
+  static const LatLng initialCenter = LatLng(
+    latitude: 47.4358055,
+    longitude: 8.4737324,
+  );
 
-  int _zoom = 7;
-  bool _animateZoom = true; // Toggle for zoom animation
-  // TEMP: default vector to reproduce the Chrome issue with console logs.
-  _MapMode _mode = _MapMode.vector;
+  // Tile source selection
+  _MapMode _mode = _MapMode.raster;
 
   /// Style URL currently applied to the map (vector mode).
   late String _activeStyleUrl = defaultStyleUrl;
   final TextEditingController _styleUrlController =
       TextEditingController(text: defaultStyleUrl);
 
+  // Camera state — kept in sync via [MapView.onCameraChanged] so switching
+  // tile sources rebuilds the map at the same place.
+  LatLng _center = initialCenter;
+  int _zoom = 7;
+
+  bool _animateZoom = true;
+
+  // ── Markers ─────────────────────────────────────────────────────────
+  // Owned by the page so markers survive raster/vector mode switches.
+  final MarkerManager _markers = MarkerManager()
+    ..add(
+      const Marker(
+        point: initialCenter,
+        alignment: Alignment.bottomCenter,
+        child: Icon(Icons.location_on, size: 40, color: Colors.red),
+      ),
+    )
+    ..add(
+      Marker.text(
+        'Munich',
+        const LatLng(latitude: 48.1351, longitude: 11.5820),
+        style: const TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          color: Colors.black87,
+        ),
+      ),
+    );
+
+  static const List<Color> _pinColors = [
+    Colors.red,
+    Colors.blue,
+    Colors.green,
+    Colors.orange,
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _markers.addListener(_onMarkersChanged);
+  }
+
   @override
   void dispose() {
+    _markers.removeListener(_onMarkersChanged);
     _styleUrlController.dispose();
     super.dispose();
+  }
+
+  void _onMarkersChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _addPinAtCenter() {
+    final color = _pinColors[_markers.length % _pinColors.length];
+    _markers.add(
+      Marker(
+        point: _center,
+        alignment: Alignment.bottomCenter,
+        child: Icon(Icons.location_on, size: 40, color: color),
+      ),
+    );
+  }
+
+  void _addTextAtCenter() {
+    _markers.add(
+      Marker.text(
+        'Marker #${_markers.length + 1}',
+        _center,
+        style: const TextStyle(
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          color: Colors.black87,
+        ),
+      ),
+    );
   }
 
   VectorMapStyle get _vectorStyle => _styleFor(_activeStyleUrl);
@@ -63,135 +137,107 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() => _activeStyleUrl = url);
   }
 
+  /// Rebuilds the map (new key) with the current camera, preserving the
+  /// viewport across raster/vector switches. New modes need a fresh
+  /// [MapView] state because they use different tile pipelines.
+  void _setMode(_MapMode mode) {
+    if (mode == _mode) return;
+    setState(() => _mode = mode);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('FOSM Map')),
-      body: Column(
+      body: Stack(
         children: [
-          Expanded(
-            child: Stack(
-              children: [
-                // Map fills the area. The key forces a fresh map state when
-                // the mode or style URL changes (different tile pipelines).
-                KeyedSubtree(
-                  key: ValueKey('$_mode|$_activeStyleUrl'),
-                  child: MapView(
-                    latLng: const LatLng(
-                      latitude: 47.4358055,
-                      longitude: 8.4737324,
-                    ),
-                    zoom: 7,
-                    minZoom: 1,
-                    maxZoom: 19,
-                    vectorStyle:
-                        _mode == _MapMode.vector ? _vectorStyle : null,
-                    showZoomControls: true,
-                    animateZoom: _animateZoom, // Control animation
-                    zoomAnimationDuration: const Duration(milliseconds: 300),
-                    onZoomChanged: (zoom) {
-                      setState(() => _zoom = zoom);
-                    },
-                  ),
-                ),
-
-                // Zoom level indicator (top-left)
-                Positioned(
-                  top: 16,
-                  left: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.9),
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.1),
-                          blurRadius: 4,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: Text(
-                      'Zoom: $_zoom',
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.black87,
-                      ),
-                    ),
-                  ),
-                ),
-
-                // Animation toggle (top-right)
-                Positioned(
-                  top: 16,
-                  right: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 12, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.9),
-                      borderRadius: BorderRadius.circular(8),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.1),
-                          blurRadius: 4,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.animation,
-                            size: 18, color: Colors.black87),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'Animate',
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                            color: Colors.black87,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Switch(
-                          value: _animateZoom,
-                          onChanged: (value) {
-                            setState(() => _animateZoom = value);
-                          },
-                          materialTapTargetSize:
-                              MaterialTapTargetSize.shrinkWrap,
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
+          // Single full-screen map. The key forces a fresh map state when
+          // the mode or style URL changes; latLng/zoom restore the camera.
+          KeyedSubtree(
+            key: ValueKey('$_mode|$_activeStyleUrl'),
+            child: MapView(
+              latLng: _center,
+              zoom: _zoom,
+              minZoom: 1,
+              maxZoom: 19,
+              vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
+              showZoomControls: true,
+              animateZoom: _animateZoom,
+              zoomAnimationDuration: const Duration(milliseconds: 300),
+              onZoomChanged: (zoom) => setState(() => _zoom = zoom),
+              onCameraChanged: (center, zoom) {
+                setState(() {
+                  _center = center;
+                  _zoom = zoom;
+                });
+              },
+              markers: _markers,
             ),
           ),
 
-          // ── Tile source controls ─────────────────────────────────────
-          _buildSourceControls(),
+          // Zoom level indicator (top-left)
+          Positioned(
+            top: 16,
+            left: 16,
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.1),
+                    blurRadius: 4,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Text(
+                'Zoom: $_zoom · ${_markers.length} markers',
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.black87,
+                ),
+              ),
+            ),
+          ),
+
+          // ── Markers button (drops a pin at the current map center)
+          Positioned(
+            right: 16,
+            bottom: 230,
+            child: _AddMarkerButton(
+              onPressed: _addPinAtCenter,
+            ),
+          ),
+
+          // ── Layers button (above the zoom controls, Google Maps style)
+          Positioned(
+            right: 16,
+            bottom: 176,
+            child: _LayersButton(
+              mode: _mode,
+              onPressed: () => _showTileOptions(context),
+            ),
+          ),
         ],
       ),
     );
   }
 
+  void _showTileOptions(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (context) => _buildSourceControls(),
+    );
+  }
+
   Widget _buildSourceControls() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border(
-          top: BorderSide(color: Colors.black.withValues(alpha: 0.08)),
-        ),
-      ),
-      child: SafeArea(
-        top: false,
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -210,13 +256,62 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ],
               selected: {_mode},
-              onSelectionChanged: (selection) {
-                setState(() => _mode = selection.first);
-              },
+              onSelectionChanged: (selection) => _setMode(selection.first),
               showSelectedIcon: false,
             ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(Icons.animation, size: 18, color: Colors.black87),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Animate zoom',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ),
+                Switch(
+                  value: _animateZoom,
+                  onChanged: (value) => setState(() => _animateZoom = value),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(Icons.location_on, size: 18, color: Colors.black87),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Markers (${_markers.length})',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: _addTextAtCenter,
+                  icon: const Icon(Icons.text_fields, size: 16),
+                  label: const Text('Text'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed:
+                      _markers.isEmpty ? null : _markers.clear,
+                  icon: const Icon(Icons.delete_outline, size: 16),
+                  label: const Text('Clear'),
+                ),
+              ],
+            ),
             if (_mode == _MapMode.vector) ...[
-              const SizedBox(height: 8),
+              const SizedBox(height: 12),
               Row(
                 children: [
                   Expanded(
@@ -257,6 +352,75 @@ class _MyHomePageState extends State<MyHomePage> {
               ),
             ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Floating round button that drops a pin at the current map center.
+class _AddMarkerButton extends StatelessWidget {
+  final VoidCallback onPressed;
+
+  const _AddMarkerButton({required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white.withValues(alpha: 0.92),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      elevation: 2,
+      shadowColor: Colors.black.withValues(alpha: 0.15),
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(8),
+          child: const Tooltip(
+            message: 'Add marker at center',
+            child: Icon(
+              Icons.add_location_alt,
+              size: 22,
+              color: Colors.red,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Floating round button styled after Google Maps' "layers" button,
+/// placed directly above the zoom controls.
+class _LayersButton extends StatelessWidget {
+  final _MapMode mode;
+  final VoidCallback onPressed;
+
+  const _LayersButton({required this.mode, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final isVector = mode == _MapMode.vector;
+    return Material(
+      color: Colors.white.withValues(alpha: 0.92),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      elevation: 2,
+      shadowColor: Colors.black.withValues(alpha: 0.15),
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(8),
+          child: Tooltip(
+            message: 'Tile options',
+            child: Icon(
+              isVector ? Icons.layers : Icons.map,
+              size: 22,
+              color: Colors.grey[800],
+            ),
+          ),
         ),
       ),
     );

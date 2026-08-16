@@ -186,6 +186,18 @@ class TileManager with CacheTiles {
     centerTileLat = centerTileLat.clamp(0.0, n);
   }
 
+  /// Projects a geographic point to viewport-local pixels under the
+  /// current camera (center + zoom). Valid for the frame in which it is
+  /// called — pan/zoom update the camera continuously.
+  Offset latLngToScreen(LatLng point) {
+    final tileX = lon2TileX(point.longitude, zoom);
+    final tileY = lat2TileY(point.latitude, zoom);
+    return Offset(
+      (tileX - centerTileLng) * tileWidth + centerCanvasX,
+      (tileY - centerTileLat) * tileHeight + centerCanvasY,
+    );
+  }
+
   void resize(Size size) {
     width = size.width;
     height = size.height;

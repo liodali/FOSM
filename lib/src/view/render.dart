@@ -23,13 +23,6 @@ class RenderCanvasOSM extends CustomPainter {
   final List<Tile> tiles;
   final int revision;
 
-  /// Current zoom — vector styles evaluate paint properties per zoom.
-  final int zoom;
-
-  /// Vector label overlay, painted above the tile grid. Null in raster
-  /// mode (and for the zoom-animation snapshot, where labels pause).
-  final LabelOverlay? overlay;
-
   RenderCanvasOSM({
     required this.horizontalTileCount,
     required this.verticalTileCount,
@@ -39,8 +32,6 @@ class RenderCanvasOSM extends CustomPainter {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
-    this.zoom = 0,
-    this.overlay,
   });
 
   static const Color _checkerLight = Color(0xFFF5F5F5);
@@ -93,19 +84,6 @@ class RenderCanvasOSM extends CustomPainter {
         }
       }
     }
-
-    // Vector labels sit above every tile (they need viewport-level
-    // collision, not per-tile rendering).
-    overlay?.paint(
-      canvas,
-      size,
-      zoom: zoom,
-      leftColumnTilesCanvasX: leftColumnTilesCanvasX,
-      topRowTilesCanvasY: topRowTilesCanvasY,
-      leftColumnTilesLngIndex: leftColumnTilesLngIndex,
-      topRowTilesLatIndex: topRowTilesLatIndex,
-      tiles: tiles,
-    );
   }
 
   void _drawCheckerboard(
@@ -148,5 +126,60 @@ class RenderCanvasOSM extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) =>
+      oldDelegate.revision != revision;
+}
+
+/// Paints the vector label overlay (place names, road shields, POI icons)
+/// for the whole viewport. Lives in its own [CustomPaint] above the marker
+/// layer, so labels stay legible over markers while markers stay above
+/// the tile grid.
+///
+/// Raster mode passes no [overlay] and the painter is a no-op.
+class VectorLabelPainter extends CustomPainter {
+  final int horizontalTileCount;
+  final int verticalTileCount;
+  final int leftColumnTilesLngIndex;
+  final int topRowTilesLatIndex;
+  final double leftColumnTilesCanvasX;
+  final double topRowTilesCanvasY;
+  final List<Tile> tiles;
+  final int revision;
+
+  /// Current zoom — styles evaluate paint properties per zoom.
+  final int zoom;
+
+  /// Vector label overlay. Null in raster mode (and during the
+  /// zoom-animation snapshot, where labels pause).
+  final LabelOverlay? overlay;
+
+  VectorLabelPainter({
+    required this.horizontalTileCount,
+    required this.verticalTileCount,
+    required this.leftColumnTilesLngIndex,
+    required this.topRowTilesLatIndex,
+    required this.leftColumnTilesCanvasX,
+    required this.topRowTilesCanvasY,
+    required this.tiles,
+    required this.revision,
+    required this.zoom,
+    required this.overlay,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    overlay?.paint(
+      canvas,
+      size,
+      zoom: zoom,
+      leftColumnTilesCanvasX: leftColumnTilesCanvasX,
+      topRowTilesCanvasY: topRowTilesCanvasY,
+      leftColumnTilesLngIndex: leftColumnTilesLngIndex,
+      topRowTilesLatIndex: topRowTilesLatIndex,
+      tiles: tiles,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant VectorLabelPainter oldDelegate) =>
       oldDelegate.revision != revision;
 }
