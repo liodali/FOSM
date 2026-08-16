@@ -248,6 +248,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
       zoom: widget.zoom,
       fetcher: runtime?.fetcher ?? widget.tileFetcher,
       decoder: runtime?.decoder,
+      urlBuilder: runtime?.urlBuilder,
       cacheNamespace: runtime?.namespace ?? '',
     );
     manager.onTilesChanged = _notify;

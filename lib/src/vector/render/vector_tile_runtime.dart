@@ -92,6 +92,11 @@ class VectorTileRuntime {
         return _fetchShared(source.urlFor(z, x, y));
       };
 
+  /// URL builder for [TileManager]'s HTTP isolate. Builds the vector
+  /// tile URL with over-zoom applied.
+  String Function(int z, int x, int y) get urlBuilder =>
+      (z, x, y) => vectorSource.urlFor(z, x, y);
+
   /// Tile decoder for [TileManager]: parses MVT bytes, caches the parsed
   /// source tile, and rasterizes the logical 256px tile image. Jobs pass
   /// through a small concurrency gate to keep frames responsive.

@@ -56,8 +56,9 @@ String tileUrl(int z, int x, int y) {
   return 'https://tile.openstreetmap.org/$z/$wrappedX/$y.png';
 }
 
-/// Default [TileFetcher]: downloads from OpenStreetMap inside an isolate
-/// ([compute]) so the main thread is never blocked by network/decode work.
+/// Default [TileFetcher]: downloads from OpenStreetMap. Used as fallback
+/// on web where isolates aren't available. On native, [TileManager] uses
+/// the persistent HTTP isolate instead (better TCP connection reuse).
 Future<Uint8List> osmTileFetcher(int z, int x, int y) {
-  return compute(downloadTileBytes, tileUrl(z, x, y));
+  return downloadTileBytes(tileUrl(z, x, y));
 }
