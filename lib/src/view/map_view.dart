@@ -74,7 +74,10 @@ class _GridSnapshot {
 /// Pass a [MarkerManager] to [markers] and mutate it at runtime — markers
 /// (any widget, or plain text) render above the tile grid and below the
 /// vector label overlay, and are culled when their anchor leaves the
-/// viewport.
+/// viewport. Markers accept [onTap]/[onLongPress] callbacks, and those
+/// with a [Marker.overlayBuilder] show a tap-to-toggle overlay that
+/// follows the marker across pans and zooms (see [MarkerOverlayConfig]
+/// for `removeOnMove` and friends).
 ///
 /// ### Zoom animation (Google Maps / Leaflet style)
 /// When [animateZoom] is `true` (default), tapping +/− or double-tapping
@@ -451,6 +454,18 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     _scaleStartFocal = null;
   }
 
+  /// Bare-map tap: closes an open marker overlay when its config allows
+  /// (`MarkerOverlayConfig.closeOnMapTap`). Marker taps never reach here —
+  /// their own recognizer is deeper in the tree and wins the arena.
+  void _onMapTap() {
+    final markers = widget.markers;
+    if (markers == null) return;
+    final overlay = markers.overlayMarker;
+    if (overlay != null && overlay.overlayConfig.closeOnMapTap) {
+      markers.hideOverlay();
+    }
+  }
+
   // ── Build ───────────────────────────────────────────────────────────
 
   /// Shown while a vector style loads (style JSON + TileJSON fetch) or if
@@ -523,6 +538,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
           onScaleStart: _onScaleStart,
           onScaleUpdate: (d) => _onScaleUpdate(manager, d),
           onScaleEnd: _onScaleEnd,
+          onTap: _onMapTap,
           onDoubleTapDown: (details) {
             _doubleTapLocal = details.localPosition;
           },
@@ -549,8 +565,12 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
               ),
 
               // ── OLD zoom tiles (overlay, scaled + fading out) ─────
+              // Keyed: this child inserts/removes mid-animation, and an
+              // unkeyed insertion reshuffles — recreating the state of —
+              // every Stack child after it (marker layer included).
               if (isCrossfade)
                 Positioned.fill(
+                  key: const ValueKey('zoom-crossfade'),
                   child: Transform.scale(
                     scale: _visualScale,
                     alignment: scaleAlignment,
