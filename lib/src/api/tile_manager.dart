@@ -32,9 +32,17 @@ class TileManager with CacheTiles {
   final Duration preloadDebounce;
 
   /// Maximum number of concurrent pre-load fetches.
-  static const int maxConcurrentPreloads = 50;
+  static const int maxConcurrentPreloads = 20;
 
   final TileFetcher _fetcher;
+
+  /// Turns fetched bytes into a [ui.Image] — the raster codec by default,
+  /// the vector parse+render pipeline in vector mode.
+  final TileDecoder _decoder;
+
+  /// Prefix for all cache keys (memory, byte and Hive). Vector styles set
+  /// this to the style id so their entries never collide with raster ones.
+  final String cacheNamespace;
 
   // ── Grid geometry ───────────────────────────────────────────────────
   late int horizontalTileCount;
@@ -113,10 +121,13 @@ class TileManager with CacheTiles {
     required this.centerLatLng,
     required this.zoom,
     TileFetcher? fetcher,
+    TileDecoder? decoder,
+    this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
     this.preloadDebounce = const Duration(milliseconds: 500),
   })  : _fetcher = fetcher ?? osmTileFetcher,
+        _decoder = decoder ?? _decodeRasterTile,
         _usePreloadIsolate =
             identical(fetcher ?? osmTileFetcher, osmTileFetcher) {
     centerCanvasX = width / 2;
@@ -267,11 +278,17 @@ class TileManager with CacheTiles {
 
     _renderTiles.clear();
 
+    // First pass: build render list and collect tiles that need loading.
+    // We sort pending loads center-first so the user sees the middle of
+    // the map before the edges — critical for vector mode where each
+    // decode is expensive.
+    final pending = <({String key, int lng, int lat, double dist})>[];
+
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileLatIndex = topRowTilesLatIndex + vIndex;
-        final key = tileKey(zoom, tileLngIndex, tileLatIndex);
+        final key = _key(zoom, tileLngIndex, tileLatIndex);
 
         // Synchronous memory-cache hit → no flicker.
         final cached = _memoryCache.remove(key);
@@ -282,8 +299,22 @@ class TileManager with CacheTiles {
         }
 
         _renderTiles.add(Tile(null, key, tileLatIndex, tileLngIndex));
-        _scheduleLoad(key, zoom, tileLngIndex, tileLatIndex);
+        // Squared distance from center (no sqrt needed for ordering).
+        final dx = tileLngIndex - centerTileLng;
+        final dy = tileLatIndex - centerTileLat;
+        pending.add((
+          key: key,
+          lng: tileLngIndex,
+          lat: tileLatIndex,
+          dist: dx * dx + dy * dy,
+        ));
       }
+    }
+
+    // Schedule loads center-first.
+    pending.sort((a, b) => a.dist.compareTo(b.dist));
+    for (final p in pending) {
+      _scheduleLoad(p.key, zoom, p.lng, p.lat);
     }
 
     _trimMemoryCache();
@@ -323,9 +354,9 @@ class TileManager with CacheTiles {
   }
 
   Future<void> _decodeFromByteCache(
-      String key, Uint8List bytes, int z, int x, int y) async {
+    String key, Uint8List bytes, int z, int x, int y) async {
     try {
-      final image = await Tile.decodeImage(bytes);
+      final image = await _decoder(bytes, z, x, y);
       _complete(key, Tile(image, key, y, x));
     } catch (_) {
       _byteCache.remove(key);
@@ -335,32 +366,54 @@ class TileManager with CacheTiles {
   }
 
   Future<void> _loadFromDisk(String key) async {
+    Uint8List? bytes;
     try {
-      final tile = await storedTile(key);
-      if (tile?.sourceTile != null) {
-        _complete(key, tile!);
-        return;
-      }
-      await deleteStoredTile(key);
+      bytes = await storedTileBytes(key);
     } catch (_) {
+      bytes = null;
+    }
+
+    if (bytes != null && bytes.isNotEmpty) {
+      // Keys may carry a style namespace ("style/z/x/y") — always read
+      // the coordinates from the tail.
+      final parts = key.split('/');
+      final z = int.tryParse(parts[parts.length - 3]);
+      final x = int.tryParse(parts[parts.length - 2]);
+      final y = int.tryParse(parts[parts.length - 1]);
+      if (z != null && x != null && y != null) {
+        try {
+          final image = await _decoder(bytes, z, x, y);
+          _complete(key, Tile(image, key, y, x));
+          return;
+        } catch (_) {
+          await deleteStoredTile(key); // corrupt entry — re-download
+        }
+      }
+    } else {
       try {
         await deleteStoredTile(key);
       } catch (_) {}
     }
+
     if (_disposed) {
       _inFlight.remove(key);
       return;
     }
     _inFlight.remove(key);
-    _scheduleLoad(key, zoom, int.parse(key.split('/')[1]),
-        int.parse(key.split('/')[2]));
+    final parts = key.split('/');
+    _scheduleLoad(
+      key,
+      int.tryParse(parts[parts.length - 3]) ?? zoom,
+      int.tryParse(parts[parts.length - 2]) ?? 0,
+      int.tryParse(parts[parts.length - 1]) ?? 0,
+    );
   }
 
   Future<void> _loadFromNetwork(String key, int z, int x, int y) async {
     try {
       final bytes = await _fetcher(z, x, y);
       _storeInByteCache(key, bytes);
-      final image = await Tile.decodeImage(bytes);
+      final image = await _decoder(bytes, z, x, y);
       unawaited(storeTile(key, Tile(image, key, y, x), bytes));
       _complete(key, Tile(image, key, y, x));
     } catch (_) {
@@ -441,10 +494,11 @@ class TileManager with CacheTiles {
     final visibleVCount =
         (verticalTileCount - 2 * tilePadding).clamp(0, 100);
 
-    // Only preload ±1 and ±2 (±3 would be 64× tiles per visible tile).
+    // Only preload ±1 zoom (±2 creates 1000+ tiles that compete with
+    // visible tile fetches and freeze the UI, especially in vector mode).
     // Priority: closest zoom levels first.
     final zoomDeltas = <int>[];
-    for (final dz in [1, -1, 2, -2]) {
+    for (final dz in [1, -1]) {
       final z = zoom + dz;
       if (z >= 0 && z <= 19) zoomDeltas.add(dz);
     }
@@ -468,10 +522,10 @@ class TileManager with CacheTiles {
 
           // Load all tiles that cover this geographic area at target zoom.
           for (var dx = 0; dx < tileMultiplier; dx++) {
-            for (var dy = 0; dy < tileMultiplier; dy++) {
-              final tx = otherX + dx;
-              final ty = otherY + dy;
-              final key = tileKey(z, tx, ty);
+              for (var dy = 0; dy < tileMultiplier; dy++) {
+                final tx = otherX + dx;
+                final ty = otherY + dy;
+                final key = _key(z, tx, ty);
 
               // Skip if already cached or in-flight.
               if (_memoryCache.containsKey(key)) continue;
@@ -580,5 +634,19 @@ class TileManager with CacheTiles {
 
   // ── Helpers ─────────────────────────────────────────────────────────
 
+  /// Namespaced cache key — `z/x/y` for raster, `style/z/x/y` in vector
+  /// mode so entries from different styles coexist in the caches.
+  String _key(int z, int x, int y) =>
+      cacheNamespace.isEmpty ? '$z/$x/$y' : '$cacheNamespace/$z/$x/$y';
+
   static String tileKey(int z, int x, int y) => '$z/$x/$y';
+
+  /// Raster default decoder: the bytes are an encoded image.
+  static Future<ui.Image> _decodeRasterTile(
+    Uint8List bytes,
+    int z,
+    int x,
+    int y,
+  ) =>
+      Tile.decodeImage(bytes);
 }

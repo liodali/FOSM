@@ -52,6 +52,15 @@ mixin CacheTiles {
     );
   }
 
+  /// Returns raw cached bytes for [cacheKey] without decoding — the caller
+  /// applies its own decoder (raster codec or vector pipeline).
+  Future<Uint8List?> storedTileBytes(String cacheKey) async {
+    if (!isCacheReady) return null;
+    final tileJson = _boxTileCache!.get(cacheKey);
+    if (tileJson is! Map) return null;
+    return _extractBytes(tileJson['image']);
+  }
+
   /// Returns raw cached bytes for [cacheKey] without decoding the image.
   /// Useful when we want to persist-then-decode in one shot.
   Uint8List? cachedTileBytes(String cacheKey) {

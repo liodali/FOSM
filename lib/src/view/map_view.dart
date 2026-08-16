@@ -8,6 +8,8 @@ import '../api/tile_manager.dart';
 import '../api/tile_source.dart';
 import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
+import '../vector/render/vector_tile_runtime.dart';
+import '../vector/style/style_loader.dart';
 import 'render.dart';
 import 'zoom_controls.dart';
 
@@ -22,6 +24,7 @@ class _GridSnapshot {
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
   final int revision;
+  final int zoom;
 
   _GridSnapshot({
     required this.horizontalTileCount,
@@ -32,6 +35,7 @@ class _GridSnapshot {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
+    required this.zoom,
   });
 
   factory _GridSnapshot.from(TileManager m) => _GridSnapshot(
@@ -43,6 +47,7 @@ class _GridSnapshot {
         topRowTilesCanvasY: m.topRowTilesCanvasY,
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
+        zoom: m.zoom,
       );
 }
 
@@ -79,6 +84,13 @@ class MapView extends StatefulWidget {
   final int minZoom;
   final int maxZoom;
   final TileFetcher? tileFetcher;
+
+  /// Renders a hosted vector style instead of raster tiles (e.g.
+  /// [openFreeMapLiberty]). When set, [tileFetcher] is ignored — the
+  /// style document defines all tile sources. Raster mode remains the
+  /// default when this is null.
+  final VectorMapStyle? vectorStyle;
+
   final bool showZoomControls;
   final ValueChanged<int>? onZoomChanged;
   final Alignment zoomControlsAlignment;
@@ -92,6 +104,7 @@ class MapView extends StatefulWidget {
     this.minZoom = 1,
     this.maxZoom = 19,
     this.tileFetcher,
+    this.vectorStyle,
     this.showZoomControls = true,
     this.onZoomChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
@@ -106,6 +119,10 @@ class MapView extends StatefulWidget {
 class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   TileManager? _tileManager;
   int _currentZoom = 0;
+
+  // ── Vector style session ────────────────────────────────────────────
+  VectorTileRuntime? _vectorRuntime;
+  Object? _vectorError;
 
   // ── Zoom animation ──────────────────────────────────────────────────
   late AnimationController _animController;
@@ -140,6 +157,9 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   void initState() {
     super.initState();
     _currentZoom = widget.zoom;
+    if (widget.vectorStyle != null) {
+      _loadVectorStyle();
+    }
 
     _animController = AnimationController(
       duration: widget.zoomAnimationDuration,
@@ -149,11 +169,43 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     _animController.addStatusListener(_onAnimStatus);
   }
 
+  Future<void> _loadVectorStyle() async {
+    final style = widget.vectorStyle;
+    if (style == null) return;
+    setState(() => _vectorError = null);
+    try {
+      final loaded = await loadVectorStyle(style);
+      if (!mounted || widget.vectorStyle != style) return;
+      _vectorRuntime = VectorTileRuntime(
+        loaded: loaded,
+        namespace: style.id,
+      );
+    } catch (error) {
+      if (!mounted || widget.vectorStyle != style) return;
+      _vectorError = error;
+    }
+    if (mounted) setState(() {});
+  }
+
   @override
   void didUpdateWidget(MapView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.zoomAnimationDuration != oldWidget.zoomAnimationDuration) {
       _animController.duration = widget.zoomAnimationDuration;
+    }
+    if (widget.vectorStyle != oldWidget.vectorStyle) {
+      // Style switch: tear everything down and reload.
+      _tileManager?.dispose();
+      _tileManager = null;
+      _vectorRuntime?.dispose();
+      _vectorRuntime = null;
+      _vectorError = null;
+      if (widget.vectorStyle != null) {
+        _loadVectorStyle();
+      } else {
+        setState(() {});
+      }
+      return;
     }
     if (widget.latLng != oldWidget.latLng) {
       _tileManager?.setCenterTile(latLng: widget.latLng);
@@ -172,6 +224,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     _animController.removeStatusListener(_onAnimStatus);
     _animController.dispose();
     _tileManager?.dispose();
+    _vectorRuntime?.dispose();
     super.dispose();
   }
 
@@ -187,12 +240,15 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
       }
       return existing;
     }
+    final runtime = _vectorRuntime;
     final manager = TileManager.init(
       width: size.width,
       height: size.height,
       centerLatLng: widget.latLng,
       zoom: widget.zoom,
-      fetcher: widget.tileFetcher,
+      fetcher: runtime?.fetcher ?? widget.tileFetcher,
+      decoder: runtime?.decoder,
+      cacheNamespace: runtime?.namespace ?? '',
     );
     manager.onTilesChanged = _notify;
     _tileManager = manager;
@@ -370,8 +426,41 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
 
   // ── Build ───────────────────────────────────────────────────────────
 
+  /// Shown while a vector style loads (style JSON + TileJSON fetch) or if
+  /// it failed — no tile grid can be built until sources resolve.
+  Widget _buildStylePlaceholder() {
+    if (_vectorError != null) {
+      return ColoredBox(
+        color: Colors.grey.shade200,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off, color: Colors.black54),
+              const SizedBox(height: 8),
+              Text(
+                'Failed to load map style',
+                style: TextStyle(color: Colors.grey.shade700),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return const ColoredBox(
+      color: Color(0xFFF5F5F5),
+      child: Center(
+        child: CircularProgressIndicator(strokeWidth: 2),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (widget.vectorStyle != null && _vectorRuntime == null) {
+      return _buildStylePlaceholder();
+    }
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = Size(constraints.maxWidth, constraints.maxHeight);
@@ -379,6 +468,8 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
 
         // Rebuild the visible grid (cheap: integer math + cache hits).
         manager.calculate();
+
+        final runtime = _vectorRuntime;
 
         // During crossfade animation, render two layers.
         final isCrossfade = _isAnimating && _animOldSnapshot != null;
@@ -426,6 +517,9 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                     topRowTilesCanvasY: manager.topRowTilesCanvasY,
                     tiles: manager.renderTiles,
                     revision: manager.revision,
+                    zoom: manager.zoom,
+                    // TEMP: overlay disabled for wasm-abort bisect
+                    overlay: null, // runtime?.createLabelOverlay(),
                   ),
                 ),
               ),
@@ -459,6 +553,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                               _animOldSnapshot!.topRowTilesCanvasY,
                           tiles: _animOldSnapshot!.tiles,
                           revision: _animOldSnapshot!.revision,
+                          zoom: _animOldSnapshot!.zoom,
                         ),
                       ),
                     ),
@@ -475,6 +570,32 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                     alignment: widget.zoomControlsAlignment,
                     onZoomIn: _zoomIn,
                     onZoomOut: _zoomOut,
+                  ),
+                ),
+
+              // ── Attribution (required by vector tile providers) ───
+              if (runtime != null && runtime.loaded.attribution.isNotEmpty)
+                Positioned(
+                  left: 4,
+                  bottom: 4,
+                  child: IgnorePointer(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.7),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                      child: Text(
+                        runtime.loaded.attribution,
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: Colors.black.withValues(alpha: 0.6),
+                        ),
+                      ),
+                    ),
                   ),
                 ),
             ],
