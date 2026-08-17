@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -68,14 +69,19 @@ class _GridSnapshot {
 
 /// How the old tile grid animates out during a zoom transition
 /// ([MapView.zoomAnimationStyle]).
+///
+/// Both styles use a two-phase animation:
+/// 1. Old tiles are blurred and held in place while new tiles load
+/// 2. Once new tiles are ready, old tiles scale up/down while fading
+///    out, revealing the crisp new tiles underneath
+///
+/// The difference is blur intensity: [ZoomAnimationStyle.crossfade]
+/// uses a heavier blur for a softer transition.
 enum ZoomAnimationStyle {
-  /// Old tiles scale up (zoom in) or down (zoom out) around the focal
-  /// point while fading out.
+  /// Light blur while waiting, then scale + fade.
   scale,
 
-  /// Old tiles scale up/down with a progressive Gaussian blur while
-  /// fading out — smooth crossfade that masks pixelation during the
-  /// scale. Works for both raster and vector tiles.
+  /// Heavier blur while waiting, then scale + fade — softer transition.
   crossfade,
 }
 
@@ -213,7 +219,20 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   /// Whether we're zooming in (true) or out (false).
   bool _animIsZoomIn = true;
 
-  bool get _isAnimating => _animController.isAnimating;
+  /// True during phase 1: old tiles shown with blur, waiting for new
+  /// tiles to load. Once new tiles are ready, phase 2 (scale) starts.
+  bool _animWaitingTiles = false;
+
+  /// Timeout timer for the wait phase — fires if tiles don't load in
+  /// time so the animation doesn't stall forever.
+  Timer? _animWaitTimer;
+
+  /// Maximum time to wait for new tiles before starting the scale
+  /// animation regardless (avoids infinite hold on slow networks).
+  static const _animWaitTimeout = Duration(milliseconds: 600);
+
+  bool get _isAnimating =>
+      _animController.isAnimating || _animWaitingTiles;
 
   // ── Scale gesture state ─────────────────────────────────────────────
   // Anchors captured at gesture start and re-baselined after every zoom
@@ -301,12 +320,18 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     _animController.removeListener(_onAnimTick);
     _animController.removeStatusListener(_onAnimStatus);
     _animController.dispose();
+    _animWaitTimer?.cancel();
     _tileManager?.dispose();
     _vectorRuntime?.dispose();
     super.dispose();
   }
 
   void _notify() {
+    // If we're in the wait phase and new tiles are now ready, kick off
+    // the scale animation before setState to avoid a wasted frame.
+    if (_animWaitingTiles && _newTilesReady()) {
+      _beginScalePhase();
+    }
     if (mounted) setState(() {});
   }
 
@@ -371,27 +396,30 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     setState(() {});
   }
 
-  // ── Zoom animation ─────────────────────────────────────────────────
+  // ── Zoom animation (two-phase) ─────────────────────────────────────
   //
   // Google Maps style zoom:
   //
-  // 1. Snapshot the current (old) grid
-  // 2. Switch TileManager to the NEW zoom immediately
-  // 3. During animation:
-  //    - NEW tiles rendered at 1.0× as background
-  //    - OLD tiles rendered with Transform.scale + opacity fade as overlay
-  //    - crossfade style: adds progressive Gaussian blur that increases
-  //      with scale, masking pixelation during the transition
-  // 4. At animation end: remove old overlay
+  // Phase 1 (waiting): old tiles shown with blur while new tiles load.
+  //   Old tiles stay in place (scale = 1.0) but blurred so the user
+  //   sees the current view softening while new tiles fill in.
   //
-  // The old tiles scale up (zoom in: 1→2×) or down (zoom out: 1→0.5×)
-  // while fading out, revealing the crisp new tiles underneath.
+  // Phase 2 (scale): once new tiles are ready (or timeout expires),
+  //   old tiles scale up (zoom in: 1→2×) or down (zoom out: 1→0.5×)
+  //   while fading out, revealing crisp new tiles underneath.
+  //
+  // Both styles show blur:
+  //   - scale: light blur (sigma 2)
+  //   - crossfade: heavy blur (sigma 5)
 
   void _startZoomAnimation(
       TileManager manager, int targetZoom, Offset? focalLocal) {
     // Cancel any in-progress animation.
     _animController.stop();
+    _animWaitTimer?.cancel();
+    _animWaitTimer = null;
     _animOldSnapshot = null;
+    _animWaitingTiles = false;
 
     // 1. Ensure grid is up-to-date and snapshot the OLD grid.
     manager.calculate();
@@ -415,7 +443,44 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     snap.anchorTileLng = manager.centerTileLng;
     snap.anchorTileLat = manager.centerTileLat;
 
-    // 3. Set up the scale animation for the old grid overlay.
+    // 3. Calculate new tiles and check if all visible tiles are loaded.
+    manager.calculate();
+
+    final ready = _newTilesReady();
+    if (ready) {
+      // All new tiles already available (cache hit) — start scale
+      // immediately.
+      _beginScalePhase();
+    } else {
+      // Phase 1: hold old tiles with blur while new tiles load.
+      _animWaitingTiles = true;
+      _visualScale = 1.0;
+      // Schedule a timeout so we don't wait forever on slow networks.
+      _animWaitTimer?.cancel();
+      _animWaitTimer = Timer(_animWaitTimeout, () {
+        if (!mounted || !_animWaitingTiles) return;
+        _beginScalePhase();
+      });
+    }
+    setState(() {});
+  }
+
+  /// Returns true when all visible tiles in the new zoom have loaded
+  /// (no placeholders). Called from [_notify] (tiles-changed callback)
+  /// and from the timeout in [_startZoomAnimation].
+  bool _newTilesReady() {
+    final manager = _tileManager;
+    if (manager == null) return true;
+    return !manager.renderTiles.any((t) => t.sourceTile == null);
+  }
+
+  /// Transitions from phase 1 (blur + wait) to phase 2 (scale + fade).
+  void _beginScalePhase() {
+    if (!_animWaitingTiles && _animOldSnapshot == null) return;
+    _animWaitingTiles = false;
+    _animWaitTimer?.cancel();
+    _animWaitTimer = null;
+
     _scaleAnimation = Tween<double>(
       begin: 1.0,
       end: _animIsZoomIn ? 2.0 : 0.5,
@@ -428,19 +493,26 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     _animController.forward(from: 0.0);
   }
 
+  /// Blur sigma for the current zoom animation style.
+  double get _blurSigma =>
+      widget.zoomAnimationStyle == ZoomAnimationStyle.crossfade ? 5.0 : 2.0;
+
   /// The old-grid overlay painted while a zoom animation plays.
-  /// Old tiles scale up (zoom in) or down (zoom out) from the focal
-  /// point while fading out, revealing the new tiles underneath.
-  /// With [ZoomAnimationStyle.crossfade], a progressive Gaussian blur
-  /// is added that increases with the scale — masking pixelation and
-  /// creating a smooth transition. Works for both raster and vector.
+  ///
+  /// Phase 1 (waiting): old tiles shown with blur, static (scale 1.0),
+  /// while new tiles load underneath.
+  ///
+  /// Phase 2 (scale): old tiles scale up/down from the focal point
+  /// while fading out, with blur masking pixelation. Reveals crisp new
+  /// tiles underneath. Works for both raster and vector tiles.
   Widget _buildOldGridOverlay(
     TileManager manager,
     Size size,
     Alignment scaleAlignment,
   ) {
     final snap = _animOldSnapshot!;
-    final progress = _animController.value;
+    final waiting = _animWaitingTiles;
+    final progress = waiting ? 0.0 : _animController.value;
 
     Widget grid = CustomPaint(
       size: size,
@@ -457,23 +529,21 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     );
 
     // Fade out — easeIn keeps tiles visible longer, then fades fast.
-    grid = Opacity(
-      opacity: (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
-      child: grid,
-    );
+    // During the wait phase, tiles stay fully opaque.
+    if (!waiting) {
+      grid = Opacity(
+        opacity: (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
+        child: grid,
+      );
+    }
 
-    // Crossfade: progressive blur proportional to the scale delta.
-    if (widget.zoomAnimationStyle == ZoomAnimationStyle.crossfade) {
-      final sigma = (_visualScale - 1.0).abs() * 4.0;
-      if (sigma > 0.1) {
-        grid = ImageFiltered(
-          imageFilter: ui.ImageFilter.blur(
-            sigmaX: sigma,
-            sigmaY: sigma,
-          ),
-          child: grid,
-        );
-      }
+    // Blur: both styles, different intensity. Progressive during scale.
+    final sigma = waiting ? _blurSigma : _blurSigma * (1.0 + (_visualScale - 1.0).abs());
+    if (sigma > 0.1) {
+      grid = ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+        child: grid,
+      );
     }
 
     return Positioned.fill(
@@ -515,6 +585,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
 
     // Animation done — remove old grid overlay.
     _animOldSnapshot = null;
+    _animWaitingTiles = false;
     _visualScale = 1.0;
     setState(() {});
   }
@@ -525,10 +596,13 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     final manager = _tileManager;
     if (manager == null) return;
 
-    // Cancel any ongoing zoom animation.
+    // Cancel any ongoing zoom animation (wait or scale phase).
     if (_isAnimating) {
       _animController.stop();
+      _animWaitTimer?.cancel();
+      _animWaitTimer = null;
       _animOldSnapshot = null;
+      _animWaitingTiles = false;
       _visualScale = 1.0;
     }
 
