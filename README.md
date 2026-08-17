@@ -15,7 +15,7 @@ A high-performance Flutter map library with native raster and vector tile render
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
 - 📱 **Cross-Platform**: iOS, Android, Web, macOS, Linux, Windows
 - 🏷️ **Labels & Icons**: Point labels, line labels (road names), and sprite icons
-- 🔄 **Zoom Animations**: Google Maps-style scale transitions on double-tap, ± buttons and pinch steps
+- 🔄 **Zoom Animations**: Google Maps-style scale and crossfade transitions on double-tap, ± buttons and pinch steps
 - 🧵 **Background Processing**: Compute-based protobuf parsing on separate threads
 - 📊 **Pre-loading**: Intelligent adjacent zoom level pre-loading
 
