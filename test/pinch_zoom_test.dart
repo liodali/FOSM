@@ -56,7 +56,7 @@ Widget _map({
 }
 
 /// Number of tile-grid painters currently in the tree — 1 normally, 2
-/// while the crossfade overlay (fading old grid) is alive.
+/// while the scale overlay (fading old grid) is alive.
 Finder get _gridPainters => find.byWidgetPredicate(
       (widget) => widget is CustomPaint && widget.painter is RenderCanvasOSM,
     );
@@ -193,7 +193,7 @@ void main() {
   });
 
   group('pinch zoom animation', () {
-    testWidgets('pinch steps play the crossfade (animateZoom config)',
+    testWidgets('pinch steps play the scale transition (animateZoom config)',
         (tester) async {
       final zoomLog = <int>[];
       LatLng camera = _center;
@@ -226,7 +226,7 @@ void main() {
       await g2.up();
     });
 
-    testWidgets('crossfade duration comes from zoomAnimationDuration',
+    testWidgets('scale transition duration comes from zoomAnimationDuration',
         (tester) async {
       final zoomLog = <int>[];
       await tester.pumpWidget(_map(
@@ -268,7 +268,7 @@ void main() {
       final g2 = await tester.startGesture(const Offset(450, 300));
       await tester.pump(kPressTimeout);
       await g1.moveBy(const Offset(-75, 0));
-      await g2.moveBy(const Offset(75, 0)); // zoom step, crossfade starts
+      await g2.moveBy(const Offset(75, 0)); // zoom step, scale transition starts
 
       // Drift both fingers 10px right — pans the map 10px while the old
       // grid is still fading: the overlay must shift with the content.
@@ -277,7 +277,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
 
       final overlay = find.descendant(
-        of: find.byKey(const ValueKey('zoom-crossfade')),
+        of: find.byKey(const ValueKey('zoom-scale')),
         matching: find.byType(Transform),
       );
       expect(overlay, findsWidgets);
