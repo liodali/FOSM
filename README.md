@@ -9,13 +9,13 @@ A high-performance Flutter map library with native raster and vector tile render
 ## ✨ Features
 
 - 🗺️ **Dual Rendering Modes**: Native raster (OSM) and vector (Mapbox Vector Tiles) rendering
-- 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager` — with tap/long-press gestures and marker-following overlays
+- 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager` — with tap/long-press gestures (hand cursor on hover) and marker-following overlays
 - 🚀 **High Performance**: Persistent HTTP isolate with TCP connection reuse
 - 🎯 **Smart Caching**: Memory + disk (Hive) with intelligent eviction
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
 - 📱 **Cross-Platform**: iOS, Android, Web, macOS, Linux, Windows
 - 🏷️ **Labels & Icons**: Point labels, line labels (road names), and sprite icons
-- 🔄 **Zoom Animations**: Smooth crossfade zoom with animated transitions
+- 🔄 **Zoom Animations**: Configurable zoom transitions — crossfade, fade or slide (double-tap, ± buttons and pinch steps)
 - 🧵 **Background Processing**: Compute-based protobuf parsing on separate threads
 - 📊 **Pre-loading**: Intelligent adjacent zoom level pre-loading
 
@@ -52,6 +52,7 @@ MapView(
   maxZoom: 19,
   showZoomControls: true,
   animateZoom: true,
+  zoomAnimationStyle: ZoomAnimationStyle.crossfade, // or .fade / .slide
 )
 ```
 
