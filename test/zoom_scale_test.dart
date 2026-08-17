@@ -29,8 +29,8 @@ Future<Uint8List> _stubFetcher(int z, int x, int y) async => _tinyPng;
 
 Future<void> _pumpMap(
   WidgetTester tester, {
-  required ZoomAnimationStyle style,
   required ValueChanged<int> onZoomChanged,
+  bool animateZoom = true,
 }) {
   return tester.pumpWidget(
     MaterialApp(
@@ -39,9 +39,8 @@ Future<void> _pumpMap(
           latLng: _center,
           zoom: _testZoom,
           tileFetcher: _stubFetcher,
-          animateZoom: true,
+          animateZoom: animateZoom,
           zoomAnimationDuration: const Duration(milliseconds: 400),
-          zoomAnimationStyle: style,
           onZoomChanged: onZoomChanged,
         ),
       ),
@@ -63,57 +62,72 @@ Future<void> _doubleTapZoomIn(WidgetTester tester) async {
 
 /// All Transform widgets inside the old-grid overlay, outermost first.
 Finder _overlayTransforms() => find.descendant(
-      of: find.byKey(const ValueKey('zoom-crossfade')),
+      of: find.byKey(const ValueKey('zoom-scale')),
       matching: find.byType(Transform),
     );
 
 void main() {
-  group('ZoomAnimationStyle', () {
-    testWidgets('crossfade scales the old grid around the focal point',
+  group('Zoom scale transition', () {
+    testWidgets('zoom-in scales the old grid up from the focal point',
+        (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(tester, onZoomChanged: zoomLog.add);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      await _doubleTapZoomIn(tester);
+
+      expect(zoomLog, [4]);
+      // translate (pan tracking) + scale
+      expect(_overlayTransforms(), findsNWidgets(2));
+
+      final scale = tester.widget<Transform>(_overlayTransforms().last);
+      // Mid-animation: scaling up towards 2×.
+      expect(scale.transform.getMaxScaleOnAxis(), greaterThan(1.1));
+
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('zoom-out shows overlay then removes it', (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(tester, onZoomChanged: zoomLog.add);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // Zoom out via the − control.
+      await tester.tap(find.byIcon(Icons.remove));
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pump();
+
+      expect(zoomLog, [2]);
+      // The scale overlay is present during the animation.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      // translate + scale transforms are applied.
+      expect(_overlayTransforms(), findsNWidgets(2));
+
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+      // After animation completes, overlay is removed.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('animateZoom: false skips the overlay entirely',
         (tester) async {
       final zoomLog = <int>[];
       await _pumpMap(
         tester,
-        style: ZoomAnimationStyle.crossfade,
         onZoomChanged: zoomLog.add,
+        animateZoom: false,
       );
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
-      await _doubleTapZoomIn(tester);
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
 
       expect(zoomLog, [4]);
-      expect(_overlayTransforms(), findsNWidgets(2)); // translate + scale
-
-      final scale = tester.widget<Transform>(_overlayTransforms().last);
-      // Zoom-in mid-animation: scaling up towards 2×.
-      expect(scale.transform.getMaxScaleOnAxis(), greaterThan(1.1));
-
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-      expect(find.byKey(const ValueKey('zoom-crossfade')), findsNothing);
+      // No overlay at all — zoom was instant.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
-
-    testWidgets('fade only changes opacity', (tester) async {
-      final zoomLog = <int>[];
-      await _pumpMap(
-        tester,
-        style: ZoomAnimationStyle.fade,
-        onZoomChanged: zoomLog.add,
-      );
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-
-      await _doubleTapZoomIn(tester);
-
-      expect(zoomLog, [4]);
-      // Just the shared pan-tracking translate — no scale transform.
-      expect(_overlayTransforms(), findsOneWidget);
-      final translate = tester.widget<Transform>(_overlayTransforms().first);
-      expect(translate.transform.getTranslation().x, 0.0);
-      expect(translate.transform.getMaxScaleOnAxis(), 1.0);
-
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-      expect(find.byKey(const ValueKey('zoom-crossfade')), findsNothing);
-    });
-
-
   });
 }
