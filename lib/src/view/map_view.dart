@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -65,6 +66,19 @@ class _GridSnapshot {
       );
 }
 
+/// How the old tile grid animates out during a zoom transition
+/// ([MapView.zoomAnimationStyle]).
+enum ZoomAnimationStyle {
+  /// Old tiles scale up (zoom in) or down (zoom out) around the focal
+  /// point while fading out.
+  scale,
+
+  /// Old tiles scale up/down with a progressive Gaussian blur while
+  /// fading out — smooth crossfade that masks pixelation during the
+  /// scale. Works for both raster and vector tiles.
+  crossfade,
+}
+
 /// A native Flutter OSM map widget rendered entirely with [CustomPainter].
 ///
 /// ### Usage
@@ -85,9 +99,9 @@ class _GridSnapshot {
 /// - **Pinch to zoom**: two-finger scale gesture changes the zoom level
 ///   in integer steps as the accumulated scale crosses each rounding
 ///   boundary. The geographic point under the current focal point stays
-///   stationary, and each step plays a scale transition when
+///   stationary, and each step plays a zoom animation when
 ///   [animateZoom] is enabled.
-/// - **Double-tap**: zoom in one level with a smooth scale transition.
+/// - **Double-tap**: zoom in one level with a smooth zoom animation.
 ///
 /// ### Markers
 /// Pass a [MarkerManager] to [markers] and mutate it at runtime — markers
@@ -98,14 +112,21 @@ class _GridSnapshot {
 /// follows the marker across pans and zooms (see [MarkerOverlayConfig]
 /// for `removeOnMove` and friends).
 ///
-/// ### Zoom animation (Google Maps / Leaflet style)
+/// ### Zoom animation (Google Maps style)
 /// When [animateZoom] is `true` (default), tapping +/−, double-tapping
-/// or crossing a zoom step in a pinch triggers a **scale transition**:
-/// 1. Old tiles scale up (zoom in) or down (zoom out) from the focal
-///    point while fading out
-/// 2. New tiles at the target zoom level are rendered underneath at
-///    their native resolution
-/// 3. At the end, the old overlay is removed — seamless transition
+/// or crossing a zoom step in a pinch triggers a zoom animation:
+///
+/// - **[ZoomAnimationStyle.scale]** (default): old tiles scale up
+///   (zoom in) or down (zoom out) from the focal point while fading out,
+///   revealing the new tiles underneath.
+/// - **[ZoomAnimationStyle.crossfade]**: same scale transition with a
+///   progressive Gaussian blur that increases as old tiles scale,
+///   creating a smooth crossfade that masks pixelation. Works for both
+///   raster and vector tiles.
+///
+/// In both styles, new tiles at the target zoom level are already
+/// rendered underneath at native resolution. At the end of the
+/// animation, the old overlay is removed — seamless transition.
 ///
 /// The fading old-grid overlay tracks camera pans, so a pinch that keeps
 /// panning mid-animation stays visually aligned.
@@ -139,6 +160,11 @@ class MapView extends StatefulWidget {
   final bool animateZoom;
   final Duration zoomAnimationDuration;
 
+  /// Which animation the old tile grid plays during zoom transitions
+  /// (double-tap, ± buttons, pinch zoom steps) when [animateZoom] is
+  /// enabled. Defaults to [ZoomAnimationStyle.scale].
+  final ZoomAnimationStyle zoomAnimationStyle;
+
   const MapView({
     super.key,
     required this.latLng,
@@ -154,6 +180,7 @@ class MapView extends StatefulWidget {
     this.zoomControlsAlignment = Alignment.bottomRight,
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
+    this.zoomAnimationStyle = ZoomAnimationStyle.scale,
   });
 
   @override
@@ -344,15 +371,17 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     setState(() {});
   }
 
-  // ── Scale transition animation ─────────────────────────────────────
+  // ── Zoom animation ─────────────────────────────────────────────────
   //
-  // Google Maps / Leaflet style zoom:
+  // Google Maps style zoom:
   //
   // 1. Snapshot the current (old) grid
   // 2. Switch TileManager to the NEW zoom immediately
   // 3. During animation:
-  //    - NEW tiles (TileManager's current state) rendered at 1.0× as background
-  //    - OLD tiles (snapshot) rendered with Transform.scale + opacity fade as overlay
+  //    - NEW tiles rendered at 1.0× as background
+  //    - OLD tiles rendered with Transform.scale + opacity fade as overlay
+  //    - crossfade style: adds progressive Gaussian blur that increases
+  //      with scale, masking pixelation during the transition
   // 4. At animation end: remove old overlay
   //
   // The old tiles scale up (zoom in: 1→2×) or down (zoom out: 1→0.5×)
@@ -401,8 +430,10 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
 
   /// The old-grid overlay painted while a zoom animation plays.
   /// Old tiles scale up (zoom in) or down (zoom out) from the focal
-  /// point while fading out, revealing the new tiles underneath —
-  /// the same transition Google Maps uses.
+  /// point while fading out, revealing the new tiles underneath.
+  /// With [ZoomAnimationStyle.crossfade], a progressive Gaussian blur
+  /// is added that increases with the scale — masking pixelation and
+  /// creating a smooth transition. Works for both raster and vector.
   Widget _buildOldGridOverlay(
     TileManager manager,
     Size size,
@@ -411,6 +442,40 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     final snap = _animOldSnapshot!;
     final progress = _animController.value;
 
+    Widget grid = CustomPaint(
+      size: size,
+      painter: RenderCanvasOSM(
+        horizontalTileCount: snap.horizontalTileCount,
+        verticalTileCount: snap.verticalTileCount,
+        leftColumnTilesLngIndex: snap.leftColumnTilesLngIndex,
+        topRowTilesLatIndex: snap.topRowTilesLatIndex,
+        leftColumnTilesCanvasX: snap.leftColumnTilesCanvasX,
+        topRowTilesCanvasY: snap.topRowTilesCanvasY,
+        tiles: snap.tiles,
+        revision: snap.revision,
+      ),
+    );
+
+    // Fade out — easeIn keeps tiles visible longer, then fades fast.
+    grid = Opacity(
+      opacity: (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
+      child: grid,
+    );
+
+    // Crossfade: progressive blur proportional to the scale delta.
+    if (widget.zoomAnimationStyle == ZoomAnimationStyle.crossfade) {
+      final sigma = (_visualScale - 1.0).abs() * 4.0;
+      if (sigma > 0.1) {
+        grid = ImageFiltered(
+          imageFilter: ui.ImageFilter.blur(
+            sigmaX: sigma,
+            sigmaY: sigma,
+          ),
+          child: grid,
+        );
+      }
+    }
+
     return Positioned.fill(
       key: const ValueKey('zoom-scale'),
       child: Transform.translate(
@@ -418,23 +483,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
         child: Transform.scale(
           scale: _visualScale,
           alignment: scaleAlignment,
-          child: Opacity(
-            opacity:
-                (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
-            child: CustomPaint(
-              size: size,
-              painter: RenderCanvasOSM(
-                horizontalTileCount: snap.horizontalTileCount,
-                verticalTileCount: snap.verticalTileCount,
-                leftColumnTilesLngIndex: snap.leftColumnTilesLngIndex,
-                topRowTilesLatIndex: snap.topRowTilesLatIndex,
-                leftColumnTilesCanvasX: snap.leftColumnTilesCanvasX,
-                topRowTilesCanvasY: snap.topRowTilesCanvasY,
-                tiles: snap.tiles,
-                revision: snap.revision,
-              ),
-            ),
-          ),
+          child: grid,
         ),
       ),
     );
