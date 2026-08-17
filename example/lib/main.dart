@@ -50,7 +50,6 @@ class _MyHomePageState extends State<MyHomePage> {
   int _zoom = 7;
 
   bool _animateZoom = true;
-  ZoomAnimationStyle _zoomStyle = ZoomAnimationStyle.crossfade;
 
   // ── Markers ─────────────────────────────────────────────────────────
   // Owned by the page so markers survive raster/vector mode switches.
@@ -267,7 +266,6 @@ class _MyHomePageState extends State<MyHomePage> {
               vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
               showZoomControls: true,
               animateZoom: _animateZoom,
-              zoomAnimationStyle: _zoomStyle,
               zoomAnimationDuration: const Duration(milliseconds: 300),
               onZoomChanged: (zoom) => setState(() => _zoom = zoom),
               onCameraChanged: (center, zoom) {
@@ -386,25 +384,6 @@ class _MyHomePageState extends State<MyHomePage> {
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
               ],
-            ),
-            const SizedBox(height: 12),
-            SegmentedButton<ZoomAnimationStyle>(
-              segments: const [
-                ButtonSegment(
-                  value: ZoomAnimationStyle.crossfade,
-                  label: Text('Crossfade'),
-                  icon: Icon(Icons.crop_free, size: 16),
-                ),
-                ButtonSegment(
-                  value: ZoomAnimationStyle.fade,
-                  label: Text('Fade'),
-                  icon: Icon(Icons.gradient, size: 16),
-                ),
-              ],
-              selected: {_zoomStyle},
-              onSelectionChanged: (selection) =>
-                  setState(() => _zoomStyle = selection.first),
-              showSelectedIcon: false,
             ),
             const SizedBox(height: 12),
             Row(
