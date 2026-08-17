@@ -31,6 +31,7 @@ Future<void> _pumpMap(
   WidgetTester tester, {
   required ValueChanged<int> onZoomChanged,
   bool animateZoom = true,
+  ZoomAnimationStyle style = ZoomAnimationStyle.scale,
 }) {
   return tester.pumpWidget(
     MaterialApp(
@@ -41,6 +42,7 @@ Future<void> _pumpMap(
           tileFetcher: _stubFetcher,
           animateZoom: animateZoom,
           zoomAnimationDuration: const Duration(milliseconds: 400),
+          zoomAnimationStyle: style,
           onZoomChanged: onZoomChanged,
         ),
       ),
@@ -66,8 +68,14 @@ Finder _overlayTransforms() => find.descendant(
       matching: find.byType(Transform),
     );
 
+/// ImageFiltered widgets inside the old-grid overlay (blur for crossfade).
+Finder _overlayBlurs() => find.descendant(
+      of: find.byKey(const ValueKey('zoom-scale')),
+      matching: find.byType(ImageFiltered),
+    );
+
 void main() {
-  group('Zoom scale transition', () {
+  group('ZoomAnimationStyle.scale', () {
     testWidgets('zoom-in scales the old grid up from the focal point',
         (tester) async {
       final zoomLog = <int>[];
@@ -84,6 +92,9 @@ void main() {
       // Mid-animation: scaling up towards 2×.
       expect(scale.transform.getMaxScaleOnAxis(), greaterThan(1.1));
 
+      // No blur for scale style.
+      expect(_overlayBlurs(), findsNothing);
+
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
@@ -99,13 +110,10 @@ void main() {
       await tester.pump();
 
       expect(zoomLog, [2]);
-      // The scale overlay is present during the animation.
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      // translate + scale transforms are applied.
       expect(_overlayTransforms(), findsNWidgets(2));
 
       await tester.pumpAndSettle(const Duration(seconds: 1));
-      // After animation completes, overlay is removed.
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
 
@@ -126,7 +134,56 @@ void main() {
       await tester.pump(const Duration(milliseconds: 50));
 
       expect(zoomLog, [4]);
-      // No overlay at all — zoom was instant.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+  });
+
+  group('ZoomAnimationStyle.crossfade', () {
+    testWidgets('zoom-in applies progressive blur during the scale',
+        (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(
+        tester,
+        onZoomChanged: zoomLog.add,
+        style: ZoomAnimationStyle.crossfade,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      await _doubleTapZoomIn(tester);
+
+      expect(zoomLog, [4]);
+      // Scale + translate transforms still present.
+      expect(_overlayTransforms(), findsNWidgets(2));
+      // Blur is applied during crossfade.
+      expect(_overlayBlurs(), findsOneWidget);
+
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('zoom-out applies blur and cleans up', (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(
+        tester,
+        onZoomChanged: zoomLog.add,
+        style: ZoomAnimationStyle.crossfade,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      await tester.tap(find.byIcon(Icons.remove));
+      // Wait for the double-tap window to expire so the tap reaches the button.
+      await tester.pump(const Duration(milliseconds: 400));
+      // Start the animation.
+      await tester.pump();
+      // Advance ~150 ms into the animation so scale delta is large
+      // enough for the blur to kick in (sigma > 0.1).
+      await tester.pump(const Duration(milliseconds: 150));
+
+      expect(zoomLog, [2]);
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      expect(_overlayBlurs(), findsOneWidget);
+
+      await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
   });
