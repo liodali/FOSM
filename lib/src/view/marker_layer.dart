@@ -250,6 +250,8 @@ class _MarkerLayerState extends State<MarkerLayer>
             marker.onLongPress != null ? () => marker.onLongPress!() : null,
         child: child,
       );
+      // Hand cursor over tappable markers on pointer devices.
+      child = MouseRegion(cursor: SystemMouseCursors.click, child: child);
     }
     if (needsMeasure) {
       child = _MeasureSize(

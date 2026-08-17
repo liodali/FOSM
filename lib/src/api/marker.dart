@@ -79,7 +79,8 @@ class MarkerOverlayConfig {
 /// ### Gestures
 /// Set [onTap] / [onLongPress] to make the marker interactive. Panning the
 /// map by dragging a marker still works — the gesture arena only resolves
-/// to the marker when the finger doesn't move.
+/// to the marker when the finger doesn't move. Interactive markers (and
+/// those with [overlayBuilder]) show a hand cursor on pointer devices.
 ///
 /// ### Overlay
 /// Give the marker an [overlayBuilder] and it gains a tap-to-toggle overlay
