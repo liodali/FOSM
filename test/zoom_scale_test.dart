@@ -25,13 +25,19 @@ final Uint8List _tinyPng = Uint8List.fromList([
   0xAE, 0x42, 0x60, 0x82,
 ]);
 
-Future<Uint8List> _stubFetcher(int z, int x, int y) async => _tinyPng;
+/// Fast fetcher — tiles resolve via microtasks.
+Future<Uint8List> _fastFetcher(int z, int x, int y) async => _tinyPng;
+
+/// Slow fetcher — tiles take 2 seconds, keeping the wait phase active.
+Future<Uint8List> _slowFetcher(int z, int x, int y) =>
+    Future.delayed(const Duration(seconds: 2), () => _tinyPng);
 
 Future<void> _pumpMap(
   WidgetTester tester, {
   required ValueChanged<int> onZoomChanged,
   bool animateZoom = true,
   ZoomAnimationStyle style = ZoomAnimationStyle.scale,
+  TileFetcher? fetcher,
 }) {
   return tester.pumpWidget(
     MaterialApp(
@@ -39,7 +45,7 @@ Future<void> _pumpMap(
         body: MapView(
           latLng: _center,
           zoom: _testZoom,
-          tileFetcher: _stubFetcher,
+          tileFetcher: fetcher ?? _fastFetcher,
           animateZoom: animateZoom,
           zoomAnimationDuration: const Duration(milliseconds: 400),
           zoomAnimationStyle: style,
@@ -50,68 +56,148 @@ Future<void> _pumpMap(
   );
 }
 
-/// Double-taps the viewport center and advances ~150 ms into the zoom
-/// animation — the old-grid overlay is alive and partway through.
-Future<void> _doubleTapZoomIn(WidgetTester tester) async {
-  await tester.tapAt(const Offset(400, 300));
-  await tester.pump(const Duration(milliseconds: 100));
-  await tester.tapAt(const Offset(400, 300));
-  // First pump anchors the ticker at elapsed 0; the second advances into
-  // the animation.
-  await tester.pump();
-  await tester.pump(const Duration(milliseconds: 150));
-}
-
 /// All Transform widgets inside the old-grid overlay, outermost first.
 Finder _overlayTransforms() => find.descendant(
       of: find.byKey(const ValueKey('zoom-scale')),
       matching: find.byType(Transform),
     );
 
-/// ImageFiltered widgets inside the old-grid overlay (blur for crossfade).
+/// ImageFiltered widgets inside the old-grid overlay (blur).
 Finder _overlayBlurs() => find.descendant(
       of: find.byKey(const ValueKey('zoom-scale')),
       matching: find.byType(ImageFiltered),
     );
 
 void main() {
-  group('ZoomAnimationStyle.scale', () {
-    testWidgets('zoom-in scales the old grid up from the focal point',
+  group('Two-phase zoom animation', () {
+    testWidgets('scale: wait phase shows blurred overlay while tiles load',
+        (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(
+        tester,
+        onZoomChanged: zoomLog.add,
+        fetcher: _slowFetcher,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // Trigger zoom-in via double-tap.
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      // Advance a small amount — tiles still loading (2s fetcher).
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(zoomLog, [4]);
+      // Overlay present in wait phase.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      // Blur is applied.
+      expect(_overlayBlurs(), findsOneWidget);
+      // Scale is 1.0 (static — waiting for tiles).
+      final scale = tester.widget<Transform>(_overlayTransforms().last);
+      expect(scale.transform.getMaxScaleOnAxis(), closeTo(1.0, 0.01));
+
+      // Drain everything: wait timeout (600ms) + scale animation (400ms)
+      // + slow fetcher (2s).
+      await tester.pumpAndSettle(const Duration(seconds: 5));
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('scale: fast fetcher skips wait, scale animates and removes',
         (tester) async {
       final zoomLog = <int>[];
       await _pumpMap(tester, onZoomChanged: zoomLog.add);
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
-      await _doubleTapZoomIn(tester);
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      // Tiles load via microtasks → wait phase skipped → scale starts.
+      await tester.pump(const Duration(milliseconds: 50));
 
       expect(zoomLog, [4]);
-      // translate (pan tracking) + scale
+      // Overlay is present during the animation.
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      // Blur is applied for both styles.
+      expect(_overlayBlurs(), findsOneWidget);
+      // translate + scale transforms present.
       expect(_overlayTransforms(), findsNWidgets(2));
-
-      final scale = tester.widget<Transform>(_overlayTransforms().last);
-      // Mid-animation: scaling up towards 2×.
-      expect(scale.transform.getMaxScaleOnAxis(), greaterThan(1.1));
-
-      // No blur for scale style.
-      expect(_overlayBlurs(), findsNothing);
 
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
 
-    testWidgets('zoom-out shows overlay then removes it', (tester) async {
+    testWidgets('crossfade: overlay has blur and scale, then cleans up',
+        (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(
+        tester,
+        onZoomChanged: zoomLog.add,
+        style: ZoomAnimationStyle.crossfade,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 150));
+
+      expect(zoomLog, [4]);
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      expect(_overlayBlurs(), findsOneWidget);
+      expect(_overlayTransforms(), findsNWidgets(2));
+
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('crossfade: wait phase shows blurred overlay',
+        (tester) async {
+      final zoomLog = <int>[];
+      await _pumpMap(
+        tester,
+        onZoomChanged: zoomLog.add,
+        style: ZoomAnimationStyle.crossfade,
+        fetcher: _slowFetcher,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.tapAt(const Offset(400, 300));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(zoomLog, [4]);
+      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
+      expect(_overlayBlurs(), findsOneWidget);
+      // Static (not scaling).
+      final scale = tester.widget<Transform>(_overlayTransforms().last);
+      expect(scale.transform.getMaxScaleOnAxis(), closeTo(1.0, 0.01));
+
+      // Drain everything.
+      await tester.pumpAndSettle(const Duration(seconds: 5));
+      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+    });
+
+    testWidgets('zoom-out via − button: overlay appears and cleans up',
+        (tester) async {
       final zoomLog = <int>[];
       await _pumpMap(tester, onZoomChanged: zoomLog.add);
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
-      // Zoom out via the − control.
       await tester.tap(find.byIcon(Icons.remove));
       await tester.pump(const Duration(milliseconds: 400));
       await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump(const Duration(milliseconds: 150));
 
       expect(zoomLog, [2]);
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      expect(_overlayTransforms(), findsNWidgets(2));
+      expect(_overlayBlurs(), findsOneWidget);
 
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
@@ -134,56 +220,6 @@ void main() {
       await tester.pump(const Duration(milliseconds: 50));
 
       expect(zoomLog, [4]);
-      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
-    });
-  });
-
-  group('ZoomAnimationStyle.crossfade', () {
-    testWidgets('zoom-in applies progressive blur during the scale',
-        (tester) async {
-      final zoomLog = <int>[];
-      await _pumpMap(
-        tester,
-        onZoomChanged: zoomLog.add,
-        style: ZoomAnimationStyle.crossfade,
-      );
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-
-      await _doubleTapZoomIn(tester);
-
-      expect(zoomLog, [4]);
-      // Scale + translate transforms still present.
-      expect(_overlayTransforms(), findsNWidgets(2));
-      // Blur is applied during crossfade.
-      expect(_overlayBlurs(), findsOneWidget);
-
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-      expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
-    });
-
-    testWidgets('zoom-out applies blur and cleans up', (tester) async {
-      final zoomLog = <int>[];
-      await _pumpMap(
-        tester,
-        onZoomChanged: zoomLog.add,
-        style: ZoomAnimationStyle.crossfade,
-      );
-      await tester.pumpAndSettle(const Duration(seconds: 1));
-
-      await tester.tap(find.byIcon(Icons.remove));
-      // Wait for the double-tap window to expire so the tap reaches the button.
-      await tester.pump(const Duration(milliseconds: 400));
-      // Start the animation.
-      await tester.pump();
-      // Advance ~150 ms into the animation so scale delta is large
-      // enough for the blur to kick in (sigma > 0.1).
-      await tester.pump(const Duration(milliseconds: 150));
-
-      expect(zoomLog, [2]);
-      expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      expect(_overlayBlurs(), findsOneWidget);
-
-      await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
   });
