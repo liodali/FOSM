@@ -1,8 +1,11 @@
 import 'dart:typed_data';
 
+import 'package:flutter/gestures.dart' show PointerDeviceKind;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show RendererBinding;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
 
 // Test surface is 800×600 by default; the map fills it, so the viewport
 // center is (400, 300).
@@ -191,6 +194,65 @@ void main() {
       await tester.longPress(find.byKey(const Key('marker')));
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(presses, 1);
+    });
+
+    testWidgets('interactive markers show a hand cursor on hover',
+        (tester) async {
+      final markers = MarkerManager()
+        ..add(
+          Marker(
+            point: _center,
+            onTap: () {},
+            child: _markerChild,
+          ),
+        )
+        ..add(
+          // Plain marker east of the interactive one, at screen (600, 300).
+          Marker(
+            point: LatLng(
+              latitude: 0,
+              longitude:
+                  tileX2Lng(lon2TileX(0, _testZoom) + 200 / 256, _testZoom),
+            ),
+            child: const SizedBox(
+              width: 40,
+              height: 40,
+              key: Key('plain-marker'),
+            ),
+          ),
+        );
+      await _pumpMap(tester, markers: markers);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      final mouse = await tester.createGesture(
+        kind: PointerDeviceKind.mouse,
+        pointer: 1,
+      );
+      addTearDown(mouse.removePointer);
+
+      // Over the tappable marker: hand cursor.
+      await mouse.addPointer(location: const Offset(400, 300));
+      await tester.pump();
+      expect(
+        RendererBinding.instance.mouseTracker.debugDeviceActiveCursor(1),
+        SystemMouseCursors.click,
+      );
+
+      // Over the plain marker: default cursor.
+      await mouse.moveTo(const Offset(600, 300));
+      await tester.pump();
+      expect(
+        RendererBinding.instance.mouseTracker.debugDeviceActiveCursor(1),
+        SystemMouseCursors.basic,
+      );
+
+      // Over the bare map: default cursor.
+      await mouse.moveTo(const Offset(50, 50));
+      await tester.pump();
+      expect(
+        RendererBinding.instance.mouseTracker.debugDeviceActiveCursor(1),
+        SystemMouseCursors.basic,
+      );
     });
 
     testWidgets('markers without callbacks do not consume map gestures',
