@@ -30,10 +30,26 @@ class MarkerLayer extends StatefulWidget {
   /// build, matching how the tile painter consumes it.
   final TileManager manager;
 
+  /// Called when a marker is tapped.
+  final ValueChanged<Marker>? onMarkerTap;
+
+  /// Called when a marker is long-pressed.
+  final ValueChanged<Marker>? onMarkerLongPress;
+
+  /// Called when a marker's overlay is shown.
+  final ValueChanged<Marker>? onOverlayShown;
+
+  /// Called when a marker's overlay is hidden.
+  final ValueChanged<Marker>? onOverlayHidden;
+
   const MarkerLayer({
     super.key,
     required this.markers,
     required this.manager,
+    this.onMarkerTap,
+    this.onMarkerLongPress,
+    this.onOverlayShown,
+    this.onOverlayHidden,
   });
 
   @override
@@ -49,6 +65,10 @@ class _MarkerLayerState extends State<MarkerLayer>
   /// show → switch → hide sequence restart the entrance correctly.
   Marker? _animatedOverlayMarker;
 
+  /// The last overlay marker reported to [onOverlayShown]/[onOverlayHidden]
+  /// callbacks, used to avoid duplicate calls.
+  Marker? _lastOverlayMarker;
+
   /// Camera snapshot used to detect movement between parent rebuilds.
   ({double lng, double lat, int zoom})? _lastCamera;
 
@@ -62,6 +82,7 @@ class _MarkerLayerState extends State<MarkerLayer>
     _overlayController = AnimationController(vsync: this, value: 1.0);
     _overlayController.addListener(_onOverlayTick);
     widget.markers.addListener(_onMarkersChanged);
+    _lastOverlayMarker = widget.markers.overlayMarker;
     _snapshotCamera();
   }
 
@@ -117,6 +138,18 @@ class _MarkerLayerState extends State<MarkerLayer>
   void _onMarkersChanged() {
     final live = widget.markers.markers;
     _markerSizes.removeWhere((marker, _) => !live.contains(marker));
+
+    final currentOverlay = widget.markers.overlayMarker;
+    if (currentOverlay != _lastOverlayMarker) {
+      if (_lastOverlayMarker != null) {
+        widget.onOverlayHidden?.call(_lastOverlayMarker!);
+      }
+      if (currentOverlay != null) {
+        widget.onOverlayShown?.call(currentOverlay);
+      }
+      _lastOverlayMarker = currentOverlay;
+    }
+
     _syncOverlayAnimation();
     if (mounted) setState(() {});
   }
@@ -151,6 +184,7 @@ class _MarkerLayerState extends State<MarkerLayer>
 
   void _handleMarkerTap(Marker marker) {
     marker.onTap?.call();
+    widget.onMarkerTap?.call(marker);
     final markers = widget.markers;
     if (marker.overlayBuilder != null) {
       if (markers.overlayMarker == marker) {
@@ -246,8 +280,12 @@ class _MarkerLayerState extends State<MarkerLayer>
         // when the finger doesn't move.
         behavior: HitTestBehavior.opaque,
         onTap: needsGestures ? () => _handleMarkerTap(marker) : null,
-        onLongPress:
-            marker.onLongPress != null ? () => marker.onLongPress!() : null,
+        onLongPress: marker.onLongPress != null
+            ? () {
+                marker.onLongPress?.call();
+                widget.onMarkerLongPress?.call(marker);
+              }
+            : null,
         child: child,
       );
       // Hand cursor over tappable markers on pointer devices.

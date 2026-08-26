@@ -5,10 +5,13 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import '../api/geo_point.dart';
+import '../api/map_controller.dart';
+import '../api/map_notification.dart';
 import '../api/marker_manager.dart';
 import '../api/tile.dart';
 import '../api/tile_manager.dart';
 import '../api/tile_source.dart';
+import '../common/osm_transformation_utilities.dart';
 import '../common/utils.dart';
 import '../vector/render/vector_tile_runtime.dart';
 import '../vector/style/style_loader.dart';
@@ -118,6 +121,21 @@ enum ZoomAnimationStyle {
 /// follows the marker across pans and zooms (see [MarkerOverlayConfig]
 /// for `removeOnMove` and friends).
 ///
+/// ### Programmatic control
+/// Pass a [MapController] to [controller] to drive the camera and
+/// markers from outside the widget tree: [MapController.moveTo],
+/// [MapController.zoomIn], [MapController.setZoom],
+/// [MapController.addMarker], etc. The controller becomes usable after
+/// the map's first frame; listen to [MapController.isAttached] or wait
+/// for [MapReadyNotification] if you need to call it immediately after
+/// building the map.
+///
+/// ### Map events
+/// The map dispatches [MapNotification]s for camera changes, zoom
+/// changes, marker taps, and overlay transitions. Any ancestor widget
+/// can listen with [NotificationListener] or via
+/// [MapEventListenerMixin].
+///
 /// ### Zoom animation (Google Maps style)
 /// When [animateZoom] is `true` (default), tapping +/−, double-tapping
 /// or crossing a zoom step in a pinch triggers a zoom animation:
@@ -142,6 +160,9 @@ class MapView extends StatefulWidget {
   final int minZoom;
   final int maxZoom;
   final TileFetcher? tileFetcher;
+
+  /// Controller for programmatic camera and marker control.
+  final MapController? controller;
 
   /// Markers rendered above the tile grid (and below the vector label
   /// overlay). Mutating the manager at runtime updates the map — pass it
@@ -178,6 +199,7 @@ class MapView extends StatefulWidget {
     this.minZoom = 1,
     this.maxZoom = 19,
     this.tileFetcher,
+    this.controller,
     this.markers,
     this.vectorStyle,
     this.showZoomControls = true,
@@ -193,7 +215,9 @@ class MapView extends StatefulWidget {
   State<MapView> createState() => _MapViewState();
 }
 
-class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
+class _MapViewState extends State<MapView>
+    with TickerProviderStateMixin
+    implements MapControllerDelegate {
   TileManager? _tileManager;
   int _currentZoom = 0;
 
@@ -234,6 +258,34 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   bool get _isAnimating =>
       _animController.isAnimating || _animWaitingTiles;
 
+  // ── Pan animation ───────────────────────────────────────────────────
+  AnimationController? _panController;
+
+  // ── Controller ready notification ───────────────────────────────────
+  bool _readyNotificationDispatched = false;
+
+  // ── MapControllerDelegate implementation ────────────────────────────
+  @override
+  LatLng get center => _tileManager?.centerLatLng ?? widget.latLng;
+
+  @override
+  int get zoom => _tileManager?.zoom ?? widget.zoom;
+
+  @override
+  MarkerManager? get markerManager => widget.markers;
+
+  @override
+  void setZoom(int zoom, {bool animate = true}) =>
+      _setZoom(zoom, animate: animate);
+
+  @override
+  void zoomBy(int delta, {bool animate = true}) =>
+      _zoomBy(delta, focalLocal: null, animate: animate);
+
+  @override
+  void moveTo(LatLng latLng, {bool animate = true}) =>
+      _moveTo(latLng, animate: animate);
+
   // ── Scale gesture state ─────────────────────────────────────────────
   // Anchors captured at gesture start and re-baselined after every zoom
   // step — tile coordinates only make sense in the zoom they were
@@ -264,6 +316,8 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     );
     _animController.addListener(_onAnimTick);
     _animController.addStatusListener(_onAnimStatus);
+
+    widget.controller?.attach(this);
   }
 
   Future<void> _loadVectorStyle() async {
@@ -287,6 +341,10 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   @override
   void didUpdateWidget(MapView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.controller != oldWidget.controller) {
+      oldWidget.controller?.detach(this);
+      widget.controller?.attach(this);
+    }
     if (widget.zoomAnimationDuration != oldWidget.zoomAnimationDuration) {
       _animController.duration = widget.zoomAnimationDuration;
     }
@@ -317,9 +375,11 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
 
   @override
   void dispose() {
+    widget.controller?.detach(this);
     _animController.removeListener(_onAnimTick);
     _animController.removeStatusListener(_onAnimStatus);
     _animController.dispose();
+    _stopPanAnimation();
     _animWaitTimer?.cancel();
     _tileManager?.dispose();
     _vectorRuntime?.dispose();
@@ -360,6 +420,19 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     );
     manager.onTilesChanged = _notify;
     _tileManager = manager;
+
+    if (!_readyNotificationDispatched) {
+      _readyNotificationDispatched = true;
+      final controller = widget.controller;
+      if (controller != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && widget.controller == controller) {
+            MapReadyNotification(controller).dispatch(context);
+          }
+        });
+      }
+    }
+
     return manager;
   }
 
@@ -369,19 +442,33 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   void _zoomOut() => _zoomBy(-1, focalLocal: null);
   void _zoomInAt(Offset localPosition) => _zoomBy(1, focalLocal: localPosition);
 
-  void _zoomBy(int delta, {Offset? focalLocal}) {
+  void _zoomBy(int delta, {Offset? focalLocal, bool? animate}) {
     final manager = _tileManager;
     if (manager == null) return;
     final newZoom =
         (manager.zoom + delta).clamp(widget.minZoom, widget.maxZoom);
     if (newZoom == manager.zoom) return;
 
-    if (!widget.animateZoom) {
+    if (!(animate ?? widget.animateZoom)) {
       _applyZoomInstantly(manager, newZoom, focalLocal);
       return;
     }
 
     _startZoomAnimation(manager, newZoom, focalLocal);
+  }
+
+  void _setZoom(int zoom, {bool? animate}) {
+    final manager = _tileManager;
+    if (manager == null) return;
+    final newZoom = zoom.clamp(widget.minZoom, widget.maxZoom);
+    if (newZoom == manager.zoom) return;
+
+    if (!(animate ?? widget.animateZoom)) {
+      _applyZoomInstantly(manager, newZoom, null);
+      return;
+    }
+
+    _startZoomAnimation(manager, newZoom, null);
   }
 
   void _applyZoomInstantly(
@@ -392,8 +479,78 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     manager.setZoomWithFocalPoint(newZoom, focal, oldZoom);
     _currentZoom = newZoom;
     widget.onZoomChanged?.call(newZoom);
+    MapZoomChangeNotification(newZoom).dispatch(context);
     _notifyCamera(manager);
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+        .dispatch(context);
     setState(() {});
+  }
+
+  void _moveTo(LatLng latLng, {bool? animate}) {
+    final manager = _tileManager;
+    if (manager == null) return;
+
+    final target = LatLng(
+      latitude: clampLatitude(latLng.latitude),
+      longitude: clampLongitude(latLng.longitude),
+    );
+
+    if (!(animate ?? widget.animateZoom)) {
+      manager.setCenterTile(latLng: target);
+      _notifyCamera(manager);
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+          .dispatch(context);
+      if (mounted) setState(() {});
+      return;
+    }
+
+    _stopPanAnimation();
+
+    final startLng = manager.centerTileLng;
+    final startLat = manager.centerTileLat;
+    final endLng = lon2TileX(target.longitude, manager.zoom);
+    final endLat = lat2TileY(target.latitude, manager.zoom);
+
+    final controller = AnimationController(
+      duration: widget.zoomAnimationDuration,
+      vsync: this,
+    );
+    _panController = controller;
+
+    final animation = Tween<Offset>(
+      begin: Offset(startLng, startLat),
+      end: Offset(endLng, endLat),
+    ).animate(CurvedAnimation(
+      parent: controller,
+      curve: Curves.easeInOut,
+    ));
+
+    void onTick() {
+      if (!mounted) return;
+      final value = animation.value;
+      manager.setCenterFromTileCoords(value.dx, value.dy);
+      _notifyCamera(manager);
+      setState(() {});
+    }
+
+    animation.addListener(onTick);
+    controller.forward().whenComplete(() {
+      animation.removeListener(onTick);
+      if (_panController == controller) {
+        _panController?.dispose();
+        _panController = null;
+      }
+      if (mounted) {
+        MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+            .dispatch(context);
+      }
+    });
+  }
+
+  void _stopPanAnimation() {
+    _panController?.stop();
+    _panController?.dispose();
+    _panController = null;
   }
 
   // ── Zoom animation (two-phase) ─────────────────────────────────────
@@ -416,6 +573,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
       TileManager manager, int targetZoom, Offset? focalLocal) {
     // Cancel any in-progress animation.
     _animController.stop();
+    _stopPanAnimation();
     _animWaitTimer?.cancel();
     _animWaitTimer = null;
     _animOldSnapshot = null;
@@ -434,7 +592,10 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
     manager.setZoomWithFocalPoint(targetZoom, focal, manager.zoom);
     _currentZoom = targetZoom;
     widget.onZoomChanged?.call(targetZoom);
+    MapZoomChangeNotification(targetZoom).dispatch(context);
     _notifyCamera(manager);
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+        .dispatch(context);
 
     // Re-anchor the snapshot to the POST-step camera so pans from here
     // on shift the overlay by exactly their screen-pixel delta while it
@@ -605,6 +766,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
       _animWaitingTiles = false;
       _visualScale = 1.0;
     }
+    _stopPanAnimation();
 
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
@@ -645,6 +807,7 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
         manager.setZoomWithFocalPoint(newZoom, focalLocal, manager.zoom);
         _currentZoom = newZoom;
         widget.onZoomChanged?.call(newZoom);
+        MapZoomChangeNotification(newZoom).dispatch(context);
         _notifyCamera(manager);
       }
 
@@ -673,6 +836,11 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
   }
 
   void _onScaleEnd(ScaleEndDetails details) {
+    final manager = _tileManager;
+    if (manager != null) {
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+          .dispatch(context);
+    }
     _scaleStartTileLng = null;
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
@@ -799,6 +967,18 @@ class _MapViewState extends State<MapView> with SingleTickerProviderStateMixin {
                   child: MarkerLayer(
                     markers: widget.markers!,
                     manager: manager,
+                    onMarkerTap: (marker) {
+                      MapMarkerTapNotification(marker).dispatch(context);
+                    },
+                    onMarkerLongPress: (marker) {
+                      MapMarkerLongPressNotification(marker).dispatch(context);
+                    },
+                    onOverlayShown: (marker) {
+                      MapOverlayShownNotification(marker).dispatch(context);
+                    },
+                    onOverlayHidden: (marker) {
+                      MapOverlayHiddenNotification(marker).dispatch(context);
+                    },
                   ),
                 ),
 
