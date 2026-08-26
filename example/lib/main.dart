@@ -29,12 +29,16 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
+class _MyHomePageState extends State<MyHomePage>
+    with MapEventListenerMixin {
   static const String defaultStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
   static const LatLng initialCenter = LatLng(
     latitude: 47.4358055,
     longitude: 8.4737324,
   );
+
+  /// Programmatic control surface for the map.
+  final MapController _mapController = MapController();
 
   // Tile source selection
   _MapMode _mode = _MapMode.raster;
@@ -179,7 +183,26 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   @override
+  void onMapReady(MapController controller) {
+    _showSnack('Map ready');
+  }
+
+  @override
+  void onMapMarkerTapped(Marker marker) {
+    _showSnack(
+      'Tapped ${marker.point.latitude.toStringAsFixed(3)}, '
+      '${marker.point.longitude.toStringAsFixed(3)}',
+    );
+  }
+
+  @override
+  void onMapOverlayShown(Marker marker) {
+    _showSnack('Overlay shown');
+  }
+
+  @override
   void dispose() {
+    _mapController.dispose();
     _markers.removeListener(_onMarkersChanged);
     _styleUrlController.dispose();
     super.dispose();
@@ -196,11 +219,6 @@ class _MyHomePageState extends State<MyHomePage> {
     pin = Marker(
       point: point,
       alignment: Alignment.bottomCenter,
-      onTap: () => _showSnack(
-        'Tapped pin at '
-        '${point.latitude.toStringAsFixed(2)}, '
-        '${point.longitude.toStringAsFixed(2)}',
-      ),
       onLongPress: () {
         _showSnack('Pin removed');
         _markers.remove(pin!);
@@ -259,24 +277,27 @@ class _MyHomePageState extends State<MyHomePage> {
           // the mode or style URL changes; latLng/zoom restore the camera.
           KeyedSubtree(
             key: ValueKey('$_mode|$_activeStyleUrl'),
-            child: MapView(
-              latLng: _center,
-              zoom: _zoom,
-              minZoom: 1,
-              maxZoom: 19,
-              vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
-              showZoomControls: true,
-              animateZoom: _animateZoom,
-              zoomAnimationStyle: _zoomStyle,
-              zoomAnimationDuration: const Duration(milliseconds: 300),
-              onZoomChanged: (zoom) => setState(() => _zoom = zoom),
-              onCameraChanged: (center, zoom) {
-                setState(() {
-                  _center = center;
-                  _zoom = zoom;
-                });
-              },
-              markers: _markers,
+            child: listenToMap(
+              MapView(
+                controller: _mapController,
+                latLng: _center,
+                zoom: _zoom,
+                minZoom: 1,
+                maxZoom: 19,
+                vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
+                showZoomControls: true,
+                animateZoom: _animateZoom,
+                zoomAnimationStyle: _zoomStyle,
+                zoomAnimationDuration: const Duration(milliseconds: 300),
+                onZoomChanged: (zoom) => setState(() => _zoom = zoom),
+                onCameraChanged: (center, zoom) {
+                  setState(() {
+                    _center = center;
+                    _zoom = zoom;
+                  });
+                },
+                markers: _markers,
+              ),
             ),
           ),
 
@@ -326,6 +347,19 @@ class _MyHomePageState extends State<MyHomePage> {
             child: _LayersButton(
               mode: _mode,
               onPressed: () => _showTileOptions(context),
+            ),
+          ),
+
+          // ── Controller demo buttons (left of screen)
+          Positioned(
+            left: 16,
+            bottom: 120,
+            child: _MapControllerButtons(
+              controller: _mapController,
+              onFlyTo: () => _mapController.moveTo(
+                const LatLng(latitude: 48.8566, longitude: 2.3522),
+                animate: true,
+              ),
             ),
           ),
         ],
@@ -545,6 +579,78 @@ class _LayersButton extends StatelessWidget {
               size: 22,
               color: Colors.grey[800],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A small vertical stack of buttons demonstrating [MapController].
+class _MapControllerButtons extends StatelessWidget {
+  final MapController controller;
+  final VoidCallback onFlyTo;
+
+  const _MapControllerButtons({
+    required this.controller,
+    required this.onFlyTo,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _ToolButton(
+          icon: Icons.add,
+          tooltip: 'Zoom in',
+          onPressed: () => controller.zoomIn(),
+        ),
+        const SizedBox(height: 8),
+        _ToolButton(
+          icon: Icons.remove,
+          tooltip: 'Zoom out',
+          onPressed: () => controller.zoomOut(),
+        ),
+        const SizedBox(height: 8),
+        _ToolButton(
+          icon: Icons.flight,
+          tooltip: 'Fly to Paris',
+          onPressed: onFlyTo,
+        ),
+      ],
+    );
+  }
+}
+
+/// Generic small square map tool button.
+class _ToolButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  const _ToolButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white.withValues(alpha: 0.92),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      elevation: 2,
+      shadowColor: Colors.black.withValues(alpha: 0.15),
+      child: SizedBox(
+        width: 44,
+        height: 44,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(8),
+          child: Tooltip(
+            message: tooltip,
+            child: Icon(icon, size: 22, color: Colors.grey[800]),
           ),
         ),
       ),
