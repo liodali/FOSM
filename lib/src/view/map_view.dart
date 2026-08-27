@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../api/geo_point.dart';
 import '../api/map_controller.dart';
 import '../api/map_notification.dart';
+import '../api/marker_cluster.dart';
 import '../api/marker_manager.dart';
 import '../api/tile.dart';
 import '../api/tile_manager.dart';
@@ -169,6 +170,10 @@ class MapView extends StatefulWidget {
   /// once and call [MarkerManager.add] / [MarkerManager.clear] anywhere.
   final MarkerManager? markers;
 
+  /// Options for clustering [ClusterMarker]s. When null, [ClusterMarker]s
+  /// render as ordinary markers and no grouping is performed.
+  final MarkerClusterOptions? markerClusterOptions;
+
   /// Renders a hosted vector style instead of raster tiles (e.g.
   /// [openFreeMapLiberty]). When set, [tileFetcher] is ignored — the
   /// style document defines all tile sources. Raster mode remains the
@@ -201,6 +206,7 @@ class MapView extends StatefulWidget {
     this.tileFetcher,
     this.controller,
     this.markers,
+    this.markerClusterOptions,
     this.vectorStyle,
     this.showZoomControls = true,
     this.onZoomChanged,
@@ -255,8 +261,7 @@ class _MapViewState extends State<MapView>
   /// animation regardless (avoids infinite hold on slow networks).
   static const _animWaitTimeout = Duration(milliseconds: 600);
 
-  bool get _isAnimating =>
-      _animController.isAnimating || _animWaitingTiles;
+  bool get _isAnimating => _animController.isAnimating || _animWaitingTiles;
 
   // ── Pan animation ───────────────────────────────────────────────────
   AnimationController? _panController;
@@ -699,7 +704,8 @@ class _MapViewState extends State<MapView>
     }
 
     // Blur: both styles, different intensity. Progressive during scale.
-    final sigma = waiting ? _blurSigma : _blurSigma * (1.0 + (_visualScale - 1.0).abs());
+    final sigma =
+        waiting ? _blurSigma : _blurSigma * (1.0 + (_visualScale - 1.0).abs());
     if (sigma > 0.1) {
       grid = ImageFiltered(
         imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
@@ -793,8 +799,7 @@ class _MapViewState extends State<MapView>
     // rounding boundary. The step anchors on the CURRENT focal point, so
     // the content under the fingers stays put even when the focal drifts
     // during the pinch.
-    final zoomDelta =
-        math.log(details.scale / startScale) / math.log(2);
+    final zoomDelta = math.log(details.scale / startScale) / math.log(2);
     final newZoom =
         (startZoom + zoomDelta).round().clamp(widget.minZoom, widget.maxZoom);
 
@@ -845,6 +850,20 @@ class _MapViewState extends State<MapView>
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
     _scaleStartFocal = null;
+  }
+
+  /// Cluster tap: dispatches notification, calls the optional callback,
+  /// and optionally zooms in using the cluster's screen position as the
+  /// focal point.
+  void _onClusterTapped(MarkerCluster cluster) {
+    MapMarkerClusterTapNotification(cluster).dispatch(context);
+    widget.markerClusterOptions?.onTap?.call(cluster);
+    if (widget.markerClusterOptions?.zoomOnTap ?? true) {
+      final position = _tileManager?.latLngToScreen(cluster.point);
+      if (position != null) {
+        _zoomInAt(position);
+      }
+    }
   }
 
   /// Bare-map tap: closes an open marker overlay when its config allows
@@ -938,11 +957,9 @@ class _MapViewState extends State<MapView>
                   painter: RenderCanvasOSM(
                     horizontalTileCount: manager.horizontalTileCount,
                     verticalTileCount: manager.verticalTileCount,
-                    leftColumnTilesLngIndex:
-                        manager.leftColumnTilesLngIndex,
+                    leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
                     topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                    leftColumnTilesCanvasX:
-                        manager.leftColumnTilesCanvasX,
+                    leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
                     topRowTilesCanvasY: manager.topRowTilesCanvasY,
                     tiles: manager.renderTiles,
                     revision: manager.revision,
@@ -967,11 +984,15 @@ class _MapViewState extends State<MapView>
                   child: MarkerLayer(
                     markers: widget.markers!,
                     manager: manager,
+                    clusterOptions: widget.markerClusterOptions,
                     onMarkerTap: (marker) {
                       MapMarkerTapNotification(marker).dispatch(context);
                     },
                     onMarkerLongPress: (marker) {
                       MapMarkerLongPressNotification(marker).dispatch(context);
+                    },
+                    onClusterTap: (cluster) {
+                      _onClusterTapped(cluster);
                     },
                     onOverlayShown: (marker) {
                       MapOverlayShownNotification(marker).dispatch(context);
@@ -996,8 +1017,7 @@ class _MapViewState extends State<MapView>
                         leftColumnTilesLngIndex:
                             manager.leftColumnTilesLngIndex,
                         topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                        leftColumnTilesCanvasX:
-                            manager.leftColumnTilesCanvasX,
+                        leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
                         topRowTilesCanvasY: manager.topRowTilesCanvasY,
                         tiles: manager.renderTiles,
                         revision: manager.revision,

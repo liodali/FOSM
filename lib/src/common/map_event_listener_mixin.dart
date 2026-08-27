@@ -4,6 +4,7 @@ import '../api/geo_point.dart';
 import '../api/map_controller.dart';
 import '../api/map_notification.dart';
 import '../api/marker.dart';
+import '../api/marker_cluster.dart';
 
 /// Mixin for parent [State]s that want to react to map events.
 ///
@@ -53,6 +54,8 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
         onMapMarkerTapped(marker);
       case MapMarkerLongPressNotification(:final marker):
         onMapMarkerLongPressed(marker);
+      case MapMarkerClusterTapNotification(:final cluster):
+        onMapMarkerClusterTapped(cluster);
       case MapOverlayShownNotification(:final marker):
         onMapOverlayShown(marker);
       case MapOverlayHiddenNotification(:final marker):
@@ -76,6 +79,9 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
 
   /// Called when a marker is long-pressed.
   void onMapMarkerLongPressed(Marker marker) {}
+
+  /// Called when a generated marker cluster is tapped.
+  void onMapMarkerClusterTapped(MarkerCluster cluster) {}
 
   /// Called when a marker's overlay is shown.
   void onMapOverlayShown(Marker marker) {}
