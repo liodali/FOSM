@@ -101,7 +101,9 @@ DecodedLayer _decodeLayer(ProtobufReader reader) {
       case 1: // name
         if (wireType == 2) name = utf8.decode(reader.readBytes());
       case 2: // features
-        if (wireType == 2) features.add(_decodeFeature(reader.readSubMessage()));
+        if (wireType == 2) {
+          features.add(_decodeFeature(reader.readSubMessage()));
+        }
       case 3: // keys
         if (wireType == 2) keys.add(utf8.decode(reader.readBytes()));
       case 4: // values
