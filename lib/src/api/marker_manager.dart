@@ -31,8 +31,13 @@ import 'marker.dart';
 /// (`removeOnMove`, map tap) and marker removal.
 class MarkerManager extends ChangeNotifier {
   final List<Marker> _markers = [];
+  int _revision = 0;
 
   Marker? _overlayMarker;
+
+  /// Monotonically increasing revision counter bumped on every mutation.
+  /// Used internally to invalidate cached cluster computations.
+  int get revision => _revision;
 
   /// The marker whose overlay is currently visible, if any.
   Marker? get overlayMarker => _overlayMarker;
@@ -60,6 +65,7 @@ class MarkerManager extends ChangeNotifier {
   /// Adds a marker and notifies listeners.
   void add(Marker marker) {
     _markers.add(marker);
+    _revision++;
     notifyListeners();
   }
 
@@ -68,6 +74,7 @@ class MarkerManager extends ChangeNotifier {
     final list = markers.toList();
     if (list.isEmpty) return;
     _markers.addAll(list);
+    _revision++;
     notifyListeners();
   }
 
@@ -91,6 +98,7 @@ class MarkerManager extends ChangeNotifier {
     _markers.removeWhere(test);
     final removed = _markers.length != before;
     if (removed) {
+      _revision++;
       if (overlayBefore != null && !_markers.contains(overlayBefore)) {
         _hideOverlayIfOpen(overlayBefore);
       }

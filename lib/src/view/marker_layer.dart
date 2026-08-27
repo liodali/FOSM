@@ -3,8 +3,10 @@ import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/scheduler.dart';
 
 import '../api/marker.dart';
+import '../api/marker_cluster.dart';
 import '../api/marker_manager.dart';
 import '../api/tile_manager.dart';
+import 'marker_cluster_engine.dart';
 
 /// Renders the markers of a [MarkerManager] at their projected positions,
 /// above the tile grid and below the vector label overlay.
@@ -30,11 +32,17 @@ class MarkerLayer extends StatefulWidget {
   /// build, matching how the tile painter consumes it.
   final TileManager manager;
 
+  /// Clustering configuration. When null, no clustering is performed.
+  final MarkerClusterOptions? clusterOptions;
+
   /// Called when a marker is tapped.
   final ValueChanged<Marker>? onMarkerTap;
 
   /// Called when a marker is long-pressed.
   final ValueChanged<Marker>? onMarkerLongPress;
+
+  /// Called when a generated cluster is tapped.
+  final ValueChanged<MarkerCluster>? onClusterTap;
 
   /// Called when a marker's overlay is shown.
   final ValueChanged<Marker>? onOverlayShown;
@@ -46,8 +54,10 @@ class MarkerLayer extends StatefulWidget {
     super.key,
     required this.markers,
     required this.manager,
+    this.clusterOptions,
     this.onMarkerTap,
     this.onMarkerLongPress,
+    this.onClusterTap,
     this.onOverlayShown,
     this.onOverlayHidden,
   });
@@ -76,6 +86,10 @@ class _MarkerLayerState extends State<MarkerLayer>
   /// overlay anchors to the marker widget's edge, which requires its size.
   final Map<Marker, Size> _markerSizes = {};
 
+  /// Cached clustering result and the key under which it was computed.
+  List<ClusterRenderItem>? _clusterItems;
+  _ClusterCacheKey? _clusterCacheKey;
+
   @override
   void initState() {
     super.initState();
@@ -92,7 +106,13 @@ class _MarkerLayerState extends State<MarkerLayer>
     if (widget.markers != oldWidget.markers) {
       oldWidget.markers.removeListener(_onMarkersChanged);
       widget.markers.addListener(_onMarkersChanged);
+      _clusterCacheKey = null;
+      _clusterItems = null;
       _syncOverlayAnimation();
+    }
+    if (widget.clusterOptions != oldWidget.clusterOptions) {
+      _clusterCacheKey = null;
+      _clusterItems = null;
     }
     // Camera check must run outside build: hideOverlay notifies, which
     // setStates via the manager listener.
@@ -150,6 +170,8 @@ class _MarkerLayerState extends State<MarkerLayer>
       _lastOverlayMarker = currentOverlay;
     }
 
+    _clusterCacheKey = null;
+    _clusterItems = null;
     _syncOverlayAnimation();
     if (mounted) setState(() {});
   }
@@ -200,6 +222,11 @@ class _MarkerLayerState extends State<MarkerLayer>
     }
   }
 
+  void _handleClusterTap(MarkerCluster cluster, Offset position) {
+    widget.onClusterTap?.call(cluster);
+    // Optional focal zoom is handled by the parent MapView.
+  }
+
   // ── Marker measurement ──────────────────────────────────────────────
 
   void _onMarkerSizeChanged(Marker marker, Size size) {
@@ -214,6 +241,33 @@ class _MarkerLayerState extends State<MarkerLayer>
     }
   }
 
+  // ── Clustering ──────────────────────────────────────────────────────
+
+  List<ClusterRenderItem> _computeClusters() {
+    final options = widget.clusterOptions;
+    if (options == null) return const [];
+
+    final key = _ClusterCacheKey(
+      manager: widget.markers,
+      managerRevision: widget.markers.revision,
+      zoom: widget.manager.zoom,
+      options: options,
+    );
+    if (_clusterCacheKey == key) {
+      return _clusterItems!;
+    }
+
+    final engine = MarkerClusterEngine(
+      manager: widget.markers,
+      zoom: widget.manager.zoom,
+      options: options,
+    );
+    final items = engine.cluster();
+    _clusterItems = items;
+    _clusterCacheKey = key;
+    return items;
+  }
+
   // ── Build ───────────────────────────────────────────────────────────
 
   @override
@@ -221,46 +275,124 @@ class _MarkerLayerState extends State<MarkerLayer>
     final manager = widget.manager;
     final children = <Widget>[];
 
-    for (final marker in widget.markers.markers) {
-      final position = manager.latLngToScreen(marker.point);
+    final options = widget.clusterOptions;
+    final hasClustering = options != null;
+    List<ClusterRenderItem>? clusterItems;
+    if (hasClustering) {
+      clusterItems = _computeClusters();
+    }
 
-      // Viewport culling: markers whose anchor is off-screen (beyond the
-      // margin that lets wide/tall widgets stay visible while partially
-      // on screen) are skipped entirely — not built, laid out or painted.
-      final visible =
-          position.dx >= -_cullMargin &&
-          position.dy >= -_cullMargin &&
-          position.dx <= manager.width + _cullMargin &&
-          position.dy <= manager.height + _cullMargin;
-      if (!visible) continue;
+    // Hide overlay of any marker that is currently grouped into a cluster.
+    final groupedMarkers = <Marker>{};
+    if (hasClustering && clusterItems != null) {
+      for (final item in clusterItems) {
+        if (item is ClusterGroupItem) {
+          for (final m in item.cluster.markers) {
+            groupedMarkers.add(m);
+          }
+        }
+      }
+    }
+    final overlayMarker = widget.markers.overlayMarker;
+    if (overlayMarker != null && groupedMarkers.contains(overlayMarker)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        widget.markers.hideOverlay();
+      });
+    }
 
-      // FractionalTranslation shifts by a fraction of the child's own
-      // size, so the anchor works without knowing the widget's
-      // dimensions: center → (-0.5, -0.5), bottomCenter → (-0.5, -1.0), …
-      final alignment = marker.alignment;
-
-      var child = _buildMarkerChild(marker);
-
-      children.add(
-        Positioned(
-          left: position.dx,
-          top: position.dy,
-          child: FractionalTranslation(
-            translation: Offset(
-              -(alignment.x + 1.0) / 2.0,
-              -(alignment.y + 1.0) / 2.0,
-            ),
-            child: child,
-          ),
-        ),
-      );
+    if (hasClustering && clusterItems != null) {
+      for (final item in clusterItems) {
+        switch (item) {
+          case SingleClusterMarkerItem(:final marker):
+            _buildMarker(context, manager, children, marker);
+          case ClusterGroupItem(:final cluster):
+            _buildCluster(context, manager, children, cluster);
+        }
+      }
+      // Plain markers are not part of the clustering result; render them
+      // on top so they remain interactive above generated clusters.
+      for (final marker in widget.markers.markers) {
+        if (marker is! ClusterMarker) {
+          _buildMarker(context, manager, children, marker);
+        }
+      }
+    } else {
+      for (final marker in widget.markers.markers) {
+        _buildMarker(context, manager, children, marker);
+      }
     }
 
     // Overlay paints above all markers (later Stack child).
     final overlay = _buildOverlay(manager);
     if (overlay != null) children.add(overlay);
 
-    return Stack(children: children);
+    return Stack(fit: StackFit.expand, children: children);
+  }
+
+  void _buildMarker(
+    BuildContext context,
+    TileManager manager,
+    List<Widget> children,
+    Marker marker,
+  ) {
+    final position = manager.latLngToScreen(marker.point);
+
+    // Viewport culling: markers whose anchor is off-screen (beyond the
+    // margin that lets wide/tall widgets stay visible while partially
+    // on screen) are skipped entirely — not built, laid out or painted.
+    if (!_isVisible(position, manager)) return;
+
+    // FractionalTranslation shifts by a fraction of the child's own
+    // size, so the anchor works without knowing the widget's
+    // dimensions: center → (-0.5, -0.5), bottomCenter → (-0.5, -1.0), …
+    final alignment = marker.alignment;
+
+    final child = _buildMarkerChild(marker);
+
+    children.add(
+      Positioned(
+        left: position.dx,
+        top: position.dy,
+        child: FractionalTranslation(
+          translation: Offset(
+            -(alignment.x + 1.0) / 2.0,
+            -(alignment.y + 1.0) / 2.0,
+          ),
+          child: child,
+        ),
+      ),
+    );
+  }
+
+  void _buildCluster(
+    BuildContext context,
+    TileManager manager,
+    List<Widget> children,
+    MarkerCluster cluster,
+  ) {
+    final position = manager.latLngToScreen(cluster.point);
+    if (!_isVisible(position, manager)) return;
+
+    final child = _buildClusterChild(context, cluster);
+
+    children.add(
+      Positioned(
+        left: position.dx,
+        top: position.dy,
+        child: FractionalTranslation(
+          translation: const Offset(-0.5, -0.5),
+          child: child,
+        ),
+      ),
+    );
+  }
+
+  bool _isVisible(Offset position, TileManager manager) {
+    return position.dx >= -_cullMargin &&
+        position.dy >= -_cullMargin &&
+        position.dx <= manager.width + _cullMargin &&
+        position.dy <= manager.height + _cullMargin;
   }
 
   /// Wraps the marker child with its gesture handlers when it has any;
@@ -300,6 +432,22 @@ class _MarkerLayerState extends State<MarkerLayer>
     return child;
   }
 
+  Widget _buildClusterChild(BuildContext context, MarkerCluster cluster) {
+    final builder = widget.clusterOptions?.builder;
+    final child = builder != null
+        ? builder(context, cluster)
+        : _DefaultClusterBadge(count: cluster.count);
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () =>
+          _handleClusterTap(cluster, manager.latLngToScreen(cluster.point)),
+      child: child,
+    );
+  }
+
+  TileManager get manager => widget.manager;
+
   /// Builds the visible overlay, or null. Anchored to the marker widget
   /// (via its measured size) at the configured side and offset, and
   /// repositioned on every rebuild — which happens on each pan/zoom frame.
@@ -309,12 +457,7 @@ class _MarkerLayerState extends State<MarkerLayer>
     if (marker == null || builder == null) return null;
 
     final position = manager.latLngToScreen(marker.point);
-    final visible =
-        position.dx >= -_cullMargin &&
-        position.dy >= -_cullMargin &&
-        position.dx <= manager.width + _cullMargin &&
-        position.dy <= manager.height + _cullMargin;
-    if (!visible) return null;
+    if (!_isVisible(position, manager)) return null;
 
     final config = marker.overlayConfig;
     final alignment = marker.alignment;
@@ -339,8 +482,7 @@ class _MarkerLayerState extends State<MarkerLayer>
       case MarkerOverlayAnchor.above:
         pivot = size != null
             ? topLeft +
-                Offset(
-                    size.width / 2 + config.offset.dx, -config.offset.dy)
+                Offset(size.width / 2 + config.offset.dx, -config.offset.dy)
             : position + Offset(config.offset.dx, -config.offset.dy);
         overlayAlignment = Alignment.bottomCenter;
         scaleAlignment = const Alignment(0, 1); // grows out of the marker
@@ -441,4 +583,70 @@ class _RenderMeasureSize extends RenderProxyBox {
     _lastSize = child!.size;
     onSizeChanged(child!.size);
   }
+}
+
+/// Default cluster badge: a circular badge showing the member count.
+class _DefaultClusterBadge extends StatelessWidget {
+  final int count;
+
+  const _DefaultClusterBadge({required this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.primary;
+    return Container(
+      width: 40,
+      height: 40,
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black26,
+            blurRadius: 4,
+            offset: Offset(0, 2),
+          ),
+        ],
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        '$count',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+/// Key used to cache cluster engine results.
+class _ClusterCacheKey {
+  final MarkerManager manager;
+  final int managerRevision;
+  final int zoom;
+  final MarkerClusterOptions options;
+
+  const _ClusterCacheKey({
+    required this.manager,
+    required this.managerRevision,
+    required this.zoom,
+    required this.options,
+  });
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is _ClusterCacheKey &&
+        other.manager == manager &&
+        other.managerRevision == managerRevision &&
+        other.zoom == zoom &&
+        other.options == options;
+  }
+
+  @override
+  int get hashCode => Object.hash(manager, managerRevision, zoom, options);
 }

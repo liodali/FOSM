@@ -178,6 +178,65 @@ markers.onOverlayHidden = (marker) { /* … */ };
 Removing a marker (or clearing the manager) while its overlay is open
 hides the overlay automatically.
 
+### Cluster markers
+
+For large marker sets, replace some or all `Marker`s with `ClusterMarker`s and
+tell the map how to group them:
+
+```dart
+final markers = MarkerManager();
+
+markers.addAll([
+  ClusterMarker(
+    point: LatLng(latitude: 47.3769, longitude: 8.5417),
+    child: const Icon(Icons.circle, size: 16, color: Colors.green),
+  ),
+  ClusterMarker(
+    point: LatLng(latitude: 47.3775, longitude: 8.5420),
+    child: const Icon(Icons.circle, size: 16, color: Colors.green),
+  ),
+]);
+
+MapView(
+  latLng: const LatLng(latitude: 47.3769, longitude: 8.5417),
+  zoom: 10,
+  markers: markers,
+  markerClusterOptions: const MarkerClusterOptions(
+    radius: 64,      // group members within this many screen pixels
+    maxZoom: 14,     // disable clustering above this zoom level
+    minSize: 2,      // smallest group that forms a cluster
+    zoomOnTap: true, // zoom in one level when a cluster is tapped
+  ),
+)
+```
+
+Use `clusterGroup` to cluster markers independently per category (e.g. stores
+vs restaurants). Provide a `builder` to customize the cluster badge, or leave it
+out to use the default circular count badge:
+
+```dart
+MarkerClusterOptions(
+  radius: 64,
+  builder: (context, cluster) => Container(
+    width: 40,
+    height: 40,
+    alignment: Alignment.center,
+    decoration: const BoxDecoration(
+      color: Colors.deepPurple,
+      shape: BoxShape.circle,
+    ),
+    child: Text('${cluster.count}', style: const TextStyle(color: Colors.white)),
+  ),
+  onTap: (cluster) => print('Tapped cluster of ${cluster.count}'),
+)
+```
+
+Plain `Marker`s and `ClusterMarker`s can coexist in the same manager. Only
+`ClusterMarker`s are grouped; plain markers are always rendered individually
+and render above generated clusters. Tapping a cluster dispatches
+`MapMarkerClusterTapNotification` and fires `MarkerClusterOptions.onTap`, so
+`MapEventListenerMixin.onMapMarkerClusterTapped` works too.
+
 ## 🏗️ Architecture
 
 ### High-Level Overview

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'geo_point.dart';
 import 'map_controller.dart';
 import 'marker.dart';
+import 'marker_cluster.dart';
 
 /// Base class for notifications dispatched by [MapView].
 ///
@@ -49,6 +50,14 @@ class MapMarkerTapNotification extends MapNotification {
   final Marker marker;
 
   const MapMarkerTapNotification(this.marker);
+}
+
+/// Dispatched when a generated marker cluster is tapped.
+class MapMarkerClusterTapNotification extends MapNotification {
+  /// The cluster that was tapped.
+  final MarkerCluster cluster;
+
+  const MapMarkerClusterTapNotification(this.cluster);
 }
 
 /// Dispatched when a marker is long-pressed.

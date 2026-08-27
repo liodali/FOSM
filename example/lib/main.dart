@@ -29,9 +29,9 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-class _MyHomePageState extends State<MyHomePage>
-    with MapEventListenerMixin {
-  static const String defaultStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
+class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
+  static const String defaultStyleUrl =
+      'https://tiles.openfreemap.org/styles/liberty';
   static const LatLng initialCenter = LatLng(
     latitude: 47.4358055,
     longitude: 8.4737324,
@@ -68,6 +68,9 @@ class _MyHomePageState extends State<MyHomePage>
     Colors.orange,
   ];
 
+  /// Whether clustering is enabled for the demo markers.
+  bool _clusteringEnabled = true;
+
   @override
   void initState() {
     super.initState();
@@ -92,8 +95,8 @@ class _MyHomePageState extends State<MyHomePage>
             anchor: MarkerOverlayAnchor.below,
             offset: Offset(0, 6),
           ),
-          overlayBuilder: (context) =>
-              _infoCard('Munich', const LatLng(latitude: 48.1351, longitude: 11.5820), Colors.blue),
+          overlayBuilder: (context) => _infoCard('Munich',
+              const LatLng(latitude: 48.1351, longitude: 11.5820), Colors.blue),
           child: const Text(
             'Munich',
             style: TextStyle(
@@ -103,8 +106,38 @@ class _MyHomePageState extends State<MyHomePage>
             ),
           ),
         ),
-      );
+      )
+      ..addAll(_buildClusterMarkers());
     _markers.addListener(_onMarkersChanged);
+  }
+
+  /// Sample points around Zurich that cluster when zoomed out.
+  List<ClusterMarker> _buildClusterMarkers() {
+    const count = 40;
+    const latStart = 47.35;
+    const latEnd = 47.45;
+    const lngStart = 8.45;
+    const lngEnd = 8.55;
+    final markers = <ClusterMarker>[];
+    for (var i = 0; i < count; i++) {
+      final t = i / (count - 1);
+      final lat = latStart + (latEnd - latStart) * t;
+      final lng = lngStart + (lngEnd - lngStart) * ((i * 0.37) % 1.0);
+      markers.add(
+        ClusterMarker(
+          clusterGroup: 'zurich',
+          point: LatLng(latitude: lat, longitude: lng),
+          alignment: Alignment.bottomCenter,
+          overlayBuilder: (context) => _infoCard(
+            'Cluster point ${i + 1}',
+            LatLng(latitude: lat, longitude: lng),
+            Colors.green,
+          ),
+          child: const Icon(Icons.circle, size: 16, color: Colors.green),
+        ),
+      );
+    }
+    return markers;
   }
 
   /// The overlay ("info window") shown when a marker is tapped — a plain
@@ -193,6 +226,11 @@ class _MyHomePageState extends State<MyHomePage>
       'Tapped ${marker.point.latitude.toStringAsFixed(3)}, '
       '${marker.point.longitude.toStringAsFixed(3)}',
     );
+  }
+
+  @override
+  void onMapMarkerClusterTapped(MarkerCluster cluster) {
+    _showSnack('Cluster: ${cluster.count} markers');
   }
 
   @override
@@ -297,6 +335,14 @@ class _MyHomePageState extends State<MyHomePage>
                   });
                 },
                 markers: _markers,
+                markerClusterOptions: _clusteringEnabled
+                    ? const MarkerClusterOptions(
+                        radius: 64,
+                        maxZoom: 14,
+                        minSize: 2,
+                        zoomOnTap: true,
+                      )
+                    : null,
               ),
             ),
           ),
@@ -306,8 +352,7 @@ class _MyHomePageState extends State<MyHomePage>
             top: 16,
             left: 16,
             child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
                 color: Colors.white.withValues(alpha: 0.9),
                 borderRadius: BorderRadius.circular(20),
@@ -422,6 +467,29 @@ class _MyHomePageState extends State<MyHomePage>
               ],
             ),
             const SizedBox(height: 12),
+            Row(
+              children: [
+                const Icon(Icons.group_work, size: 18, color: Colors.black87),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Cluster markers',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.black87,
+                    ),
+                  ),
+                ),
+                Switch(
+                  value: _clusteringEnabled,
+                  onChanged: (value) =>
+                      setState(() => _clusteringEnabled = value),
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             SegmentedButton<ZoomAnimationStyle>(
               segments: const [
                 ButtonSegment(
@@ -462,8 +530,7 @@ class _MyHomePageState extends State<MyHomePage>
                 ),
                 const SizedBox(width: 8),
                 FilledButton.tonalIcon(
-                  onPressed:
-                      _markers.isEmpty ? null : _markers.clear,
+                  onPressed: _markers.isEmpty ? null : _markers.clear,
                   icon: const Icon(Icons.delete_outline, size: 16),
                   label: const Text('Clear'),
                 ),
