@@ -38,7 +38,7 @@ class _GridSnapshot {
   /// The POST-step camera center, in the NEW zoom's tile units. The
   /// camera may keep moving while the overlay fades out (an in-progress
   /// pinch pans between zoom steps) — the overlay shift is measured
-  /// against this anchor (see [_MapViewState._animPanShift]).
+  /// against this anchor.
   double anchorTileLng;
   double anchorTileLat;
 
@@ -66,9 +66,96 @@ class _GridSnapshot {
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
         zoom: m.zoom,
-        anchorTileLng: m.centerTileLng,
-        anchorTileLat: m.centerTileLat,
+      anchorTileLng: m.centerTileLng,
+      anchorTileLat: m.centerTileLat,
+    );
+}
+
+/// The old-grid overlay painted while a zoom animation plays.
+///
+/// Phase 1 (waiting): old tiles shown with blur, static (scale 1.0),
+/// while new tiles load underneath.
+///
+/// Phase 2 (scale): old tiles scale up/down from the focal point
+/// while fading out, with blur masking pixelation. Reveals crisp new
+/// tiles underneath. Works for both raster and vector tiles.
+class _OldGridOverlay extends StatelessWidget {
+  final TileManager manager;
+  final Size size;
+  final Alignment scaleAlignment;
+  final _GridSnapshot snapshot;
+  final AnimationController animation;
+  final bool waiting;
+  final double visualScale;
+  final double blurSigma;
+
+  const _OldGridOverlay({
+    required this.manager,
+    required this.size,
+    required this.scaleAlignment,
+    required this.snapshot,
+    required this.animation,
+    required this.waiting,
+    required this.visualScale,
+    required this.blurSigma,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = waiting ? 0.0 : animation.value;
+
+    Widget grid = CustomPaint(
+      size: size,
+      painter: RenderCanvasOSM(
+        horizontalTileCount: snapshot.horizontalTileCount,
+        verticalTileCount: snapshot.verticalTileCount,
+        leftColumnTilesLngIndex: snapshot.leftColumnTilesLngIndex,
+        topRowTilesLatIndex: snapshot.topRowTilesLatIndex,
+        leftColumnTilesCanvasX: snapshot.leftColumnTilesCanvasX,
+        topRowTilesCanvasY: snapshot.topRowTilesCanvasY,
+        tiles: snapshot.tiles,
+        revision: snapshot.revision,
+      ),
+    );
+
+    // Fade out — easeIn keeps tiles visible longer, then fades fast.
+    // During the wait phase, tiles stay fully opaque.
+    if (!waiting) {
+      grid = Opacity(
+        opacity: (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
+        child: grid,
       );
+    }
+
+    // Blur: both styles, different intensity. Progressive during scale.
+    final sigma =
+        waiting ? blurSigma : blurSigma * (1.0 + (visualScale - 1.0).abs());
+    if (sigma > 0.1) {
+      grid = ImageFiltered(
+        imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
+        child: grid,
+      );
+    }
+
+    // Keep the fading overlay glued to the map when the camera pans
+    // between zoom steps.
+    final panShift = Offset(
+      -(manager.centerTileLng - snapshot.anchorTileLng) * tileWidth,
+      -(manager.centerTileLat - snapshot.anchorTileLat) * tileHeight,
+    );
+
+    return Positioned.fill(
+      key: const ValueKey('zoom-scale'),
+      child: Transform.translate(
+        offset: panShift,
+        child: Transform.scale(
+          scale: visualScale,
+          alignment: scaleAlignment,
+          child: grid,
+        ),
+      ),
+    );
+  }
 }
 
 /// How the old tile grid animates out during a zoom transition
@@ -663,83 +750,6 @@ class _MapViewState extends State<MapView>
   double get _blurSigma =>
       widget.zoomAnimationStyle == ZoomAnimationStyle.crossfade ? 5.0 : 2.0;
 
-  /// The old-grid overlay painted while a zoom animation plays.
-  ///
-  /// Phase 1 (waiting): old tiles shown with blur, static (scale 1.0),
-  /// while new tiles load underneath.
-  ///
-  /// Phase 2 (scale): old tiles scale up/down from the focal point
-  /// while fading out, with blur masking pixelation. Reveals crisp new
-  /// tiles underneath. Works for both raster and vector tiles.
-  Widget _buildOldGridOverlay(
-    TileManager manager,
-    Size size,
-    Alignment scaleAlignment,
-  ) {
-    final snap = _animOldSnapshot!;
-    final waiting = _animWaitingTiles;
-    final progress = waiting ? 0.0 : _animController.value;
-
-    Widget grid = CustomPaint(
-      size: size,
-      painter: RenderCanvasOSM(
-        horizontalTileCount: snap.horizontalTileCount,
-        verticalTileCount: snap.verticalTileCount,
-        leftColumnTilesLngIndex: snap.leftColumnTilesLngIndex,
-        topRowTilesLatIndex: snap.topRowTilesLatIndex,
-        leftColumnTilesCanvasX: snap.leftColumnTilesCanvasX,
-        topRowTilesCanvasY: snap.topRowTilesCanvasY,
-        tiles: snap.tiles,
-        revision: snap.revision,
-      ),
-    );
-
-    // Fade out — easeIn keeps tiles visible longer, then fades fast.
-    // During the wait phase, tiles stay fully opaque.
-    if (!waiting) {
-      grid = Opacity(
-        opacity: (1.0 - Curves.easeIn.transform(progress)).clamp(0.0, 1.0),
-        child: grid,
-      );
-    }
-
-    // Blur: both styles, different intensity. Progressive during scale.
-    final sigma =
-        waiting ? _blurSigma : _blurSigma * (1.0 + (_visualScale - 1.0).abs());
-    if (sigma > 0.1) {
-      grid = ImageFiltered(
-        imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
-        child: grid,
-      );
-    }
-
-    return Positioned.fill(
-      key: const ValueKey('zoom-scale'),
-      child: Transform.translate(
-        offset: _animPanShift(manager),
-        child: Transform.scale(
-          scale: _visualScale,
-          alignment: scaleAlignment,
-          child: grid,
-        ),
-      ),
-    );
-  }
-
-  /// How far the camera panned since the animation started, in screen
-  /// pixels. Applied to the fading old-grid overlay so an in-progress
-  /// pinch (which pans between zoom steps) keeps it glued to the map
-  /// instead of ghosting. A camera pan moves every layer by the same
-  /// screen pixels regardless of the overlay's own animation scale.
-  Offset _animPanShift(TileManager manager) {
-    final snap = _animOldSnapshot;
-    if (snap == null) return Offset.zero;
-    return Offset(
-      -(manager.centerTileLng - snap.anchorTileLng) * tileWidth,
-      -(manager.centerTileLat - snap.anchorTileLat) * tileHeight,
-    );
-  }
-
   void _onAnimTick() {
     if (!mounted) return;
     _visualScale = _scaleAnimation?.value ?? 1.0;
@@ -867,8 +877,8 @@ class _MapViewState extends State<MapView>
   }
 
   /// Bare-map tap: closes an open marker overlay when its config allows
-  /// (`MarkerOverlayConfig.closeOnMapTap`). Marker taps never reach here —
-  /// their own recognizer is deeper in the tree and wins the arena.
+  /// (`MarkerOverlayConfig.closeOnMapTap`). This detector lives below the
+  /// marker layer, so marker taps never reach it.
   void _onMapTap() {
     final markers = widget.markers;
     if (markers == null) return;
@@ -943,43 +953,67 @@ class _MapViewState extends State<MapView>
           onScaleStart: _onScaleStart,
           onScaleUpdate: (d) => _onScaleUpdate(manager, d),
           onScaleEnd: _onScaleEnd,
-          onTap: _onMapTap,
+          // NOTE: bare-map tap is handled by the tile-layer detector below,
+          // not by this root detector. Putting it here made the map's tap
+          // recognizer compete in the gesture arena with marker taps, which
+          // caused marker taps to be dropped/intermittent.
           onDoubleTapDown: (details) {
             _doubleTapLocal = details.localPosition;
           },
           onDoubleTap: () => _zoomInAt(_doubleTapLocal),
           child: Stack(
             children: [
-              // ── NEW zoom tiles (background, always at 1.0×) ───────
+              // ── Map surface: tiles + bare-map tap handler ───────────
+              // Placed below markers so marker taps win unambiguously.
               Positioned.fill(
-                child: CustomPaint(
-                  size: size,
-                  painter: RenderCanvasOSM(
-                    horizontalTileCount: manager.horizontalTileCount,
-                    verticalTileCount: manager.verticalTileCount,
-                    leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
-                    topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                    leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
-                    topRowTilesCanvasY: manager.topRowTilesCanvasY,
-                    tiles: manager.renderTiles,
-                    revision: manager.revision,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onTap: _onMapTap,
+                  child: Stack(
+                    children: [
+                      // ── NEW zoom tiles (background, always at 1.0×) ─
+                      Positioned.fill(
+                        child: CustomPaint(
+                          size: size,
+                          painter: RenderCanvasOSM(
+                            horizontalTileCount: manager.horizontalTileCount,
+                            verticalTileCount: manager.verticalTileCount,
+                            leftColumnTilesLngIndex:
+                                manager.leftColumnTilesLngIndex,
+                            topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                            leftColumnTilesCanvasX:
+                                manager.leftColumnTilesCanvasX,
+                            topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                            tiles: manager.renderTiles,
+                            revision: manager.revision,
+                          ),
+                        ),
+                      ),
+
+                      // ── OLD zoom tiles (overlay, animated out) ─────
+                      // Keyed: this child inserts/removes mid-animation,
+                      // and an unkeyed insertion reshuffles — recreating
+                      // the state of — every Stack child after it (marker
+                      // layer included).
+                      if (isAnimatingZoom) ...[
+                        _OldGridOverlay(
+                          manager: manager,
+                          size: size,
+                          scaleAlignment: scaleAlignment,
+                          snapshot: _animOldSnapshot!,
+                          animation: _animController,
+                          waiting: _animWaitingTiles,
+                          visualScale: _visualScale,
+                          blurSigma: _blurSigma,
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
 
-              // ── OLD zoom tiles (overlay, animated out) ─────────────
-              // Keyed: this child inserts/removes mid-animation, and an
-              // unkeyed insertion reshuffles — recreating the state of —
-              // every Stack child after it (marker layer included).
-              if (isAnimatingZoom)
-                _buildOldGridOverlay(
-                  manager,
-                  size,
-                  scaleAlignment,
-                ),
-
               // ── Markers (above tiles + scale overlay, below labels) ─
-              if (widget.markers != null)
+              if (widget.markers != null) ...[
                 Positioned.fill(
                   child: MarkerLayer(
                     markers: widget.markers!,
@@ -1002,11 +1036,12 @@ class _MapViewState extends State<MapView>
                     },
                   ),
                 ),
+              ],
 
               // ── Vector labels (above markers; need viewport-level ──
               // ── collision, not per-tile rendering). Ignored for  ───
               // ── hit testing so markers stay tappable.             ───
-              if (runtime != null)
+              if (runtime != null) ...[
                 Positioned.fill(
                   child: IgnorePointer(
                     child: CustomPaint(
@@ -1027,9 +1062,10 @@ class _MapViewState extends State<MapView>
                     ),
                   ),
                 ),
+              ],
 
               // ── Zoom controls (not affected by scale) ────────────
-              if (widget.showZoomControls)
+              if (widget.showZoomControls) ...[
                 Positioned.fill(
                   child: MapZoomControls(
                     zoom: _currentZoom,
@@ -1040,9 +1076,10 @@ class _MapViewState extends State<MapView>
                     onZoomOut: _zoomOut,
                   ),
                 ),
+              ],
 
               // ── Attribution (required by vector tile providers) ───
-              if (runtime != null && runtime.loaded.attribution.isNotEmpty)
+              if (runtime != null && runtime.loaded.attribution.isNotEmpty) ...[
                 Positioned(
                   left: 4,
                   bottom: 4,
@@ -1066,6 +1103,7 @@ class _MapViewState extends State<MapView>
                     ),
                   ),
                 ),
+              ],
             ],
           ),
         );
