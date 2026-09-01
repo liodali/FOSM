@@ -80,3 +80,4 @@ build/
 *.lock
 .commandcode
 .zcode
+.plan

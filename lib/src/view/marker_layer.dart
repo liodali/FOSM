@@ -273,14 +273,10 @@ class _MarkerLayerState extends State<MarkerLayer>
   @override
   Widget build(BuildContext context) {
     final manager = widget.manager;
-    final children = <Widget>[];
 
     final options = widget.clusterOptions;
     final hasClustering = options != null;
-    List<ClusterRenderItem>? clusterItems;
-    if (hasClustering) {
-      clusterItems = _computeClusters();
-    }
+    final clusterItems = hasClustering ? _computeClusters() : null;
 
     // Hide overlay of any marker that is currently grouped into a cluster.
     final groupedMarkers = <Marker>{};
@@ -301,39 +297,37 @@ class _MarkerLayerState extends State<MarkerLayer>
       });
     }
 
-    if (hasClustering && clusterItems != null) {
-      for (final item in clusterItems) {
-        switch (item) {
-          case SingleClusterMarkerItem(:final marker):
-            _buildMarker(context, manager, children, marker);
-          case ClusterGroupItem(:final cluster):
-            _buildCluster(context, manager, children, cluster);
-        }
-      }
-      // Plain markers are not part of the clustering result; render them
-      // on top so they remain interactive above generated clusters.
-      for (final marker in widget.markers.markers) {
-        if (marker is! ClusterMarker) {
-          _buildMarker(context, manager, children, marker);
-        }
-      }
-    } else {
-      for (final marker in widget.markers.markers) {
-        _buildMarker(context, manager, children, marker);
-      }
-    }
-
     // Overlay paints above all markers (later Stack child).
     final overlay = _buildOverlay(manager);
-    if (overlay != null) children.add(overlay);
 
-    return Stack(fit: StackFit.expand, children: children);
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        if (hasClustering && clusterItems != null) ...[
+          for (final item in clusterItems)
+            switch (item) {
+              SingleClusterMarkerItem(:final marker) =>
+                _buildMarkerWidget(context, manager, marker),
+              ClusterGroupItem(:final cluster) =>
+                _buildClusterWidget(context, manager, cluster),
+            },
+          // Plain markers are not part of the clustering result; render them
+          // on top so they remain interactive above generated clusters.
+          for (final marker in widget.markers.markers)
+            if (marker is! ClusterMarker)
+              _buildMarkerWidget(context, manager, marker),
+        ] else ...[
+          for (final marker in widget.markers.markers)
+            _buildMarkerWidget(context, manager, marker),
+        ],
+        if (overlay != null) overlay,
+      ],
+    );
   }
 
-  void _buildMarker(
+  Widget _buildMarkerWidget(
     BuildContext context,
     TileManager manager,
-    List<Widget> children,
     Marker marker,
   ) {
     final position = manager.latLngToScreen(marker.point);
@@ -341,7 +335,7 @@ class _MarkerLayerState extends State<MarkerLayer>
     // Viewport culling: markers whose anchor is off-screen (beyond the
     // margin that lets wide/tall widgets stay visible while partially
     // on screen) are skipped entirely — not built, laid out or painted.
-    if (!_isVisible(position, manager)) return;
+    if (!_isVisible(position, manager)) return const SizedBox.shrink();
 
     // FractionalTranslation shifts by a fraction of the child's own
     // size, so the anchor works without knowing the widget's
@@ -350,40 +344,35 @@ class _MarkerLayerState extends State<MarkerLayer>
 
     final child = _buildMarkerChild(marker);
 
-    children.add(
-      Positioned(
-        left: position.dx,
-        top: position.dy,
-        child: FractionalTranslation(
-          translation: Offset(
-            -(alignment.x + 1.0) / 2.0,
-            -(alignment.y + 1.0) / 2.0,
-          ),
-          child: child,
+    return Positioned(
+      left: position.dx,
+      top: position.dy,
+      child: FractionalTranslation(
+        translation: Offset(
+          -(alignment.x + 1.0) / 2.0,
+          -(alignment.y + 1.0) / 2.0,
         ),
+        child: child,
       ),
     );
   }
 
-  void _buildCluster(
+  Widget _buildClusterWidget(
     BuildContext context,
     TileManager manager,
-    List<Widget> children,
     MarkerCluster cluster,
   ) {
     final position = manager.latLngToScreen(cluster.point);
-    if (!_isVisible(position, manager)) return;
+    if (!_isVisible(position, manager)) return const SizedBox.shrink();
 
     final child = _buildClusterChild(context, cluster);
 
-    children.add(
-      Positioned(
-        left: position.dx,
-        top: position.dy,
-        child: FractionalTranslation(
-          translation: const Offset(-0.5, -0.5),
-          child: child,
-        ),
+    return Positioned(
+      left: position.dx,
+      top: position.dy,
+      child: FractionalTranslation(
+        translation: const Offset(-0.5, -0.5),
+        child: child,
       ),
     );
   }

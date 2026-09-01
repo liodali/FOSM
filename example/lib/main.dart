@@ -653,7 +653,10 @@ class _LayersButton extends StatelessWidget {
   }
 }
 
-/// A small vertical stack of buttons demonstrating [MapController].
+/// A small button demonstrating [MapController.moveTo].
+///
+/// Zoom in/out are already provided by [MapView]'s built-in controls, so
+/// duplicating them here is avoided.
 class _MapControllerButtons extends StatelessWidget {
   final MapController controller;
   final VoidCallback onFlyTo;
@@ -668,18 +671,6 @@ class _MapControllerButtons extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        _ToolButton(
-          icon: Icons.add,
-          tooltip: 'Zoom in',
-          onPressed: () => controller.zoomIn(),
-        ),
-        const SizedBox(height: 8),
-        _ToolButton(
-          icon: Icons.remove,
-          tooltip: 'Zoom out',
-          onPressed: () => controller.zoomOut(),
-        ),
-        const SizedBox(height: 8),
         _ToolButton(
           icon: Icons.flight,
           tooltip: 'Fly to Paris',
