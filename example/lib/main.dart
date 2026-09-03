@@ -37,6 +37,16 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
     longitude: 8.4737324,
   );
 
+  /// Static demo route around Zurich, rendered on both raster and vector
+  /// maps. FOSM only draws the points — a real app would fetch/decode a
+  /// routing response itself.
+  static const List<LatLng> _zurichRoute = [
+    LatLng(latitude: 47.3769, longitude: 8.5417),
+    LatLng(latitude: 47.3788, longitude: 8.5470),
+    LatLng(latitude: 47.3811, longitude: 8.5524),
+    LatLng(latitude: 47.3845, longitude: 8.5555),
+  ];
+
   /// Programmatic control surface for the map.
   final MapController _mapController = MapController();
 
@@ -107,7 +117,33 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
           ),
         ),
       )
-      ..addAll(_buildClusterMarkers());
+      ..addAll(_buildClusterMarkers())
+      ..add(
+        Marker(
+          point: _zurichRoute.first,
+          alignment: Alignment.bottomCenter,
+          overlayBuilder: (context) =>
+              _infoCard('Route start', _zurichRoute.first, Colors.indigo),
+          child: const Icon(
+            Icons.trip_origin,
+            size: 18,
+            color: Colors.indigo,
+          ),
+        ),
+      )
+      ..add(
+        Marker(
+          point: _zurichRoute.last,
+          alignment: Alignment.bottomCenter,
+          overlayBuilder: (context) =>
+              _infoCard('Route end', _zurichRoute.last, Colors.indigo),
+          child: const Icon(
+            Icons.location_on,
+            size: 28,
+            color: Colors.indigo,
+          ),
+        ),
+      );
     _markers.addListener(_onMarkersChanged);
   }
 
@@ -335,6 +371,13 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                   });
                 },
                 markers: _markers,
+                polylines: const [
+                  MapPolyline(
+                    points: _zurichRoute,
+                    color: Color(0xFF283593),
+                    strokeWidth: 6,
+                  ),
+                ],
                 markerClusterOptions: _clusteringEnabled
                     ? const MarkerClusterOptions(
                         radius: 64,

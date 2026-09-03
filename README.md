@@ -10,6 +10,7 @@ A high-performance Flutter map library with native raster and vector tile render
 
 - 🗺️ **Dual Rendering Modes**: Native raster (OSM) and vector (Mapbox Vector Tiles) rendering
 - 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager` — with tap/long-press gestures (hand cursor on hover) and marker-following overlays
+- 🛣️ **Polylines**: Render decoded route geometry (`List<LatLng>`) in any color/width, above tiles and below markers — works in raster and vector mode
 - 🚀 **High Performance**: Persistent HTTP isolate with TCP connection reuse
 - 🎯 **Smart Caching**: Memory + disk (Hive) with intelligent eviction
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
@@ -236,6 +237,61 @@ Plain `Marker`s and `ClusterMarker`s can coexist in the same manager. Only
 and render above generated clusters. Tapping a cluster dispatches
 `MapMarkerClusterTapNotification` and fires `MarkerClusterOptions.onTap`, so
 `MapEventListenerMixin.onMapMarkerClusterTapped` works too.
+
+### Polylines (routes)
+
+FOSM renders decoded route geometry only — calling a routing provider
+(OSRM, OpenRouteService, …) and decoding its encoded-polyline response is
+your application's responsibility. Pass the decoded `LatLng` points as
+`MapPolyline`s:
+
+```dart
+final routePoints = <LatLng>[
+  const LatLng(latitude: 47.3769, longitude: 8.5417),
+  const LatLng(latitude: 47.3788, longitude: 8.5470),
+  const LatLng(latitude: 47.3811, longitude: 8.5524),
+];
+
+MapView(
+  latLng: routePoints.first,
+  zoom: 14,
+  polylines: [
+    MapPolyline(
+      points: routePoints,
+      color: Colors.blue,
+      strokeWidth: 5, // logical pixels; does not scale with zoom
+    ),
+  ],
+);
+```
+
+Replacing or clearing a route is ordinary widget configuration — rebuild
+the parent with a new list (empty lists and one-point lists paint nothing):
+
+```dart
+polylines: routePoints.isEmpty
+    ? const []
+    : [MapPolyline(points: routePoints)],
+```
+
+Multiple independently styled routes are supported; list order is paint
+order (later polylines draw above earlier ones):
+
+```dart
+polylines: [
+  MapPolyline(points: fastestRoute, color: Colors.blue),
+  MapPolyline(points: alternativeRoute, color: Colors.grey),
+],
+```
+
+Routes render above the tile grid (and the zoom-transition overlay) and
+below markers and vector labels, and stay geographically aligned through
+pan, pinch zoom, zoom controls, and `MapController` movements. Route
+painting never consumes gestures.
+
+**Known limitation:** a segment crossing the international date line
+(longitude `179` → `-179`) is drawn as a long straight line across the map
+rather than wrapping around the world.
 
 ## 🏗️ Architecture
 
@@ -666,11 +722,13 @@ lib/
     │   ├── tile_source.dart           # TileFetcher typedef
     │   ├── geo_point.dart             # LatLng class
     │   ├── marker.dart                # Marker model
-    │   └── marker_manager.dart        # Marker collection (ChangeNotifier)
+    │   ├── map_polyline.dart          # MapPolyline model (route styling)
+    │   ├── marker_manager.dart        # Marker collection (ChangeNotifier)
     │
     ├── view/
     │   ├── map_view.dart              # Main map widget
     │   ├── render.dart                # CustomPainters (tiles, labels)
+    │   ├── polyline_layer.dart        # Route/polyline rendering layer
     │   ├── marker_layer.dart          # Widget markers + viewport culling
     │   └── zoom_controls.dart         # +/- buttons
     │
