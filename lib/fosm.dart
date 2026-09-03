@@ -3,6 +3,7 @@ export 'src/view/zoom_controls.dart';
 export 'src/api/geo_point.dart';
 export 'src/api/map_controller.dart' show MapController;
 export 'src/api/map_notification.dart';
+export 'src/api/map_polyline.dart';
 export 'src/api/marker.dart';
 export 'src/api/marker_cluster.dart';
 export 'src/api/marker_manager.dart';
