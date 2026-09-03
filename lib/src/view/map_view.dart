@@ -4,21 +4,23 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
-import '../api/geo_point.dart';
-import '../api/map_controller.dart';
-import '../api/map_notification.dart';
-import '../api/marker_cluster.dart';
-import '../api/marker_manager.dart';
-import '../api/tile.dart';
-import '../api/tile_manager.dart';
-import '../api/tile_source.dart';
-import '../common/osm_transformation_utilities.dart';
-import '../common/utils.dart';
-import '../vector/render/vector_tile_runtime.dart';
-import '../vector/style/style_loader.dart';
-import 'marker_layer.dart';
-import 'render.dart';
-import 'zoom_controls.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/map_controller.dart';
+import 'package:fosm/src/api/map_notification.dart';
+import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/marker_manager.dart';
+import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/api/tile_source.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
+import 'package:fosm/src/vector/style/style_loader.dart';
+import 'package:fosm/src/view/marker_layer.dart';
+import 'package:fosm/src/view/polyline_layer.dart';
+import 'package:fosm/src/view/render.dart';
+import 'package:fosm/src/view/zoom_controls.dart';
 
 /// Captures a snapshot of the tile grid geometry and tiles for rendering
 /// an "old zoom" overlay during the scale transition.
@@ -66,9 +68,9 @@ class _GridSnapshot {
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
         zoom: m.zoom,
-      anchorTileLng: m.centerTileLng,
-      anchorTileLat: m.centerTileLat,
-    );
+        anchorTileLng: m.centerTileLng,
+        anchorTileLat: m.centerTileLat,
+      );
 }
 
 /// The old-grid overlay painted while a zoom animation plays.
@@ -209,6 +211,16 @@ enum ZoomAnimationStyle {
 /// follows the marker across pans and zooms (see [MarkerOverlayConfig]
 /// for `removeOnMove` and friends).
 ///
+/// ### Polylines
+/// Pass decoded route geometry as [MapPolyline]s via [polylines] — one
+/// `List<LatLng>` per route. FOSM only renders the points; fetching and
+/// decoding a routing response is the application's responsibility. Routes
+/// render above the tile grid and below markers and vector labels, stay
+/// aligned on every pan/zoom, and update when the parent rebuilds with a
+/// new (or empty) list. Known limitation: a segment crossing the
+/// international date line (e.g. longitude 179 → -179) is drawn as a long
+/// straight line rather than wrapping around the world.
+///
 /// ### Programmatic control
 /// Pass a [MapController] to [controller] to drive the camera and
 /// markers from outside the widget tree: [MapController.moveTo],
@@ -261,6 +273,10 @@ class MapView extends StatefulWidget {
   /// render as ordinary markers and no grouping is performed.
   final MarkerClusterOptions? markerClusterOptions;
 
+  /// Geographic lines rendered above map tiles and below markers/labels.
+  /// List order is paint order: later polylines draw above earlier ones.
+  final List<MapPolyline> polylines;
+
   /// Renders a hosted vector style instead of raster tiles (e.g.
   /// [openFreeMapLiberty]). When set, [tileFetcher] is ignored — the
   /// style document defines all tile sources. Raster mode remains the
@@ -294,6 +310,7 @@ class MapView extends StatefulWidget {
     this.controller,
     this.markers,
     this.markerClusterOptions,
+    this.polylines = const [],
     this.vectorStyle,
     this.showZoomControls = true,
     this.onZoomChanged,
@@ -1011,6 +1028,16 @@ class _MapViewState extends State<MapView>
                   ),
                 ),
               ),
+
+              // ── Polylines (above tiles, below markers and labels) ──
+              if (widget.polylines.isNotEmpty) ...[
+                Positioned.fill(
+                  child: PolylineLayer(
+                    polylines: widget.polylines,
+                    manager: manager,
+                  ),
+                ),
+              ],
 
               // ── Markers (above tiles + scale overlay, below labels) ─
               if (widget.markers != null) ...[
