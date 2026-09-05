@@ -121,9 +121,10 @@ class _Pixels {
 
 Future<_Pixels> _render(
   WidgetTester tester,
-  List<MapPolyline> polylines,
-) async {
-  final manager = _manager();
+  List<MapPolyline> polylines, {
+  int zoom = _testZoom,
+}) async {
+  final manager = _manager(zoom: zoom);
   try {
     final pixels = await tester.runAsync<_Pixels>(() async {
       final recorder = ui.PictureRecorder();
@@ -351,6 +352,456 @@ void main() {
       final painter = PolylinePainter(polylines: const [], manager: manager);
 
       expect(painter.shouldRepaint(oldPainter), isTrue);
+    });
+
+    testWidgets('draws a border outside the main stroke', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-20, 0),
+            _pointAtPixelOffset(20, 0),
+          ],
+          color: Colors.blue,
+          strokeWidth: 6,
+          borderColor: Colors.white,
+          borderWidth: 3,
+        ),
+      ]);
+
+      // Main stroke center is blue.
+      expect(pixels.blue(50, 50), 243);
+      // Border pixels are outside the main stroke on both sides.
+      expect(pixels.alpha(50, 45), greaterThan(0));
+      expect(pixels.red(50, 45), greaterThan(200));
+      expect(pixels.green(50, 45), greaterThan(200));
+      expect(pixels.blue(50, 45), greaterThan(200));
+      expect(pixels.alpha(50, 57), 0);
+    });
+
+    testWidgets('uses configurable stroke caps', (tester) async {
+      final round = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-20, 0),
+            _pointAtPixelOffset(20, 0),
+          ],
+          color: Colors.red,
+          strokeWidth: 10,
+          strokeCap: StrokeCap.round,
+        ),
+      ]);
+      final butt = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-20, 0),
+            _pointAtPixelOffset(20, 0),
+          ],
+          color: Colors.red,
+          strokeWidth: 10,
+          strokeCap: StrokeCap.butt,
+        ),
+      ]);
+
+      // Round caps extend past the endpoint; butt caps do not.
+      expect(round.alpha(26, 50), greaterThan(0));
+      expect(butt.alpha(26, 50), 0);
+    });
+
+    testWidgets('renders dashed patterns with gaps', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-30, 0),
+            _pointAtPixelOffset(30, 0),
+          ],
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 10,
+            gapLength: 10,
+          ),
+        ),
+      ]);
+
+      // Dash interval at distance 20..30 from the left endpoint.
+      expect(pixels.alpha(45, 50), greaterThan(0));
+      // Gap interval at distance 30..40 from the left endpoint.
+      expect(pixels.alpha(55, 50), 0);
+    });
+
+    testWidgets('dashed border and inner dash align', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-30, 0),
+            _pointAtPixelOffset(30, 0),
+          ],
+          color: Colors.blue,
+          strokeWidth: 4,
+          borderColor: Colors.white,
+          borderWidth: 2,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 10,
+            gapLength: 10,
+          ),
+        ),
+      ]);
+
+      // A dash exists and its surrounding border is visible.
+      expect(pixels.alpha(45, 50), greaterThan(0));
+      expect(pixels.alpha(45, 46), greaterThan(0));
+      expect(pixels.red(45, 46), greaterThan(200));
+    });
+
+    testWidgets('renders dotted patterns with spacing', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-30, 0),
+            _pointAtPixelOffset(30, 0),
+          ],
+          color: Colors.red,
+          strokeWidth: 6,
+          pattern: const MapPolylinePattern.dotted(spacing: 20),
+        ),
+      ]);
+
+      // Dot center at the first repeat point (distance == spacing).
+      expect(pixels.alpha(40, 50), greaterThan(0));
+      // Midpoint between first and second dot is a gap.
+      expect(pixels.alpha(30, 50), 0);
+    });
+
+    testWidgets('dotted phase continues across route vertices', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-20, 0),
+            _pointAtPixelOffset(-5, 0),
+            _pointAtPixelOffset(-5, 25),
+          ],
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dotted(spacing: 20),
+        ),
+      ]);
+
+      // Segment 1 is 15px and segment 2 is 25px. With spacing 20, the second
+      // dot lands at cumulative distance 20 (5px along segment 2) rather than
+      // resetting at the vertex (distance 15), leaving the vertex unpainted.
+      expect(pixels.alpha(45, 55), greaterThan(0));
+      expect(pixels.alpha(45, 50), 0);
+      // The route ends at cumulative distance 40; no irregular extra endpoint
+      // dot is forced when the sampling loop reaches the exact path length.
+      expect(pixels.alpha(45, 70), 0);
+    });
+
+    testWidgets(
+        'configurable joins render distinct silhouettes and miter limits',
+        (tester) async {
+      Future<_Pixels> renderWithJoin(
+        StrokeJoin join, {
+        double miterLimit = 4,
+      }) =>
+          _render(tester, [
+            MapPolyline(
+              points: [
+                _pointAtPixelOffset(-20, -10),
+                _pointAtPixelOffset(0, 10),
+                _pointAtPixelOffset(20, -10),
+              ],
+              color: Colors.red,
+              strokeWidth: 12,
+              strokeJoin: join,
+              strokeMiterLimit: miterLimit,
+            ),
+          ]);
+
+      final round = await renderWithJoin(StrokeJoin.round);
+      final bevel = await renderWithJoin(StrokeJoin.bevel);
+      final miter = await renderWithJoin(StrokeJoin.miter);
+      final clippedMiter =
+          await renderWithJoin(StrokeJoin.miter, miterLimit: 1);
+
+      // All joins paint the shared vertex.
+      expect(round.alpha(50, 60), greaterThan(0));
+      expect(bevel.alpha(50, 60), greaterThan(0));
+      expect(miter.alpha(50, 60), greaterThan(0));
+
+      // At (50, 65): round and miter extend past the bevel's cut edge.
+      expect(round.alpha(50, 65), greaterThan(0));
+      expect(bevel.alpha(50, 65), 0);
+      expect(miter.alpha(50, 65), greaterThan(0));
+
+      // At (50, 68): miter tip extends further than round.
+      expect(round.alpha(50, 68), 0);
+      expect(miter.alpha(50, 68), greaterThan(0));
+
+      // Low miter limit clips the sharp spike to bevel behavior.
+      expect(clippedMiter.alpha(50, 68), 0);
+    });
+
+    testWidgets('uses square stroke caps with corner extension',
+        (tester) async {
+      final points = [
+        _pointAtPixelOffset(-20, 0),
+        _pointAtPixelOffset(20, 0),
+      ];
+      final butt = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 10,
+          strokeCap: StrokeCap.butt,
+        ),
+      ]);
+      final round = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 10,
+          strokeCap: StrokeCap.round,
+        ),
+      ]);
+      final square = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 10,
+          strokeCap: StrokeCap.square,
+        ),
+      ]);
+
+      // Endpoint is at (30, 50).
+      // Butt does not extend past x = 30.
+      expect(butt.alpha(27, 50), 0);
+      // Round and square both extend past x = 30 along the center line.
+      expect(round.alpha(27, 50), greaterThan(0));
+      expect(square.alpha(27, 50), greaterThan(0));
+
+      // At the cap corner (25, 45): square covers the corner while round does not.
+      expect(butt.alpha(25, 45), 0);
+      expect(round.alpha(25, 45), 0);
+      expect(square.alpha(25, 45), greaterThan(0));
+    });
+
+    testWidgets('dashed pattern respects offset and negative normalization',
+        (tester) async {
+      final points = [
+        _pointAtPixelOffset(-30, 0),
+        _pointAtPixelOffset(30, 0),
+      ];
+
+      // Positive offset: first dash is delayed by offset.
+      final positive = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 10,
+            gapLength: 10,
+            offset: 6,
+          ),
+        ),
+      ]);
+      // Left endpoint is at screen (20, 50).
+      // Interval [0, 6) is gap: at screen (22, 50), distance 2 is transparent.
+      expect(positive.alpha(22, 50), 0);
+      // Interval [6, 16] is dash: at screen (30, 50), distance 10 is painted.
+      expect(positive.alpha(30, 50), greaterThan(0));
+
+      // Negative offset: normalized modulo cycle (20). -4 % 20 == 16.
+      // First dash starts at distance 16.
+      final negative = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 10,
+            gapLength: 10,
+            offset: -4,
+          ),
+        ),
+      ]);
+      // At screen (25, 50), distance 5 is in the initial gap before distance 16.
+      expect(negative.alpha(25, 50), 0);
+      // At screen (40, 50), distance 20 is inside the first dash [16, 26].
+      expect(negative.alpha(40, 50), greaterThan(0));
+    });
+
+    testWidgets('dotted pattern respects offset and negative normalization',
+        (tester) async {
+      final points = [
+        _pointAtPixelOffset(-30, 0),
+        _pointAtPixelOffset(30, 0),
+      ];
+
+      // Positive offset: first dot starts at offset.
+      final positive = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dotted(
+            spacing: 20,
+            offset: 8,
+          ),
+        ),
+      ]);
+      // Endpoint is at screen (20, 50).
+      // Dot at distance 8: screen (28, 50) is painted.
+      expect(positive.alpha(28, 50), greaterThan(0));
+      // Distance 0 at screen (20, 50) has no dot.
+      expect(positive.alpha(20, 50), 0);
+
+      // Negative offset: normalized modulo spacing (20). -6 % 20 == 14.
+      final negative = await _render(tester, [
+        MapPolyline(
+          points: points,
+          color: Colors.red,
+          strokeWidth: 4,
+          pattern: const MapPolylinePattern.dotted(
+            spacing: 20,
+            offset: -6,
+          ),
+        ),
+      ]);
+      // Dot at distance 14: screen (34, 50) is painted.
+      expect(negative.alpha(34, 50), greaterThan(0));
+      // Distance 8 at screen (28, 50) has no dot.
+      expect(negative.alpha(28, 50), 0);
+    });
+
+    testWidgets('dash continues through a non-cycle-aligned vertex',
+        (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-30, 0),
+            _pointAtPixelOffset(-15, 0),
+            _pointAtPixelOffset(-15, 25),
+          ],
+          color: Colors.red,
+          strokeWidth: 4,
+          strokeCap: StrokeCap.butt,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 20,
+            gapLength: 10,
+          ),
+        ),
+      ]);
+
+      // Segment 1 is 15px (screen (20, 50) to (35, 50)).
+      // Dash length is 20px, so it crosses the corner at (35, 50) and continues
+      // 5px down segment 2 to screen (35, 55).
+      expect(pixels.alpha(35, 50), greaterThan(0));
+      expect(pixels.alpha(35, 53), greaterThan(0));
+      // Gap runs from distance 20 to 30: screen (35, 60) is distance 25 (gap).
+      expect(pixels.alpha(35, 60), 0);
+    });
+
+    testWidgets('pattern phase remains stable when route starts off-screen',
+        (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(-80, 0),
+            _pointAtPixelOffset(30, 0),
+          ],
+          color: Colors.red,
+          strokeWidth: 4,
+          strokeCap: StrokeCap.butt,
+          pattern: const MapPolylinePattern.dashed(
+            dashLength: 20,
+            gapLength: 10,
+          ),
+        ),
+      ]);
+
+      // Route starts off-screen at screen (-30, 50).
+      // Dash 0: -30..-10
+      // Gap 0: -10..0
+      // Dash 1: 0..20
+      // Gap 1: 20..30
+      // Dash 2: 30..50
+      // Gap 2: 50..60
+      // Dash 3: 60..80
+      // Visible dash 2 covers screen x = 30..50.
+      expect(pixels.alpha(40, 50), greaterThan(0));
+      // Gap 2 covers screen x = 50..60.
+      expect(pixels.alpha(55, 50), 0);
+      // Dash 3 covers screen x = 60..80.
+      expect(pixels.alpha(70, 50), greaterThan(0));
+    });
+
+    testWidgets('renders dotted borders with correct radii', (tester) async {
+      final pixels = await _render(tester, [
+        MapPolyline(
+          points: [
+            _pointAtPixelOffset(0, 0),
+            _pointAtPixelOffset(40, 0),
+          ],
+          color: Colors.blue,
+          strokeWidth: 6,
+          borderColor: Colors.white,
+          borderWidth: 3,
+          pattern: const MapPolylinePattern.dotted(spacing: 20),
+        ),
+      ]);
+
+      // Dot center is at screen (50, 50).
+      // Inner radius is 3, border radius is 6.
+      // At center: inner color (blue).
+      expect(pixels.blue(50, 50), greaterThan(200));
+      // At distance 4 from center (50, 54): border color (white).
+      expect(pixels.red(50, 54), greaterThan(200));
+      expect(pixels.green(50, 54), greaterThan(200));
+      expect(pixels.blue(50, 54), greaterThan(200));
+      // At distance 8 from center (50, 58): outside dot border.
+      expect(pixels.alpha(50, 58), 0);
+    });
+
+    testWidgets('fast-forwards patterns to a distant visible route section',
+        (tester) async {
+      const zoom = 19;
+      final pixels = await _render(
+        tester,
+        [
+          MapPolyline(
+            points: [
+              _pointAtPixelOffset(-2100000, -10, zoom: zoom),
+              _pointAtPixelOffset(30, -10, zoom: zoom),
+            ],
+            color: Colors.red,
+            strokeWidth: 4,
+            strokeCap: StrokeCap.butt,
+            pattern: const MapPolylinePattern.dashed(
+              dashLength: 10,
+              gapLength: 10,
+            ),
+          ),
+          MapPolyline(
+            points: [
+              _pointAtPixelOffset(-2100000, 10, zoom: zoom),
+              _pointAtPixelOffset(30, 10, zoom: zoom),
+            ],
+            color: Colors.blue,
+            strokeWidth: 4,
+            pattern: const MapPolylinePattern.dotted(spacing: 20),
+          ),
+        ],
+        zoom: zoom,
+      );
+
+      // The viewport is more than 100,000 pattern cycles from each route
+      // start, but visible marks are found directly rather than by walking
+      // every preceding cycle.
+      expect(pixels.red(55, 40), greaterThan(0));
+      expect(pixels.alpha(65, 40), 0);
+      expect(pixels.blue(50, 60), greaterThan(0));
+      expect(pixels.alpha(60, 60), 0);
     });
   });
 
