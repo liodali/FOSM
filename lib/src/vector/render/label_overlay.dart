@@ -4,12 +4,12 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/painting.dart' show TextPainter, TextSpan, TextStyle;
 
-import '../../api/tile.dart';
-import '../mvt/vector_tile.dart';
-import '../style/expression.dart';
-import '../style/map_style.dart';
-import 'vector_tile_renderer.dart';
-import 'vector_tile_runtime.dart';
+import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/vector/mvt/vector_tile.dart';
+import 'package:fosm/src/vector/style/expression.dart';
+import 'package:fosm/src/vector/style/map_style.dart';
+import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
+import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 
 /// Paints symbol layers (place labels, POI icons, …) on top of the tile
 /// grid for the whole viewport.
@@ -36,8 +36,26 @@ class LabelOverlay {
   static const double _lineLabelSpacing = 250.0;
 
   /// Prepared labels keyed by tile index + zoom (stable across pans).
+  /// Preserved across tile-arrival rebuilds because the overlay is owned
+  /// for the lifetime of the runtime — see [VectorTileRuntime.labelOverlay].
   final LinkedHashMap<String, List<_PreparedLabel>> _prepared =
       LinkedHashMap();
+
+  bool _disposed = false;
+
+  /// Releases all cached text/halo painters and clears prepared labels.
+  /// Called once from [VectorTileRuntime.dispose]; the overlay must not
+  /// be painted after disposal.
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    for (final labels in _prepared.values) {
+      for (final label in labels) {
+        label.dispose();
+      }
+    }
+    _prepared.clear();
+  }
 
   void paint(
     ui.Canvas canvas,
@@ -49,6 +67,7 @@ class LabelOverlay {
     required int topRowTilesLatIndex,
     required List<Tile> tiles,
   }) {
+    if (_disposed) return;
     final sprite = runtime.sprite;
     final collision = _CollisionGrid(cellSize: 72);
     final seenSymbols = <String>{};
