@@ -1,7 +1,9 @@
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
@@ -97,8 +99,7 @@ void main() {
 
       // Center tile should be present.
       final centerKey = TileManager.tileKey(1, 1, 1);
-      final hasCenter =
-          manager.renderTiles.any((t) => t.index == centerKey);
+      final hasCenter = manager.renderTiles.any((t) => t.index == centerKey);
       expect(hasCenter, isTrue);
 
       manager.dispose();
@@ -139,8 +140,8 @@ void main() {
       manager.setCenterTile(
         latLng: LatLng(latitude: 95, longitude: 0),
       );
-      expect(manager.centerLatLng.latitude,
-          closeTo(maxWebMercatorLatitude, 0.01));
+      expect(
+          manager.centerLatLng.latitude, closeTo(maxWebMercatorLatitude, 0.01));
 
       manager.setCenterTile(
         latLng: LatLng(latitude: -95, longitude: 0),
@@ -351,12 +352,10 @@ void main() {
       expect(tilesAtZ5, greaterThan(0));
 
       // Tile keys should be different at different zoom levels.
-      final keysAtZ3 = manager.renderTiles
-          .where((t) => t.index.startsWith('3/'))
-          .length;
-      final keysAtZ5 = manager.renderTiles
-          .where((t) => t.index.startsWith('5/'))
-          .length;
+      final keysAtZ3 =
+          manager.renderTiles.where((t) => t.index.startsWith('3/')).length;
+      final keysAtZ5 =
+          manager.renderTiles.where((t) => t.index.startsWith('5/')).length;
       // After setZoom(5), all tiles should be at z=5.
       expect(keysAtZ3, 0);
       expect(keysAtZ5, tilesAtZ5);
@@ -506,7 +505,8 @@ void main() {
       await tester.pumpAndSettle();
 
       // Should have fetched tiles at z=5 (visible) and z=4, z=6 (adjacent).
-      expect(fetchedZooms.contains(5), isTrue, reason: 'Should fetch visible tiles at z=5');
+      expect(fetchedZooms.contains(5), isTrue,
+          reason: 'Should fetch visible tiles at z=5');
       expect(fetchedZooms.contains(4), isTrue, reason: 'Should preload z=4');
       expect(fetchedZooms.contains(6), isTrue, reason: 'Should preload z=6');
 
@@ -549,6 +549,168 @@ void main() {
       // Some new fetches for tiles not in the pre-loaded set,
       // but fewer than if we had no pre-loading.
       expect(fetchesAfterZoom, greaterThan(fetchesBeforeZoom));
+
+      manager.dispose();
+    });
+  });
+
+  group('byteOnlyPadding (vector-style padding policy)', () {
+    /// A decoder that counts how many times it is invoked and returns a
+    /// 1×1 image. In vector mode the decoder is the expensive
+    /// parse+render+toImage pipeline, so the count is the signal we care
+    /// about.
+    // ignore: no_leading_underscores_for_local_identifiers
+    int _decodeCount = 0;
+    // ignore: no_leading_underscores_for_local_identifiers
+    Future<ui.Image> _countingDecoder(
+        Uint8List bytes, int z, int x, int y) async {
+      _decodeCount++;
+      return Tile.decodeImage(bytes);
+    }
+
+    setUp(() => _decodeCount = 0);
+
+    testWidgets('only visible tiles are decoded; padding is bytes-only',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: _countingDecoder,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+      );
+
+      manager.calculate();
+      // Let the byte-only padding preloads and visible decodes settle.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+
+      // With a 256×256 viewport and 256px tiles there is roughly 1
+      // visible tile (plus partials). The 2-tile padding ring on every
+      // side must NOT go through the decoder.
+      final visibleH = manager.horizontalTileCount - 2 * 2;
+      final visibleV = manager.verticalTileCount - 2 * 2;
+      final maxVisibleDecodes = visibleH * visibleV;
+      expect(_decodeCount, lessThanOrEqualTo(maxVisibleDecodes),
+          reason: 'padding tiles must not be decoded when byteOnlyPadding');
+      expect(_decodeCount, greaterThan(0),
+          reason: 'visible tiles must still be decoded');
+
+      manager.dispose();
+    });
+
+    testWidgets('padding tiles do not notify on completion', (tester) async {
+      var notifications = 0;
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: _countingDecoder,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+      );
+      manager.onTilesChanged = () => notifications++;
+
+      manager.calculate();
+      // Snapshot the notification count after visible tiles settle.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+      final notificationsAfterVisible = notifications;
+
+      // Wait longer so any padding byte preloads finish. They must not
+      // produce additional notifications.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+
+      expect(notifications, notificationsAfterVisible,
+          reason: 'padding byte-only completion must not notify');
+
+      manager.dispose();
+    });
+
+    testWidgets('a prefetched padding tile decodes when it becomes visible',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: _countingDecoder,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+      );
+
+      manager.calculate();
+      // Let padding bytes preload.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+      final decodesBeforePan = _decodeCount;
+
+      // Pan the center by one tile so a previously-padding tile enters
+      // the visible area. Its bytes are already in the byte cache, so it
+      // should decode without a network fetch.
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 0, longitude: 0),
+      );
+      // Shift center by ~one tile east at zoom 3.
+      final oneTileLng = tileX2Lng(1, 3) - tileX2Lng(0, 3);
+      manager.setCenterTile(
+        latLng: LatLng(latitude: 0, longitude: oneTileLng),
+      );
+      manager.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+
+      // The newly-visible tile decodes from the byte cache.
+      expect(_decodeCount, greaterThan(decodesBeforePan),
+          reason: 'a padding tile entering the viewport must decode');
+
+      manager.dispose();
+    });
+
+    testWidgets('raster defaults: byteOnlyPadding=false still decodes padding',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: _countingDecoder,
+        tilePadding: 2,
+        preloadAdjacentZoom: false,
+        // byteOnlyPadding defaults to false — raster behaviour.
+      );
+
+      manager.calculate();
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      });
+      await tester.pump();
+
+      // Raster mode decodes the whole padded grid (padding decodes are
+      // cheap), so the decode count is well above the single visible tile.
+      expect(_decodeCount, greaterThan(1),
+          reason: 'raster mode must decode padding tiles too');
 
       manager.dispose();
     });

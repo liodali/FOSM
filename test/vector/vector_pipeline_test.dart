@@ -44,7 +44,9 @@ LoadedVectorStyle buildLoadedStyle() {
         'type': 'symbol',
         'source': 'openmaptiles',
         'source-layer': 'water',
-        'layout': {'text-field': ['get', 'class']},
+        'layout': {
+          'text-field': ['get', 'class']
+        },
       },
     ],
   }));
@@ -103,7 +105,8 @@ class Pixels {
 
 void main() {
   group('VectorTileRenderer', () {
-    testWidgets('renders background + fill with correct pixels', (tester) async {
+    testWidgets('renders background + fill with correct pixels',
+        (tester) async {
       final loaded = buildLoadedStyle();
       final renderer = VectorTileRenderer(loaded);
       final decoded = decodeVectorTile(buildHalfWaterTile());
@@ -172,6 +175,85 @@ void main() {
       expect(leftPixels.red(128, 128), 0);
       expect(rightPixels.red(128, 128), 255);
       expect(rightPixels.blue(128, 128), 0);
+    });
+  });
+
+  group('LabelOverlay stability and disposal', () {
+    test('createLabelOverlay returns one stable instance', () {
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'label-stability',
+        parseOffThread: false,
+      );
+      // The overlay must be identical across calls so prepared labels and
+      // TextPainters survive tile-arrival rebuilds.
+      expect(runtime.createLabelOverlay(), same(runtime.labelOverlay));
+      expect(runtime.createLabelOverlay(), same(runtime.labelOverlay));
+      runtime.dispose();
+    });
+
+    test('paint after dispose is a no-op (does not throw)', () {
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'label-dispose',
+        parseOffThread: false,
+      );
+      final overlay = runtime.labelOverlay;
+      runtime.dispose();
+
+      // Painting a disposed overlay must not throw and must do nothing.
+      final recorder = ui.PictureRecorder();
+      final canvas = ui.Canvas(recorder);
+      overlay.paint(
+        canvas,
+        const ui.Size(256, 256),
+        zoom: 12,
+        leftColumnTilesCanvasX: 0,
+        topRowTilesCanvasY: 0,
+        leftColumnTilesLngIndex: 0,
+        topRowTilesLatIndex: 0,
+        tiles: const [],
+      );
+      recorder.endRecording().dispose();
+    });
+  });
+
+  group('Over-zoom parse sharing', () {
+    testWidgets('two over-zoom siblings share one parsed source tile',
+        (tester) async {
+      // Source maxzoom is 12; z13 tiles resolve to the same z12 source.
+      final tileBytes = buildHalfWaterTile();
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'overzoom-share',
+        parseOffThread: false,
+      );
+
+      // Decode two z13 siblings that map to the same z12 source tile.
+      final results = await tester.runAsync(() => Future.wait([
+            runtime.decoder(tileBytes, 13, 6, 4),
+            runtime.decoder(tileBytes, 13, 7, 4),
+          ]));
+
+      expect(results, isNotNull);
+      final images = results!;
+      expect(images.length, 2);
+      for (final image in images) {
+        expect(image.width, 256);
+        expect(image.height, 256);
+        image.dispose();
+      }
+
+      // Both siblings resolve to the same z12 source coord → one parsed
+      // tile, shared via the in-flight parse dedup + LRU.
+      final parsedA = runtime.parsedTileFor(13, 6, 4);
+      final parsedB = runtime.parsedTileFor(13, 7, 4);
+      expect(parsedA, isNotNull);
+      expect(parsedB, isNotNull);
+      expect(identical(parsedA, parsedB), isTrue,
+          reason: 'over-zoom siblings must share the parsed source tile');
+
+      runtime.dispose();
     });
   });
 
