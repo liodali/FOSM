@@ -35,9 +35,9 @@ class VectorTileRuntime {
   final LoadedVectorStyle loaded;
   final String namespace;
 
-  /// Whether to parse MVT bytes on a background thread via `compute()`.
-  /// Set to `false` in tests where the Flutter test framework doesn't
-  /// drain isolate messages properly.
+  /// Whether to use the platform's asynchronous parse path: a persistent
+  /// worker on native or cooperative chunking on web. Set to `false` in
+  /// tests that require fully synchronous parsing.
   final bool parseOffThread;
 
   VectorTileRuntime({
@@ -50,7 +50,7 @@ class VectorTileRuntime {
     // `compute()` spawns are avoided. On web [MvtIsolate] is a stub
     // whose spawn() is a no-op and isReady stays false.
     if (parseOffThread) {
-      _mvtIsolate.spawn();
+      _mvtSpawn = _mvtIsolate.spawn();
     }
   }
 
@@ -76,6 +76,17 @@ class VectorTileRuntime {
 
   // ── Persistent MVT decode isolate ───────────────────────────────────
   final MvtIsolate _mvtIsolate = MvtIsolate();
+  Future<void>? _mvtSpawn;
+
+  /// Source layers referenced by this style. Other protobuf layer messages
+  /// can be skipped without decoding their features or geometry.
+  late final Set<String> _sourceLayers = {
+    for (final layer in loaded.style.layers)
+      if (layer.isVisible &&
+          layer.source == vectorSource.name &&
+          layer.sourceLayer != null)
+        layer.sourceLayer!,
+  };
 
   /// In-flight parses keyed by the resolved source [TileCoord]. Over-zoom
   /// siblings (e.g. four z15 tiles reading one z14 source tile) share one
@@ -160,13 +171,14 @@ class VectorTileRuntime {
     }
   }
 
-  Future<ui.Image> _decodeAndRender(Uint8List bytes, int z, int x, int y) async {
+  Future<ui.Image> _decodeAndRender(
+      Uint8List bytes, int z, int x, int y) async {
     if (_disposed) throw StateError('runtime disposed');
     final source = vectorSource;
     try {
       final coord = source.resolve(z, x, y);
-      final parsed = _parsedTileFor(coord) ??
-          await _parseAndStoreDedup(bytes, coord);
+      final parsed =
+          _parsedTileFor(coord) ?? await _parseAndStoreDedup(bytes, coord);
 
       // Yield to the event loop between heavy stages so the UI thread
       // can process input and paint. Critical on web where everything
@@ -208,10 +220,8 @@ class VectorTileRuntime {
       // Yield before the heavy Canvas path-building step.
       if (kIsWeb) await Future<void>.delayed(Duration.zero);
 
-      // Use the async renderer which yields between layer batches.
-      // OpenFreeMap Liberty has ~111 layers (~50-70 visible per zoom);
-      // the async renderer chunks them into batches of 8 with frame
-      // yields on web, so the browser stays responsive.
+      // Use the time-budgeted renderer. It cooperatively yields between
+      // layers, features, and large geometry batches on every platform.
       final picture = await VectorTileRenderer(loaded).renderAsync(
         decoded: parsed.decoded,
         srcZ: parsed.srcZ,
@@ -222,9 +232,10 @@ class VectorTileRuntime {
         rasterCoords: rasterCoords,
       );
       try {
-        // Yield before toImage — on CanvasKit/WASM this is a GPU→CPU
-        // readback that can take 5-15ms per tile.
-        if (kIsWeb) await Future<void>.delayed(Duration.zero);
+        // Enter a new event-loop turn before toImage. On CanvasKit/SkWasm
+        // this snapshot can take 5-15ms; a real timer gives an already
+        // scheduled browser/desktop frame a chance to run first.
+        await Future<void>.delayed(const Duration(milliseconds: 1));
         final image = await picture.toImage(256, 256);
         return image;
       } finally {
@@ -274,16 +285,31 @@ class VectorTileRuntime {
     return future;
   }
 
-  Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord) async {
+  Future<ParsedVectorTile> _parseAndStore(
+      Uint8List bytes, TileCoord coord) async {
     // On native, route through the persistent MVT isolate (one long-lived
     // worker) instead of spawning a fresh `compute()` isolate per tile.
     // On web, or when parseOffThread is false (tests), decode on the
     // current thread.
     final DecodedVectorTile decoded;
+    if (parseOffThread) {
+      try {
+        await _mvtSpawn;
+      } catch (_) {
+        // A worker startup failure falls back to one-shot compute below.
+      }
+    }
     if (parseOffThread && _mvtIsolate.isReady) {
-      decoded = await _mvtIsolate.decode(bytes);
+      decoded = await _mvtIsolate.decode(
+        bytes,
+        sourceLayers: _sourceLayers,
+      );
     } else {
-      decoded = await decodeMvtAsync(bytes, useIsolate: parseOffThread);
+      decoded = await decodeMvtAsync(
+        bytes,
+        useIsolate: parseOffThread,
+        sourceLayers: _sourceLayers,
+      );
     }
     final parsed = ParsedVectorTile(decoded: decoded, srcZ: coord.z);
     if (_disposed) return parsed;
@@ -351,8 +377,7 @@ class VectorTileRuntime {
   }
 
   /// Resolves once the sprite attempt (if any) finished — used by tests.
-  Future<void> get spriteReady =>
-      _spriteLoading ?? Future<void>.value();
+  Future<void> get spriteReady => _spriteLoading ?? Future<void>.value();
 
   /// Returns the stable label overlay owned by this runtime.
   ///

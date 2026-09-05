@@ -140,6 +140,28 @@ void main() {
       expect(pixels.alpha(246, 128), 255);
     });
 
+    testWidgets('time budget yields within a dense style layer',
+        (tester) async {
+      final renderer = VectorTileRenderer(buildLoadedStyle());
+      final decoded = decodeVectorTile(buildHalfWaterTile());
+      var yields = 0;
+
+      final picture = await renderer.renderAsync(
+        decoded: decoded,
+        srcZ: 12,
+        z: 12,
+        x: 3,
+        y: 2,
+        yieldBudget: Duration.zero,
+        yieldControl: () async {
+          yields++;
+        },
+      );
+
+      expect(yields, greaterThan(0));
+      picture.dispose();
+    });
+
     testWidgets('over-zoom renders the parent sub-rect', (tester) async {
       final loaded = buildLoadedStyle();
       final renderer = VectorTileRenderer(loaded);
@@ -279,10 +301,13 @@ void main() {
         preloadAdjacentZoom: false,
       );
 
-      manager.calculate();
-
       await tester.runAsync(() async {
-        await Future<void>.delayed(const Duration(seconds: 2));
+        manager.calculate();
+        final timeout = Stopwatch()..start();
+        while (manager.renderTiles.any((tile) => tile.sourceTile == null) &&
+            timeout.elapsed < const Duration(seconds: 5)) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
       });
       await tester.pump();
 

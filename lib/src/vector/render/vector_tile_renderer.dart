@@ -2,8 +2,6 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
-
 import '../mvt/vector_tile.dart';
 import '../style/css_color.dart';
 import '../style/expression.dart';
@@ -74,21 +72,15 @@ class VectorTileRenderer {
 
   static const double tileSize = 256;
 
-  /// How many layers to paint before yielding to the event loop.
-  /// OpenFreeMap Liberty has ~111 layers; at typical zooms ~50-70 are
-  /// visible. A batch of 8 keeps each chunk under ~2ms on web CanvasKit
-  /// so the browser can paint between chunks.
-  static const int _layersPerBatch = 8;
+  /// Maximum cooperative work interval before yielding to the event loop.
+  static const Duration defaultYieldBudget = Duration(milliseconds: 8);
 
-  /// Renders the tile asynchronously, yielding between layer batches so
-  /// the UI thread stays responsive. [PictureRecorder] and [Canvas] are
-  /// plain Dart objects — they survive across async yields within the
-  /// same isolate without issue.
+  /// Renders the tile asynchronously with a time budget on every platform.
+  /// Checkpoints exist between layers, features, and geometry batches so a
+  /// single dense source layer cannot monopolise the UI isolate.
   ///
-  /// On native, [kIsWeb] is false so no yields occur and this runs
-  /// synchronously (the caller already isolates the decode via
-  /// `compute`). On web, every [_layersPerBatch] layers yields one
-  /// frame so the browser can handle input and paint.
+  /// [yieldBudget] and [yieldControl] are exposed for deterministic tests;
+  /// production callers should use their defaults.
   Future<ui.Picture> renderAsync({
     required DecodedVectorTile decoded,
     required int srcZ,
@@ -97,6 +89,8 @@ class VectorTileRenderer {
     required int y,
     Map<String, ui.Image> rasterTiles = const {},
     Map<String, TileCoord> rasterCoords = const {},
+    Duration yieldBudget = defaultYieldBudget,
+    Future<void> Function()? yieldControl,
   }) async {
     final recorder = ui.PictureRecorder();
     final canvas =
@@ -109,40 +103,82 @@ class VectorTileRenderer {
     // avoids re-checking per batch.
     final visible = <StyleLayer>[
       for (final layer in loaded.style.layers)
-        if (layer.isVisible && z >= layer.minZoom && z <= layer.maxZoom)
-          layer,
+        if (layer.isVisible && z >= layer.minZoom && z <= layer.maxZoom) layer,
     ];
 
-    var painted = 0;
+    final stopwatch = Stopwatch()..start();
+    final yieldNow = yieldControl ?? () => Future<void>.delayed(Duration.zero);
+
+    Future<void>? checkpoint() {
+      if (stopwatch.elapsed < yieldBudget) return null;
+      return yieldNow().whenComplete(stopwatch.reset);
+    }
+
     for (final layer in visible) {
+      Iterable<void> chunks = const <void>[];
       switch (layer.type) {
         case StyleLayerType.background:
           _paintBackground(canvas, layer, ctx);
         case StyleLayerType.raster:
           _paintRaster(canvas, layer, ctx, z, x, y, rasterTiles, rasterCoords);
         case StyleLayerType.fill:
-          _paintFillLike(canvas, layer, decoded, srcZ, z, x, y, ctx,
-              extrusion: false);
+          chunks = _paintFillLikeChunks(
+            canvas,
+            layer,
+            decoded,
+            srcZ,
+            z,
+            x,
+            y,
+            ctx,
+            extrusion: false,
+          );
         case StyleLayerType.line:
-          _paintLines(canvas, layer, decoded, srcZ, z, x, y, ctx);
+          chunks = _paintLineChunks(
+            canvas,
+            layer,
+            decoded,
+            srcZ,
+            z,
+            x,
+            y,
+            ctx,
+          );
         case StyleLayerType.circle:
-          _paintCircles(canvas, layer, decoded, srcZ, z, x, y, ctx);
+          chunks = _paintCircleChunks(
+            canvas,
+            layer,
+            decoded,
+            srcZ,
+            z,
+            x,
+            y,
+            ctx,
+          );
         case StyleLayerType.fillExtrusion:
-          // Rendered flat (no 3D yet) — still gives building footprints.
-          _paintFillLike(canvas, layer, decoded, srcZ, z, x, y, ctx,
-              extrusion: true);
+          chunks = _paintFillLikeChunks(
+            canvas,
+            layer,
+            decoded,
+            srcZ,
+            z,
+            x,
+            y,
+            ctx,
+            extrusion: true,
+          );
         case StyleLayerType.symbol:
           continue; // label overlay
         case StyleLayerType.unknown:
           continue;
       }
 
-      painted++;
-      // Yield every N layers on web so the browser can paint between
-      // chunks. On native this is a no-op branch (kIsWeb is false).
-      if (kIsWeb && painted % _layersPerBatch == 0) {
-        await Future<void>.delayed(Duration.zero);
+      for (final _ in chunks) {
+        final pendingYield = checkpoint();
+        if (pendingYield != null) await pendingYield;
       }
+      final pendingYield = checkpoint();
+      if (pendingYield != null) await pendingYield;
     }
 
     return recorder.endRecording();
@@ -193,10 +229,10 @@ class VectorTileRenderer {
     return recorder.endRecording();
   }
 
-  void _paintBackground(ui.Canvas canvas, StyleLayer layer, EvaluationContext ctx) {
-    final color =
-        evaluateColorExpr(layer.paint['background-color'], ctx) ??
-            const ui.Color(0xFF000000);
+  void _paintBackground(
+      ui.Canvas canvas, StyleLayer layer, EvaluationContext ctx) {
+    final color = evaluateColorExpr(layer.paint['background-color'], ctx) ??
+        const ui.Color(0xFF000000);
     final opacity =
         evaluateNumExpr(layer.paint['background-opacity'], ctx, fallback: 1)
             .clamp(0.0, 1.0);
@@ -284,6 +320,32 @@ class VectorTileRenderer {
     EvaluationContext baseCtx, {
     required bool extrusion,
   }) {
+    for (final _ in _paintFillLikeChunks(
+      canvas,
+      layer,
+      decoded,
+      srcZ,
+      z,
+      x,
+      y,
+      baseCtx,
+      extrusion: extrusion,
+    )) {
+      // Consume all chunks synchronously.
+    }
+  }
+
+  Iterable<void> _paintFillLikeChunks(
+    ui.Canvas canvas,
+    StyleLayer layer,
+    DecodedVectorTile decoded,
+    int srcZ,
+    int z,
+    int x,
+    int y,
+    EvaluationContext baseCtx, {
+    required bool extrusion,
+  }) sync* {
     final data = _sourceData(layer, decoded);
     if (data == null || data.features.isEmpty) return;
 
@@ -302,8 +364,7 @@ class VectorTileRenderer {
     }
 
     final transform = _transformFor(data, srcZ, z, x, y);
-    final bounds =
-        const ui.Rect.fromLTWH(-4, -4, tileSize + 8, tileSize + 8);
+    final bounds = const ui.Rect.fromLTWH(-4, -4, tileSize + 8, tileSize + 8);
 
     final staticColor = colorIsStatic
         ? (evaluateColorExpr(colorExpr, baseCtx) ?? const ui.Color(0xFF000000))
@@ -316,6 +377,7 @@ class VectorTileRenderer {
     final groups = <int, _FillBatch>{};
 
     for (final feature in data.features) {
+      yield null;
       if (feature.geomType != MvtGeomType.polygon) continue;
       final featureCtx = EvaluationContext(
         zoom: baseCtx.zoom,
@@ -338,7 +400,13 @@ class VectorTileRenderer {
 
       final key = (color.toARGB32() << 8) | (opacity * 100).round();
       final batch = groups.putIfAbsent(key, () => _FillBatch(color, opacity));
-      _addParts(batch.path, feature, transform, bounds, close: true);
+      yield* _addPartsChunks(
+        batch.path,
+        feature,
+        transform,
+        bounds,
+        close: true,
+      );
     }
 
     for (final batch in groups.values) {
@@ -361,6 +429,30 @@ class VectorTileRenderer {
     int y,
     EvaluationContext baseCtx,
   ) {
+    for (final _ in _paintLineChunks(
+      canvas,
+      layer,
+      decoded,
+      srcZ,
+      z,
+      x,
+      y,
+      baseCtx,
+    )) {
+      // Consume all chunks synchronously.
+    }
+  }
+
+  Iterable<void> _paintLineChunks(
+    ui.Canvas canvas,
+    StyleLayer layer,
+    DecodedVectorTile decoded,
+    int srcZ,
+    int z,
+    int x,
+    int y,
+    EvaluationContext baseCtx,
+  ) sync* {
     final data = _sourceData(layer, decoded);
     if (data == null || data.features.isEmpty) return;
 
@@ -410,6 +502,7 @@ class VectorTileRenderer {
     }
 
     for (final feature in data.features) {
+      yield null;
       if (feature.geomType != MvtGeomType.lineString) continue;
       final featureCtx = EvaluationContext(
         zoom: baseCtx.zoom,
@@ -428,15 +521,21 @@ class VectorTileRenderer {
             const ui.Color(0xFF000000);
         opacity = evaluateNumExpr(opacityExpr, featureCtx, fallback: 1)
             .clamp(0.0, 1.0);
-        width =
-            evaluateNumExpr(widthExpr, featureCtx, fallback: 1).clamp(0.0, 100.0);
+        width = evaluateNumExpr(widthExpr, featureCtx, fallback: 1)
+            .clamp(0.0, 100.0);
         if (opacity <= 0 || width <= 0) continue;
       }
 
       final key = '${color.toARGB32()}:$opacity:$width';
       final batch =
           groups.putIfAbsent(key, () => _LineBatch(color, opacity, width));
-      _addParts(batch.path, feature, transform, bounds, close: false);
+      yield* _addPartsChunks(
+        batch.path,
+        feature,
+        transform,
+        bounds,
+        close: false,
+      );
     }
 
     for (final batch in groups.values) {
@@ -466,6 +565,30 @@ class VectorTileRenderer {
     int y,
     EvaluationContext baseCtx,
   ) {
+    for (final _ in _paintCircleChunks(
+      canvas,
+      layer,
+      decoded,
+      srcZ,
+      z,
+      x,
+      y,
+      baseCtx,
+    )) {
+      // Consume all chunks synchronously.
+    }
+  }
+
+  Iterable<void> _paintCircleChunks(
+    ui.Canvas canvas,
+    StyleLayer layer,
+    DecodedVectorTile decoded,
+    int srcZ,
+    int z,
+    int x,
+    int y,
+    EvaluationContext baseCtx,
+  ) sync* {
     final data = _sourceData(layer, decoded);
     if (data == null || data.features.isEmpty) return;
 
@@ -512,6 +635,7 @@ class VectorTileRenderer {
     );
 
     for (final feature in data.features) {
+      yield null;
       final featureCtx = EvaluationContext(
         zoom: baseCtx.zoom,
         properties: feature.properties,
@@ -521,12 +645,10 @@ class VectorTileRenderer {
       double opacity = staticOpacity, radius = staticRadius;
       ui.Color color = staticColor;
       if (dataDriven) {
-        opacity = evaluateNumExpr(
-                layer.paint['circle-opacity'], featureCtx,
+        opacity = evaluateNumExpr(layer.paint['circle-opacity'], featureCtx,
                 fallback: staticOpacity)
             .clamp(0.0, 1.0);
-        radius = evaluateNumExpr(
-                layer.paint['circle-radius'], featureCtx,
+        radius = evaluateNumExpr(layer.paint['circle-radius'], featureCtx,
                 fallback: staticRadius)
             .clamp(0.0, 512.0);
         color = evaluateColorExpr(layer.paint['circle-color'], featureCtx) ??
@@ -534,6 +656,7 @@ class VectorTileRenderer {
         if (opacity <= 0 || radius <= 0) continue;
       }
 
+      var pointCount = 0;
       for (final part in feature.geometry) {
         if (part.length < 2) continue;
         final center = ui.Offset(
@@ -547,6 +670,8 @@ class VectorTileRenderer {
           dataDriven ? (ui.Paint()..color = _alpha(color, opacity)) : fill,
         );
         if (stroke != null) canvas.drawCircle(center, radius, stroke);
+        pointCount++;
+        if (pointCount % 256 == 0) yield null;
       }
     }
   }
@@ -556,13 +681,14 @@ class VectorTileRenderer {
   /// Adds a feature's geometry to [path], skipping parts whose bounds fall
   /// entirely outside [bounds] (cheap pixel-space pre-test — the raster
   /// would clip them anyway, but they cost path verbs and draw dispatch).
-  void _addParts(
+  Iterable<void> _addPartsChunks(
     ui.Path path,
     DecodedFeature feature,
     TileTransform transform,
     ui.Rect bounds, {
     required bool close,
-  }) {
+  }) sync* {
+    var verbs = 0;
     for (final part in feature.geometry) {
       if (part.length < 4) {
         if (!close && part.length >= 2) {
@@ -585,6 +711,8 @@ class VectorTileRenderer {
         } else {
           path.lineTo(px, py);
         }
+        verbs++;
+        if (verbs % 512 == 0) yield null;
       }
       if (close) path.close();
     }
@@ -647,15 +775,13 @@ class VectorTileRenderer {
   static ui.Color _alpha(ui.Color color, double opacity) =>
       color.withValues(alpha: color.a * opacity.clamp(0.0, 1.0));
 
-  static ui.StrokeCap _strokeCap(dynamic value) =>
-      switch (value) {
+  static ui.StrokeCap _strokeCap(dynamic value) => switch (value) {
         'round' => ui.StrokeCap.round,
         'square' => ui.StrokeCap.square,
         _ => ui.StrokeCap.butt,
       };
 
-  static ui.StrokeJoin _strokeJoin(dynamic value) =>
-      switch (value) {
+  static ui.StrokeJoin _strokeJoin(dynamic value) => switch (value) {
         'round' => ui.StrokeJoin.round,
         'bevel' => ui.StrokeJoin.bevel,
         _ => ui.StrokeJoin.miter,
@@ -691,7 +817,8 @@ class _StaticPaintCache {
 
   _StaticPaintCache(StyleLayer layer, this.baseCtx);
 
-  dynamic raw(EvaluationContext featureCtx, Map<String, dynamic> props, String key) {
+  dynamic raw(
+      EvaluationContext featureCtx, Map<String, dynamic> props, String key) {
     final expr = props[key];
     if (expr == null) return null;
     if (dependsOnProperties(expr)) {
