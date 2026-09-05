@@ -106,8 +106,65 @@ void main() {
       expect(tile.layers, isEmpty);
     });
 
-    test('real-world smoke: decoded tile from bytes is self-consistent',
-        () {
+    test('skips source layers that are not referenced by the style', () {
+      final builder = MvtBuilder()
+        ..addLayer(name: 'boundary', features: const [])
+        ..addLayer(name: 'water', features: const [])
+        ..addLayer(name: 'place', features: const []);
+
+      final tile = decodeVectorTile(
+        builder.build(),
+        sourceLayers: const {'water', 'place'},
+      );
+
+      expect(tile.layers.map((layer) => layer.name), ['water', 'place']);
+      expect(tile.layerByName('boundary'), isNull);
+      expect(tile.layerByName('water'), same(tile.layers.first));
+    });
+
+    test('async decoder yields between layers and matches sync output',
+        () async {
+      final builder = MvtBuilder()
+        ..addLayer(name: 'boundary', features: const [])
+        ..addLayer(
+          name: 'water',
+          features: [
+            TestFeature(
+              id: 7,
+              type: TestGeomType.polygon,
+              geometryCommands: polygonRingCommands(
+                const [(0, 0), (10, 0), (10, 10), (0, 10)],
+              ),
+            ),
+          ],
+        )
+        ..addLayer(name: 'place', features: const []);
+      final bytes = builder.build();
+      var yields = 0;
+
+      final asyncTile = await decodeVectorTileAsync(
+        bytes,
+        sourceLayers: const {'water', 'place'},
+        yieldBudget: Duration.zero,
+        yieldControl: () async => yields++,
+      );
+      final syncTile = decodeVectorTile(
+        bytes,
+        sourceLayers: const {'water', 'place'},
+      );
+
+      expect(yields, greaterThan(0));
+      expect(
+        asyncTile.layers.map((layer) => layer.name),
+        syncTile.layers.map((layer) => layer.name),
+      );
+      expect(
+        asyncTile.layerByName('water')!.features.single.geometry.single,
+        syncTile.layerByName('water')!.features.single.geometry.single,
+      );
+    });
+
+    test('real-world smoke: decoded tile from bytes is self-consistent', () {
       // A tile with several layers — ensure unknown layers skip cleanly.
       final builder = MvtBuilder()
         ..addLayer(name: 'boundary', features: const [])

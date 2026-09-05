@@ -7,16 +7,27 @@ import '../vector/mvt/vector_tile.dart';
 /// - **Native** (iOS/Android/macOS/Linux): `compute()` spawns a real
 ///   isolate on a background thread — protobuf parsing never touches
 ///   the main thread.
-/// - **Web**: `compute()` runs on the same thread (Dart isolates aren't
-///   supported on web), but the caller already yields between decode
-///   stages in [VectorTileRuntime], so the UI stays responsive.
+/// - **Web**: decoding runs on the main thread, restricted to style-used
+///   layers and cooperatively yielding between layer messages.
 ///
 /// When [useIsolate] is false, parsing runs synchronously on the
 /// current thread. Used in tests where the Flutter test framework
 /// doesn't drain isolate messages properly.
-Future<DecodedVectorTile> decodeMvtAsync(Uint8List bytes, {bool useIsolate = true}) async {
-  if (!useIsolate) return decodeVectorTile(bytes);
-  return compute(decodeVectorTile, bytes);
+Future<DecodedVectorTile> decodeMvtAsync(
+  Uint8List bytes, {
+  bool useIsolate = true,
+  Set<String>? sourceLayers,
+}) async {
+  if (!useIsolate) {
+    return decodeVectorTile(bytes, sourceLayers: sourceLayers);
+  }
+  if (kIsWeb) {
+    return decodeVectorTileAsync(bytes, sourceLayers: sourceLayers);
+  }
+  return compute(
+    decodeMvtRequest,
+    MvtDecodeRequest(bytes, sourceLayers),
+  );
 }
 
 /// Whether MVT decoding runs on a separate OS thread.

@@ -14,17 +14,15 @@ enum MvtGeomType { unknown, point, lineString, polygon }
 /// a deep copy of boxed doubles.
 class DecodedVectorTile {
   final List<DecodedLayer> layers;
+  final Map<String, DecodedLayer> _layersByName;
 
-  DecodedVectorTile(this.layers);
+  DecodedVectorTile(this.layers)
+      : _layersByName = {
+          for (final layer in layers) layer.name: layer,
+        };
 
-  /// Finds a layer by its MVT `source-layer` name (the key style layers
-  /// match on). Layers are few (< 20 typically), so a scan is fine.
-  DecodedLayer? layerByName(String name) {
-    for (final layer in layers) {
-      if (layer.name == name) return layer;
-    }
-    return null;
-  }
+  /// Finds a layer by its MVT `source-layer` name in constant time.
+  DecodedLayer? layerByName(String name) => _layersByName[name];
 }
 
 /// One MVT layer: a named feature table (e.g. `water`, `transportation`).
@@ -63,9 +61,27 @@ class DecodedFeature {
   });
 }
 
-/// Decodes raw MVT (protobuf) bytes. Top-level so it can be passed to
-/// `compute(decodeVectorTile, bytes)`.
-DecodedVectorTile decodeVectorTile(Uint8List bytes) {
+/// A sendable request used by `compute()` and the persistent native worker.
+class MvtDecodeRequest {
+  final Uint8List bytes;
+  final Set<String>? sourceLayers;
+
+  const MvtDecodeRequest(this.bytes, this.sourceLayers);
+}
+
+/// Decodes a [MvtDecodeRequest]. Top-level so it can be passed to `compute()`.
+DecodedVectorTile decodeMvtRequest(MvtDecodeRequest request) =>
+    decodeVectorTile(request.bytes, sourceLayers: request.sourceLayers);
+
+/// Decodes raw MVT (protobuf) bytes.
+///
+/// When [sourceLayers] is provided, layer messages not referenced by the
+/// active style are skipped before their feature tables and geometry are
+/// decoded. The layer name itself is read from a zero-copy view first.
+DecodedVectorTile decodeVectorTile(
+  Uint8List bytes, {
+  Set<String>? sourceLayers,
+}) {
   final reader = ProtobufReader(bytes);
   final layers = <DecodedLayer>[];
 
@@ -75,12 +91,83 @@ DecodedVectorTile decodeVectorTile(Uint8List bytes) {
     final wireType = tag & 0x7;
 
     if (fieldNumber == 3 && wireType == 2) {
-      layers.add(_decodeLayer(reader.readSubMessage()));
+      final layerBytes = reader.readBytes();
+      if (_shouldDecodeLayer(layerBytes, sourceLayers)) {
+        layers.add(_decodeLayer(ProtobufReader(layerBytes)));
+      }
     } else {
       reader.skipField(wireType);
     }
   }
   return DecodedVectorTile(layers);
+}
+
+/// Web-friendly decoder that cooperatively yields between MVT layers.
+///
+/// This does not create a browser worker, but it prevents a tile containing
+/// many layers from monopolising the browser event loop. Native callers use
+/// [decodeVectorTile] in the persistent isolate instead.
+Future<DecodedVectorTile> decodeVectorTileAsync(
+  Uint8List bytes, {
+  Set<String>? sourceLayers,
+  Duration yieldBudget = const Duration(milliseconds: 4),
+  Future<void> Function()? yieldControl,
+}) async {
+  final reader = ProtobufReader(bytes);
+  final layers = <DecodedLayer>[];
+  final budget = _DecodeBudget(
+    yieldBudget,
+    yieldControl ?? () => Future<void>.delayed(Duration.zero),
+  );
+
+  while (reader.hasMore) {
+    final tag = reader.readVarint();
+    final fieldNumber = tag >> 3;
+    final wireType = tag & 0x7;
+
+    if (fieldNumber == 3 && wireType == 2) {
+      final layerBytes = reader.readBytes();
+      if (_shouldDecodeLayer(layerBytes, sourceLayers)) {
+        layers.add(await _decodeLayerAsync(
+          ProtobufReader(layerBytes),
+          budget,
+        ));
+      }
+      final pendingYield = budget.checkpoint();
+      if (pendingYield != null && reader.hasMore) await pendingYield;
+    } else {
+      reader.skipField(wireType);
+    }
+  }
+  return DecodedVectorTile(layers);
+}
+
+class _DecodeBudget {
+  final Duration interval;
+  final Future<void> Function() yieldControl;
+  final Stopwatch _stopwatch = Stopwatch()..start();
+
+  _DecodeBudget(this.interval, this.yieldControl);
+
+  Future<void>? checkpoint() {
+    if (_stopwatch.elapsed < interval) return null;
+    return yieldControl().whenComplete(_stopwatch.reset);
+  }
+}
+
+bool _shouldDecodeLayer(Uint8List bytes, Set<String>? sourceLayers) {
+  if (sourceLayers == null) return true;
+  final reader = ProtobufReader(bytes);
+  while (reader.hasMore) {
+    final tag = reader.readVarint();
+    final fieldNumber = tag >> 3;
+    final wireType = tag & 0x7;
+    if (fieldNumber == 1 && wireType == 2) {
+      return sourceLayers.contains(utf8.decode(reader.readBytes()));
+    }
+    reader.skipField(wireType);
+  }
+  return false;
 }
 
 DecodedLayer _decodeLayer(ProtobufReader reader) {
@@ -131,6 +218,68 @@ DecodedLayer _decodeLayer(ProtobufReader reader) {
       properties: properties,
       geometry: _decodeGeometry(raw.geometry, raw.geomType),
     ));
+  }
+
+  return DecodedLayer(name: name, extent: extent, features: decoded);
+}
+
+Future<DecodedLayer> _decodeLayerAsync(
+  ProtobufReader reader,
+  _DecodeBudget budget,
+) async {
+  var name = '';
+  var extent = 4096;
+  final features = <_RawFeature>[];
+  final keys = <String>[];
+  final values = <Object?>[];
+
+  while (reader.hasMore) {
+    final tag = reader.readVarint();
+    final fieldNumber = tag >> 3;
+    final wireType = tag & 0x7;
+
+    switch (fieldNumber) {
+      case 15:
+        reader.readVarint();
+      case 1:
+        if (wireType == 2) name = utf8.decode(reader.readBytes());
+      case 2:
+        if (wireType == 2) {
+          features.add(_decodeFeature(reader.readSubMessage()));
+        }
+      case 3:
+        if (wireType == 2) keys.add(utf8.decode(reader.readBytes()));
+      case 4:
+        if (wireType == 2) values.add(_decodeValue(reader.readSubMessage()));
+      case 5:
+        extent = reader.readVarint();
+      default:
+        reader.skipField(wireType);
+    }
+
+    final pendingYield = budget.checkpoint();
+    if (pendingYield != null && reader.hasMore) await pendingYield;
+  }
+
+  final decoded = <DecodedFeature>[];
+  for (final raw in features) {
+    final properties = <String, Object?>{};
+    for (var i = 0; i + 1 < raw.tags.length; i += 2) {
+      final keyIndex = raw.tags[i];
+      final valueIndex = raw.tags[i + 1];
+      if (keyIndex < keys.length && valueIndex < values.length) {
+        properties[keys[keyIndex]] = values[valueIndex];
+      }
+    }
+    decoded.add(DecodedFeature(
+      id: raw.id,
+      geomType: raw.geomType,
+      properties: properties,
+      geometry: _decodeGeometry(raw.geometry, raw.geomType),
+    ));
+
+    final pendingYield = budget.checkpoint();
+    if (pendingYield != null) await pendingYield;
   }
 
   return DecodedLayer(name: name, extent: extent, features: decoded);

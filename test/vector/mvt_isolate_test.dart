@@ -4,11 +4,20 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/isolate/mvt_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/mvt_isolate_native.dart';
+import 'package:fosm/src/isolate/mvt_worker.dart';
 import 'package:fosm/src/vector/mvt/vector_tile.dart';
 
 import 'mvt_builder.dart';
 
 void main() {
+  test('platform decoder filters unused source layers', () async {
+    final decoded = await decodeMvtAsync(
+      buildTestTile(),
+      sourceLayers: const {'not-water'},
+    );
+    expect(decoded.layers, isEmpty);
+  }, timeout: const Timeout(Duration(seconds: 20)));
+
   // The persistent MVT isolate only exists on native (dart:io). On web
   // MvtIsolate is a stub whose isReady is always false, so these tests
   // would not exercise the worker.
@@ -39,6 +48,19 @@ void main() {
 
       worker.dispose();
       expect(worker.isReady, isFalse);
+    }, timeout: isolateTimeout);
+
+    test('filters unused source layers in the worker', () async {
+      final worker = MvtIsolate();
+      await worker.spawn();
+
+      final decoded = await worker.decode(
+        buildTestTile(),
+        sourceLayers: const {'not-water'},
+      );
+      expect(decoded.layers, isEmpty);
+
+      worker.dispose();
     }, timeout: isolateTimeout);
 
     test('multiple sequential requests reuse one isolate', () async {

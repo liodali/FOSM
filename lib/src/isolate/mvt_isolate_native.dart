@@ -15,7 +15,8 @@ import 'package:fosm/src/vector/mvt/vector_tile.dart';
 /// (lists, maps, ints, strings) so it is deep-copied across the isolate
 /// boundary, exactly as `compute()` already does.
 ///
-/// Protocol (main → isolate): `[SendPort replyPort, Uint8List bytes]`
+/// Protocol (main → isolate):
+/// `[SendPort replyPort, Uint8List bytes, Set<String>? sourceLayers]`
 /// Protocol (isolate → main): `DecodedVectorTile` on success, `String`
 /// on error.
 ///
@@ -57,12 +58,15 @@ class MvtIsolate {
   /// Decodes [bytes] on the background isolate and returns the parsed
   /// tile. Each call uses a one-shot [ReceivePort] for its reply,
   /// matching the [HttpIsolate] pattern.
-  Future<DecodedVectorTile> decode(Uint8List bytes) {
+  Future<DecodedVectorTile> decode(
+    Uint8List bytes, {
+    Set<String>? sourceLayers,
+  }) {
     if (!_ready) {
       throw StateError('MvtIsolate not ready — call spawn() first');
     }
     final responsePort = ReceivePort();
-    _sendPort!.send([responsePort.sendPort, bytes]);
+    _sendPort!.send([responsePort.sendPort, bytes, sourceLayers]);
     return responsePort.first.then((response) {
       responsePort.close();
       if (response is DecodedVectorTile) return response;
@@ -91,9 +95,12 @@ class MvtIsolate {
       final parts = message as List;
       final replyPort = parts[0] as SendPort;
       final bytes = parts[1] as Uint8List;
+      final sourceLayers = parts[2] as Set<String>?;
 
       try {
-        replyPort.send(decodeVectorTile(bytes));
+        replyPort.send(
+          decodeVectorTile(bytes, sourceLayers: sourceLayers),
+        );
       } catch (e) {
         replyPort.send(e.toString());
       }
