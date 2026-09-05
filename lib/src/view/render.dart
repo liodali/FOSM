@@ -1,8 +1,10 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
-import '../api/tile.dart';
-import '../common/utils.dart';
-import '../vector/render/label_overlay.dart';
+import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/vector/render/label_overlay.dart';
 
 /// Paints the OSM tile grid onto a [CustomPaint] canvas.
 ///
@@ -43,14 +45,45 @@ class RenderCanvasOSM extends CustomPainter {
   static final Paint _checkerLightPaint = Paint()..color = _checkerLight;
   static final Paint _checkerDarkPaint = Paint()..color = _checkerDark;
 
+  /// Pre-recorded checkerboard pictures, one per tile parity. The parity
+  /// is `(lngIndex + latIndex) % 2`, which determines the colour of the
+  /// top-left cell, so adjacent tiles keep the global checker continuity.
+  ///
+  /// Recording once and replaying with a single `drawPicture` per missing
+  /// tile replaces the old ~512 `drawRect` calls per tile (one base rect
+  /// plus one rect per dark cell). For an empty 80-tile grid that cuts
+  /// the display list from ~41 000 rect draws to 80 picture replays.
+  static ui.Picture? _checkerEven; // dark top-left
+  static ui.Picture? _checkerOdd; // light top-left
+
+  static ui.Picture _checkerPicture(bool darkTopLeft) {
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    const cell = 8.0;
+    final cellsX = tileWidth ~/ cell;
+    final cellsY = tileHeight ~/ cell;
+    // Light base fills the whole tile.
+    canvas.drawRect(
+      ui.Rect.fromLTWH(0, 0, tileWidth.toDouble(), tileHeight.toDouble()),
+      _checkerLightPaint,
+    );
+    for (var cx = 0; cx < cellsX; cx++) {
+      for (var cy = 0; cy < cellsY; cy++) {
+        final isDark = ((cx + cy) % 2 == 0) == darkTopLeft;
+        if (!isDark) continue;
+        canvas.drawRect(
+          ui.Rect.fromLTWH(cx * cell, cy * cell, cell, cell),
+          _checkerDarkPaint,
+        );
+      }
+    }
+    return recorder.endRecording();
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
     // Background fill so any sub-pixel gaps between tiles aren't black.
     canvas.drawRect(Offset.zero & size, _checkerLightPaint);
-
-    const cell = 8.0;
-    final cellsPerTileX = tileWidth ~/ cell;
-    final cellsPerTileY = tileHeight ~/ cell;
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileCanvasX = leftColumnTilesCanvasX + hIndex * tileWidth;
@@ -62,64 +95,26 @@ class RenderCanvasOSM extends CustomPainter {
 
         // tiles is row-major: h outer, v inner → index = h * verticalTileCount + v
         final listIndex = hIndex * verticalTileCount + vIndex;
-        final tile =
-            (listIndex < tiles.length) ? tiles[listIndex] : null;
+        final tile = (listIndex < tiles.length) ? tiles[listIndex] : null;
         final image = tile?.sourceTile;
 
         if (image != null) {
-          canvas.drawImage(image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
+          canvas.drawImage(
+              image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
         } else {
-          // Checkerboard placeholder — alternating colors give a "loading"
-          // feel identical to the JS reference implementation.
-          _drawCheckerboard(
-            canvas,
-            tileCanvasX,
-            tileCanvasY,
-            tileLngIndex,
-            tileLatIndex,
-            cellsPerTileX,
-            cellsPerTileY,
-            cell,
-          );
+          // Reusable checkerboard placeholder — a single picture replay
+          // per missing tile instead of hundreds of rect draws. The
+          // picture is recorded at (0,0), so translate to the tile origin.
+          final darkTopLeft = (tileLngIndex + tileLatIndex) % 2 == 0;
+          final picture = darkTopLeft
+              ? (_checkerEven ??= _checkerPicture(true))
+              : (_checkerOdd ??= _checkerPicture(false));
+          canvas
+            ..save()
+            ..translate(tileCanvasX, tileCanvasY)
+            ..drawPicture(picture)
+            ..restore();
         }
-      }
-    }
-  }
-
-  void _drawCheckerboard(
-    Canvas canvas,
-    double originX,
-    double originY,
-    int lngIndex,
-    int latIndex,
-    int cellsX,
-    int cellsY,
-    double cell,
-  ) {
-    // Fill the whole tile with the light color first (halves draw calls).
-    canvas.drawRect(
-      Rect.fromLTWH(originX, originY, tileWidth.toDouble(), tileHeight.toDouble()),
-      _checkerLightPaint,
-    );
-
-    // Global cell coordinates so the pattern is stable across the world
-    // (doesn't "swim" relative to tiles during panning).
-    final baseColX = lngIndex * cellsX;
-    final baseColY = latIndex * cellsY;
-
-    for (var cx = 0; cx < cellsX; cx++) {
-      for (var cy = 0; cy < cellsY; cy++) {
-        final isDark = ((baseColX + cx) + (baseColY + cy)) % 2 == 0;
-        if (!isDark) continue;
-        canvas.drawRect(
-          Rect.fromLTWH(
-            originX + cx * cell,
-            originY + cy * cell,
-            cell,
-            cell,
-          ),
-          _checkerDarkPaint,
-        );
       }
     }
   }
