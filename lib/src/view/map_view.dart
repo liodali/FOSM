@@ -217,9 +217,35 @@ enum ZoomAnimationStyle {
 /// decoding a routing response is the application's responsibility. Routes
 /// render above the tile grid and below markers and vector labels, stay
 /// aligned on every pan/zoom, and update when the parent rebuilds with a
-/// new (or empty) list. Known limitation: a segment crossing the
-/// international date line (e.g. longitude 179 → -179) is drawn as a long
-/// straight line rather than wrapping around the world.
+/// new (or empty) list.
+///
+/// Each [MapPolyline] can be styled with a solid, dashed, or dotted
+/// pattern, an optional outer border/casing, and configurable caps and
+/// joins:
+///
+/// ```dart
+/// MapPolyline(
+///   points: routePoints,
+///   color: const Color(0xFF3F51B5),
+///   strokeWidth: 6,
+///   borderColor: Colors.white,
+///   borderWidth: 2,
+/// )
+///
+/// MapPolyline(
+///   points: alternativeRoute,
+///   color: Colors.orange,
+///   strokeWidth: 5,
+///   pattern: const MapPolylinePattern.dashed(dashLength: 14, gapLength: 8),
+///   strokeCap: StrokeCap.round,
+///   strokeJoin: StrokeJoin.round,
+/// )
+/// ```
+///
+/// Pattern dimensions, stroke widths, and border widths are in logical
+/// pixels and do not scale with map zoom. Known limitation: a segment
+/// crossing the international date line (e.g. longitude 179 → -179) is
+/// drawn as a long straight line rather than wrapping around the world.
 ///
 /// ### Programmatic control
 /// Pass a [MapController] to [controller] to drive the camera and
