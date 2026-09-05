@@ -6,15 +6,15 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 
-import '../common/cache_tile_mixin.dart';
-import '../common/osm_transformation_utilities.dart';
-import '../common/utils.dart';
-import 'geo_point.dart';
-import '../isolate/http_isolate.dart'
-    if (dart.library.io) '../isolate/http_isolate_native.dart'
-    if (dart.library.js_interop) '../isolate/http_isolate.dart';
-import 'tile.dart';
-import 'tile_source.dart';
+import 'package:fosm/src/common/cache_tile_mixin.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/isolate/http_isolate.dart'
+    if (dart.library.io) 'package:fosm/src/isolate/http_isolate_native.dart'
+    if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart';
+import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/api/tile_source.dart';
 
 // ─── Tile manager ────────────────────────────────────────────────────────────
 
@@ -86,6 +86,21 @@ class TileManager with CacheTiles {
   final int tilePadding;
   final bool preloadAdjacentZoom;
 
+  /// When `true`, the off-screen padding ring is fetched as compressed
+  /// bytes only and is **not** decoded until it enters the viewport.
+  ///
+  /// Vector mode sets this: a vector tile decode runs MVT parsing, ~74
+  /// style-layer passes, path construction, and `Picture.toImage`, so
+  /// decoding all 80 padded tiles at mode switch dominates the frame
+  /// budget. Raster mode leaves it `false` because a raster decode is
+  /// cheap and the padded images make panning instant.
+  ///
+  /// Visible tiles are always decoded immediately regardless of this
+  /// flag. When a prefetched padding tile scrolls into view, the next
+  /// `calculate()` finds its bytes in the byte cache and decodes on
+  /// demand.
+  final bool byteOnlyPadding;
+
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
@@ -125,6 +140,7 @@ class TileManager with CacheTiles {
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
+    this.byteOnlyPadding = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
   })  : _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
@@ -271,6 +287,13 @@ class TileManager with CacheTiles {
     verticalTileCount =
         ((height + -topRowTilesCanvasY) / tileHeight).ceil();
 
+    // Capture the visible (un-padded) bounds so we can classify each grid
+    // cell as visible or padding below. Visible cells are decoded
+    // immediately; padding cells are either decoded (raster) or fetched
+    // as bytes only (vector, see [byteOnlyPadding]).
+    final visibleHCount = horizontalTileCount;
+    final visibleVCount = verticalTileCount;
+
     // Expand by [tilePadding] on each side.
     final paddedHCount = horizontalTileCount + 2 * tilePadding;
     final paddedVCount = verticalTileCount + 2 * tilePadding;
@@ -295,11 +318,20 @@ class TileManager with CacheTiles {
     // the map before the edges — critical for vector mode where each
     // decode is expensive.
     final pending = <({String key, int lng, int lat, double dist})>[];
+    // Padding cells scheduled for byte-only preload (vector mode). Kept
+    // separate so they never go through the decoder until they become
+    // visible.
+    final bytePreload = <({String key, int lng, int lat, double dist})>[];
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
+      final isPaddingH = hIndex < tilePadding ||
+          hIndex >= tilePadding + visibleHCount;
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileLatIndex = topRowTilesLatIndex + vIndex;
+        final isPaddingV = vIndex < tilePadding ||
+            vIndex >= tilePadding + visibleVCount;
+        final isPadding = isPaddingH || isPaddingV;
         final key = _key(zoom, tileLngIndex, tileLatIndex);
 
         // Synchronous memory-cache hit → no flicker.
@@ -314,19 +346,41 @@ class TileManager with CacheTiles {
         // Squared distance from center (no sqrt needed for ordering).
         final dx = tileLngIndex - centerTileLng;
         final dy = tileLatIndex - centerTileLat;
-        pending.add((
-          key: key,
-          lng: tileLngIndex,
-          lat: tileLatIndex,
-          dist: dx * dx + dy * dy,
-        ));
+        final dist = dx * dx + dy * dy;
+
+        if (isPadding && byteOnlyPadding) {
+          // Off-screen padding ring in vector mode: fetch bytes only,
+          // do not decode. Decoded later when the tile scrolls into view.
+          bytePreload.add((
+            key: key,
+            lng: tileLngIndex,
+            lat: tileLatIndex,
+            dist: dist,
+          ));
+        } else {
+          pending.add((
+            key: key,
+            lng: tileLngIndex,
+            lat: tileLatIndex,
+            dist: dist,
+          ));
+        }
       }
     }
 
-    // Schedule loads center-first.
+    // Schedule visible loads center-first.
     pending.sort((a, b) => a.dist.compareTo(b.dist));
     for (final p in pending) {
       _scheduleLoad(p.key, zoom, p.lng, p.lat);
+    }
+
+    // Schedule byte-only padding preloads center-first, after visible
+    // work has been queued so they never compete with visible decodes.
+    if (bytePreload.isNotEmpty) {
+      bytePreload.sort((a, b) => a.dist.compareTo(b.dist));
+      for (final p in bytePreload) {
+        _scheduleByteOnlyPreload(p.key, zoom, p.lng, p.lat);
+      }
     }
 
     _trimMemoryCache();
@@ -561,6 +615,60 @@ class TileManager with CacheTiles {
         }
       }
     }
+  }
+
+  /// Fetches compressed bytes for an off-screen padding tile without
+  /// decoding, used in vector mode ([byteOnlyPadding]). The bytes land
+  /// in [_byteCache] so the next [calculate] that brings this tile into
+  /// the visible area decodes it instantly via [_decodeFromByteCache].
+  ///
+  /// Unlike [_preloadTile], this never decodes and never notifies
+  /// [onTilesChanged] — a padding tile completing must not trigger a
+  /// repaint. It shares the [_activePreloads]/[maxConcurrentPreloads]
+  /// gate with adjacent-zoom preloads so the total background fetch
+  /// concurrency stays bounded and never competes with visible fetches.
+  void _scheduleByteOnlyPreload(String key, int z, int x, int y) {
+    final n = 1 << z;
+    if (y < 0 || y >= n) return;
+    if (_inFlight.contains(key)) return;
+    if (_byteCache.containsKey(key) || _memoryCache.containsKey(key)) return;
+    if (_activePreloads >= maxConcurrentPreloads) return;
+
+    final failedUntil = _failedUntil[key];
+    if (failedUntil != null && DateTime.now().isBefore(failedUntil)) return;
+
+    _inFlight.add(key);
+    _activePreloads++;
+
+    () async {
+      Uint8List? bytes;
+      try {
+        if (hasStoredTile(key)) {
+          final cached = cachedTileBytes(key);
+          if (cached != null) bytes = cached;
+        }
+        bytes ??= (_httpIsolate.isReady && _urlBuilder != null)
+            ? await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y))
+            : await _fetcher(z, x, y);
+      } catch (_) {
+        _inFlight.remove(key);
+        _activePreloads--;
+        _failedUntil[key] = DateTime.now().add(failureBackoff);
+        return;
+      }
+      if (_disposed) {
+        _inFlight.remove(key);
+        _activePreloads--;
+        return;
+      }
+      _storeInByteCache(key, bytes);
+      unawaited(storeTile(key, Tile(null, key, y, x), bytes));
+      _inFlight.remove(key);
+      _activePreloads--;
+      // Deliberately no decode and no onTilesChanged notification: an
+      // off-screen padding tile appearing in the byte cache is not a
+      // visible change. The next calculate() will decode on demand.
+    }();
   }
 
   /// Pre-loads a single tile.
