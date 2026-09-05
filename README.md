@@ -284,10 +284,49 @@ polylines: [
 ],
 ```
 
-Routes render above the tile grid (and the zoom-transition overlay) and
-below markers and vector labels, and stay geographically aligned through
-pan, pinch zoom, zoom controls, and `MapController` movements. Route
-painting never consumes gestures.
+Routes support solid, dashed, and dotted patterns, optional outer
+borders/casing, and configurable caps, joins, and miter limits:
+
+```dart
+// Solid route with a white border.
+MapPolyline(
+  points: routePoints,
+  color: const Color(0xFF3F51B5),
+  strokeWidth: 6,
+  borderColor: Colors.white,
+  borderWidth: 2,
+)
+
+// Dashed alternative route.
+MapPolyline(
+  points: alternativeRoute,
+  color: Colors.orange,
+  strokeWidth: 5,
+  pattern: const MapPolylinePattern.dashed(
+    dashLength: 14,
+    gapLength: 8,
+  ),
+  strokeCap: StrokeCap.round,
+  strokeJoin: StrokeJoin.round,
+)
+
+// Dotted walking route.
+MapPolyline(
+  points: walkingRoute,
+  color: Colors.deepPurple,
+  strokeWidth: 6, // dot diameter
+  borderColor: Colors.white,
+  borderWidth: 1,
+  pattern: const MapPolylinePattern.dotted(spacing: 12),
+)
+```
+
+Pattern dimensions, stroke widths, and border widths are in logical pixels
+and do not scale with map zoom. Dash-and-gap cycles and dot spacing must be
+at least one logical pixel. Routes render above the tile grid (and the
+zoom-transition overlay) and below markers and vector labels, and stay
+geographically aligned through pan, pinch zoom, zoom controls, and
+`MapController` movements. Route painting never consumes gestures.
 
 **Known limitation:** a segment crossing the international date line
 (longitude `179` → `-179`) is drawn as a long straight line across the map
