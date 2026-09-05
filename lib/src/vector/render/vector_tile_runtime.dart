@@ -4,16 +4,18 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 
-import '../../api/tile.dart' show Tile;
-import '../../api/tile_source.dart'
+import 'package:fosm/src/api/tile.dart' show Tile;
+import 'package:fosm/src/api/tile_source.dart'
     show TileDecoder, TileFetcher, downloadTileBytes;
-import '../../isolate/mvt_worker.dart';
-import '../mvt/vector_tile.dart';
-import '../style/map_style.dart' show StyleLayerType;
-import '../style/style_loader.dart';
-import 'label_overlay.dart';
-import 'sprite_atlas.dart';
-import 'vector_tile_renderer.dart';
+import 'package:fosm/src/isolate/mvt_isolate.dart'
+    if (dart.library.io) 'package:fosm/src/isolate/mvt_isolate_native.dart';
+import 'package:fosm/src/isolate/mvt_worker.dart';
+import 'package:fosm/src/vector/mvt/vector_tile.dart';
+import 'package:fosm/src/vector/style/map_style.dart' show StyleLayerType;
+import 'package:fosm/src/vector/style/style_loader.dart';
+import 'package:fosm/src/vector/render/label_overlay.dart';
+import 'package:fosm/src/vector/render/sprite_atlas.dart';
+import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
 
 /// A parsed source tile, shared by every logical tile that over-zooms from
 /// it (e.g. four z15 tiles reading one z14 source tile parse it once).
@@ -44,6 +46,12 @@ class VectorTileRuntime {
     this.parseOffThread = true,
   }) {
     _loadSprite();
+    // Spawn the persistent MVT decode isolate on native so per-tile
+    // `compute()` spawns are avoided. On web [MvtIsolate] is a stub
+    // whose spawn() is a no-op and isReady stays false.
+    if (parseOffThread) {
+      _mvtIsolate.spawn();
+    }
   }
 
   ResolvedTileSource get vectorSource {
@@ -66,8 +74,29 @@ class VectorTileRuntime {
   /// In-flight byte fetches by URL — over-zoom siblings share one download.
   final Map<String, Future<Uint8List>> _inFlightUrls = {};
 
+  // ── Persistent MVT decode isolate ───────────────────────────────────
+  final MvtIsolate _mvtIsolate = MvtIsolate();
+
+  /// In-flight parses keyed by the resolved source [TileCoord]. Over-zoom
+  /// siblings (e.g. four z15 tiles reading one z14 source tile) share one
+  /// parse future instead of starting duplicate decodes before the first
+  /// result lands in the parsed-tile LRU.
+  final Map<TileCoord, Future<ParsedVectorTile>> _inFlightParses = {};
+
   SpriteAtlas? sprite;
   Future<void>? _spriteLoading;
+
+  /// The single label overlay for this runtime, created lazily and kept
+  /// for the lifetime of the loaded style. Returning a fresh overlay on
+  /// every rebuild (the old behaviour) discarded all prepared-label and
+  /// `TextPainter` caches on each tile arrival, making label preparation
+  /// grow ~quadratically during progressive loading.
+  LabelOverlay? _labelOverlay;
+
+  /// The stable label overlay owned by this runtime. Created once and
+  /// preserved across tile-arrival rebuilds so cached `TextPainter`s
+  /// survive. Disposed in [dispose].
+  LabelOverlay get labelOverlay => _labelOverlay ??= LabelOverlay(this);
 
   bool _disposed = false;
 
@@ -136,7 +165,8 @@ class VectorTileRuntime {
     final source = vectorSource;
     try {
       final coord = source.resolve(z, x, y);
-      final parsed = _parsedTileFor(coord) ?? await _parseAndStore(bytes, coord);
+      final parsed = _parsedTileFor(coord) ??
+          await _parseAndStoreDedup(bytes, coord);
 
       // Yield to the event loop between heavy stages so the UI thread
       // can process input and paint. Critical on web where everything
@@ -226,11 +256,35 @@ class VectorTileRuntime {
     return null;
   }
 
+  /// Deduplicates in-flight parses by resolved source [TileCoord]. When
+  /// over-zoom siblings request the same source tile before the first
+  /// parse completes, they all share one future (and one decode) instead
+  /// of each spawning their own.
+  Future<ParsedVectorTile> _parseAndStoreDedup(
+      Uint8List bytes, TileCoord coord) {
+    final existing = _inFlightParses[coord];
+    if (existing != null) return existing;
+    final future = _parseAndStore(bytes, coord);
+    _inFlightParses[coord] = future;
+    // Remove the in-flight entry once it settles so later cache misses
+    // (after an LRU eviction) can parse again.
+    future.whenComplete(() {
+      _inFlightParses.remove(coord);
+    });
+    return future;
+  }
+
   Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord) async {
-    // decodeMvtAsync uses compute() on native (real isolate) and falls
-    // back to synchronous parsing on web. Set parseOffThread=false in
-    // tests to avoid isolate message draining issues.
-    final decoded = await decodeMvtAsync(bytes, useIsolate: parseOffThread);
+    // On native, route through the persistent MVT isolate (one long-lived
+    // worker) instead of spawning a fresh `compute()` isolate per tile.
+    // On web, or when parseOffThread is false (tests), decode on the
+    // current thread.
+    final DecodedVectorTile decoded;
+    if (parseOffThread && _mvtIsolate.isReady) {
+      decoded = await _mvtIsolate.decode(bytes);
+    } else {
+      decoded = await decodeMvtAsync(bytes, useIsolate: parseOffThread);
+    }
     final parsed = ParsedVectorTile(decoded: decoded, srcZ: coord.z);
     if (_disposed) return parsed;
 
@@ -300,11 +354,21 @@ class VectorTileRuntime {
   Future<void> get spriteReady =>
       _spriteLoading ?? Future<void>.value();
 
-  LabelOverlay createLabelOverlay() => LabelOverlay(this);
+  /// Returns the stable label overlay owned by this runtime.
+  ///
+  /// Kept for backwards compatibility with callers that expect a factory
+  /// method; new code should prefer the [labelOverlay] getter. Either way
+  /// the same instance is returned for the lifetime of the runtime, so
+  /// prepared labels and `TextPainter`s survive tile-arrival rebuilds.
+  LabelOverlay createLabelOverlay() => labelOverlay;
 
   void dispose() {
     _disposed = true;
+    _labelOverlay?.dispose();
+    _labelOverlay = null;
     _inFlightUrls.clear();
+    _inFlightParses.clear();
+    _mvtIsolate.dispose();
     _parsedTiles.clear();
     for (final image in _rasterTiles.values) {
       image.dispose();

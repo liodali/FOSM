@@ -552,6 +552,11 @@ class _MapViewState extends State<MapView>
       decoder: runtime?.decoder,
       urlBuilder: runtime?.urlBuilder,
       cacheNamespace: runtime?.namespace ?? '',
+      // Vector decodes are expensive (MVT parse + style passes + toImage),
+      // so the off-screen padding ring is fetched as bytes only and decoded
+      // on demand when it scrolls into view. Raster decodes are cheap and
+      // keep decoding the padding ring for instant panning.
+      byteOnlyPadding: runtime != null,
     );
     manager.onTilesChanged = _notify;
     _tileManager = manager;
@@ -1110,7 +1115,7 @@ class _MapViewState extends State<MapView>
                         tiles: manager.renderTiles,
                         revision: manager.revision,
                         zoom: manager.zoom,
-                        overlay: runtime.createLabelOverlay(),
+                        overlay: runtime.labelOverlay,
                       ),
                     ),
                   ),
