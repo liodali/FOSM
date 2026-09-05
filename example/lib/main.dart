@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:fosm/fosm.dart';
+import 'package:routing_client_dart/routing_client_dart.dart' as routing;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -22,6 +23,8 @@ class MyApp extends StatelessWidget {
 
 enum _MapMode { raster, vector }
 
+enum _RouteStyle { solid, dashed, dotted }
+
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key});
 
@@ -37,15 +40,14 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
     longitude: 8.4737324,
   );
 
-  /// Static demo route around Zurich, rendered on both raster and vector
-  /// maps. FOSM only draws the points — a real app would fetch/decode a
-  /// routing response itself.
-  static const List<LatLng> _zurichRoute = [
-    LatLng(latitude: 47.3769, longitude: 8.5417),
-    LatLng(latitude: 47.3788, longitude: 8.5470),
-    LatLng(latitude: 47.3811, longitude: 8.5524),
-    LatLng(latitude: 47.3845, longitude: 8.5555),
-  ];
+  /// Demo destination — Zurich Hauptbahnhof. The origin is the current map
+  /// center when the route button is pressed.
+  static const LatLng _destination =
+      LatLng(latitude: 47.3769, longitude: 8.5417);
+
+  /// Fetches and decodes the route geometry between the current map center
+  /// and [_destination] via OSRM ([routing.RoutingManager]).
+  final routing.RoutingManager _routingManager = routing.RoutingManager();
 
   /// Programmatic control surface for the map.
   final MapController _mapController = MapController();
@@ -53,10 +55,22 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   // Tile source selection
   _MapMode _mode = _MapMode.raster;
 
+  /// Decoded route points ([LatLng]) drawn as a [MapPolyline].
+  List<LatLng>? _routePoints;
+  Marker? _routeStartMarker;
+  Marker? _routeEndMarker;
+
+  /// Human-readable route summary (distance/duration) or error message.
+  String? _routeInfo;
+  bool _routeLoading = false;
+
   /// Style URL currently applied to the map (vector mode).
   late String _activeStyleUrl = defaultStyleUrl;
   final TextEditingController _styleUrlController =
       TextEditingController(text: defaultStyleUrl);
+
+  /// Currently selected route style for the demo route.
+  _RouteStyle _routeStyle = _RouteStyle.solid;
 
   // Camera state — kept in sync via [MapView.onCameraChanged] so switching
   // tile sources rebuilds the map at the same place.
@@ -117,34 +131,89 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
           ),
         ),
       )
-      ..addAll(_buildClusterMarkers())
-      ..add(
-        Marker(
-          point: _zurichRoute.first,
-          alignment: Alignment.bottomCenter,
-          overlayBuilder: (context) =>
-              _infoCard('Route start', _zurichRoute.first, Colors.indigo),
-          child: const Icon(
-            Icons.trip_origin,
-            size: 18,
-            color: Colors.indigo,
-          ),
-        ),
-      )
-      ..add(
-        Marker(
-          point: _zurichRoute.last,
-          alignment: Alignment.bottomCenter,
-          overlayBuilder: (context) =>
-              _infoCard('Route end', _zurichRoute.last, Colors.indigo),
-          child: const Icon(
-            Icons.location_on,
-            size: 28,
-            color: Colors.indigo,
-          ),
-        ),
-      );
+      ..addAll(_buildClusterMarkers());
     _markers.addListener(_onMarkersChanged);
+  }
+
+  /// Requests an OSRM route from the current map center to [_destination],
+  /// decodes the encoded polyline, and renders it as a [MapPolyline] with
+  /// start/end markers.
+  Future<void> _fetchRoute() async {
+    if (_routeLoading) return;
+    setState(() {
+      _routeLoading = true;
+      _routeInfo = null;
+    });
+    try {
+      final waypoints = [
+        routing.LngLat(lng: _center.longitude, lat: _center.latitude),
+        routing.LngLat(lng: _destination.longitude, lat: _destination.latitude),
+      ];
+      final road = await _routingManager.getRoute(
+        request: routing.OSRMRequest.route(waypoints: waypoints, steps: false),
+      );
+      // OSRM's default polyline geometry is precision-5 encoded; decode it
+      // into the points FOSM draws.
+      final decoded = road.polylineEncoded?.decodeGeometry(precision: 5) ??
+          road.polyline ??
+          const <routing.LngLat>[];
+      if (decoded.length < 2) {
+        throw Exception('Empty route returned');
+      }
+      if (!mounted) return;
+      setState(() {
+        _routePoints = decoded
+            .map((p) => LatLng(latitude: p.lat, longitude: p.lng))
+            .toList();
+        // [Road.distance] is already in km; duration is in seconds.
+        _routeInfo = '${road.distance.toStringAsFixed(1)} km · '
+            '${(road.duration / 60).round()} min';
+        _routeLoading = false;
+      });
+      _showRouteMarkers();
+      // Frame the route: center on its midpoint at street zoom.
+      final mid = _routePoints![_routePoints!.length ~/ 2];
+      _mapController.moveTo(mid, animate: true);
+      _mapController.setZoom(13, animate: true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _routeLoading = false;
+        _routeInfo = 'Route failed: $e';
+      });
+    }
+  }
+
+  /// Swaps the route start/end markers for the latest fetched route.
+  void _showRouteMarkers() {
+    final points = _routePoints!;
+    if (_routeStartMarker != null) {
+      _markers.remove(_routeStartMarker!);
+    }
+    if (_routeEndMarker != null) {
+      _markers.remove(_routeEndMarker!);
+    }
+    final startMarker = Marker(
+      point: points.first,
+      alignment: Alignment.bottomCenter,
+      child: const Icon(
+        Icons.trip_origin,
+        size: 18,
+        color: Colors.indigo,
+      ),
+    );
+    final endMarker = Marker(
+      point: points.last,
+      alignment: Alignment.bottomCenter,
+      child: const Icon(
+        Icons.location_on,
+        size: 28,
+        color: Colors.indigo,
+      ),
+    );
+    _routeStartMarker = startMarker;
+    _routeEndMarker = endMarker;
+    _markers.addAll([startMarker, endMarker]);
   }
 
   /// Sample points around Zurich that cluster when zoomed out.
@@ -371,12 +440,25 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                   });
                 },
                 markers: _markers,
-                polylines: const [
-                  MapPolyline(
-                    points: _zurichRoute,
-                    color: Color(0xFF283593),
-                    strokeWidth: 6,
-                  ),
+                polylines: [
+                  if (_routePoints != null)
+                    MapPolyline(
+                      points: _routePoints!,
+                      color: const Color(0xFF283593),
+                      strokeWidth: 6,
+                      borderColor: Colors.white,
+                      borderWidth: _routeStyle == _RouteStyle.solid ? 2 : 1.5,
+                      pattern: switch (_routeStyle) {
+                        _RouteStyle.solid => const MapPolylinePattern.solid(),
+                        _RouteStyle.dashed => const MapPolylinePattern.dashed(
+                            dashLength: 14,
+                            gapLength: 8,
+                          ),
+                        _RouteStyle.dotted => const MapPolylinePattern.dotted(
+                            spacing: 12,
+                          ),
+                      },
+                    ),
                 ],
                 markerClusterOptions: _clusteringEnabled
                     ? const MarkerClusterOptions(
@@ -416,6 +498,84 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                   color: Colors.black87,
                 ),
               ),
+            ),
+          ),
+
+          // ── Route status banner (below the zoom indicator)
+          if (_routeLoading || _routeInfo != null)
+            Positioned(
+              top: 64,
+              left: 16,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.9),
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.1),
+                      blurRadius: 4,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_routeLoading)
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else
+                      Icon(
+                        _routePoints != null
+                            ? Icons.route
+                            : Icons.error_outline,
+                        size: 16,
+                        color:
+                            _routePoints != null ? Colors.indigo : Colors.red,
+                      ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _routeLoading ? 'Fetching route…' : _routeInfo ?? '',
+                      style: const TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.black87,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // ── Route button (fetches OSRM route from center → destination)
+          Positioned(
+            right: 16,
+            bottom: 284,
+            child: _ToolButton(
+              icon: Icons.route,
+              tooltip: 'Draw route to Zurich HB',
+              onPressed: _routeLoading ? () {} : _fetchRoute,
+            ),
+          ),
+
+          // ── Route style button (cycles solid / dashed / dotted)
+          Positioned(
+            right: 16,
+            bottom: 338,
+            child: _ToolButton(
+              icon: Icons.format_line_spacing,
+              tooltip: 'Route style: $_routeStyle',
+              onPressed: () {
+                setState(() {
+                  _routeStyle = _RouteStyle
+                      .values[(_routeStyle.index + 1) % _RouteStyle.values.length];
+                });
+              },
             ),
           ),
 
