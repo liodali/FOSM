@@ -80,6 +80,10 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   bool _animateZoom = true;
   ZoomAnimationStyle _zoomStyle = ZoomAnimationStyle.scale;
 
+  /// Demo hard camera constraint — toggled by the bounds button. `null`
+  /// means free panning.
+  LatLngBounds? _cameraBounds;
+
   // ── Markers ─────────────────────────────────────────────────────────
   // Owned by the page so markers survive raster/vector mode switches.
   // Built in initState — the overlay builders close over `this`.
@@ -171,10 +175,12 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
         _routeLoading = false;
       });
       _showRouteMarkers();
-      // Frame the route: center on its midpoint at street zoom.
-      final mid = _routePoints![_routePoints!.length ~/ 2];
-      _mapController.moveTo(mid, animate: true);
-      _mapController.setZoom(13, animate: true);
+      // Frame the whole route, with a margin around it.
+      _mapController.fitBounds(
+        LatLngBounds.fromPoints(_routePoints!),
+        padding: const EdgeInsets.all(48),
+        animate: true,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -427,6 +433,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 zoom: _zoom,
                 minZoom: 1,
                 maxZoom: 19,
+                cameraBounds: _cameraBounds,
                 vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
                 showZoomControls: true,
                 animateZoom: _animateZoom,
@@ -563,6 +570,36 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
             ),
           ),
 
+          // ── Camera bounds toggle (on/off panning constraint)
+          Positioned(
+            right: 16,
+            bottom: 392,
+            child: _ToolButton(
+              icon: _cameraBounds == null
+                  ? Icons.crop_free
+                  : Icons.center_focus_strong,
+              tooltip: _cameraBounds == null
+                  ? 'Camera bounds: off'
+                  : 'Camera bounds: on',
+              onPressed: () {
+                setState(() {
+                  _cameraBounds = _cameraBounds == null
+                      ? LatLngBounds(
+                          southwest: LatLng(
+                            latitude: initialCenter.latitude - 0.2,
+                            longitude: initialCenter.longitude - 0.2,
+                          ),
+                          northeast: LatLng(
+                            latitude: initialCenter.latitude + 0.2,
+                            longitude: initialCenter.longitude + 0.2,
+                          ),
+                        )
+                      : null;
+                });
+              },
+            ),
+          ),
+
           // ── Route style button (cycles solid / dashed / dotted)
           Positioned(
             right: 16,
@@ -572,8 +609,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
               tooltip: 'Route style: $_routeStyle',
               onPressed: () {
                 setState(() {
-                  _routeStyle = _RouteStyle
-                      .values[(_routeStyle.index + 1) % _RouteStyle.values.length];
+                  _routeStyle = _RouteStyle.values[
+                      (_routeStyle.index + 1) % _RouteStyle.values.length];
                 });
               },
             ),
