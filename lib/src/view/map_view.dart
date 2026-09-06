@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/map_controller.dart';
 import 'package:fosm/src/api/map_notification.dart';
 import 'package:fosm/src/api/map_polyline.dart';
@@ -285,6 +286,13 @@ class MapView extends StatefulWidget {
   final int zoom;
   final int minZoom;
   final int maxZoom;
+
+  /// Optional hard bounding box the camera can never leave — pans,
+  /// pinches, and programmatic moves are all clamped inside it. When the
+  /// box is smaller than the viewport, the camera pins to its center.
+  /// `null` (default) disables the constraint.
+  final LatLngBounds? cameraBounds;
+
   final TileFetcher? tileFetcher;
 
   /// Controller for programmatic camera and marker control.
@@ -332,6 +340,7 @@ class MapView extends StatefulWidget {
     required this.zoom,
     this.minZoom = 1,
     this.maxZoom = 19,
+    this.cameraBounds,
     this.tileFetcher,
     this.controller,
     this.markers,
@@ -421,6 +430,11 @@ class _MapViewState extends State<MapView>
   void moveTo(LatLng latLng, {bool animate = true}) =>
       _moveTo(latLng, animate: animate);
 
+  @override
+  void fitBounds(LatLngBounds bounds,
+          {EdgeInsets padding = EdgeInsets.zero, bool animate = true}) =>
+      _fitBounds(bounds, padding: padding, animate: animate);
+
   // ── Scale gesture state ─────────────────────────────────────────────
   // Anchors captured at gesture start and re-baselined after every zoom
   // step — tile coordinates only make sense in the zoom they were
@@ -497,6 +511,10 @@ class _MapViewState extends State<MapView>
       }
       return;
     }
+    if (widget.cameraBounds != oldWidget.cameraBounds) {
+      _tileManager?.setCameraBounds(widget.cameraBounds);
+      setState(() {});
+    }
     if (widget.latLng != oldWidget.latLng) {
       _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
@@ -557,6 +575,7 @@ class _MapViewState extends State<MapView>
       // on demand when it scrolls into view. Raster decodes are cheap and
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
+      cameraBounds: widget.cameraBounds,
     );
     manager.onTilesChanged = _notify;
     _tileManager = manager;
@@ -691,6 +710,75 @@ class _MapViewState extends State<MapView>
     _panController?.stop();
     _panController?.dispose();
     _panController = null;
+  }
+
+  /// Frames [bounds] in the viewport, leaving [padding] around it, then
+  /// restores free camera movement (unlike [cameraBounds], nothing stays
+  /// constrained afterwards). Zoom is integer-only: the computed zoom is
+  /// floored and clamped to [MapView.minZoom]/[MapView.maxZoom], so the
+  /// box is always fully visible.
+  void _fitBounds(
+    LatLngBounds bounds, {
+    EdgeInsets padding = EdgeInsets.zero,
+    bool? animate,
+  }) {
+    final manager = _tileManager;
+    if (manager == null) return;
+
+    final animateFit = animate ?? widget.animateZoom;
+    final availW = manager.width - padding.left - padding.right;
+    final availH = manager.height - padding.top - padding.bottom;
+    if (availW <= 0 || availH <= 0) return;
+
+    // Spans in zoom-0 tile units (tile size 256 px).
+    final spanX = lon2TileX(bounds.east, 0) - lon2TileX(bounds.west, 0);
+    final spanY = lat2TileY(bounds.south, 0) - lat2TileY(bounds.north, 0);
+
+    // Scale factors for each nonzero span; a zero span (single point on
+    // one axis) contributes no constraint.
+    final scales = <double>[];
+    if (spanX > 0) scales.add(availW / (spanX * tileWidth));
+    if (spanY > 0) scales.add(availH / (spanY * tileHeight));
+
+    int targetZoom;
+    if (scales.isEmpty) {
+      // Degenerate box (single point) → frame it as close as allowed.
+      targetZoom = widget.maxZoom;
+    } else {
+      final scale = scales.reduce(math.min);
+      targetZoom = math.max(0, math.log(scale) / math.ln2).floor();
+      targetZoom = targetZoom.clamp(widget.minZoom, widget.maxZoom);
+    }
+
+    // Projected bounds center, shifted for asymmetric padding.
+    final projectedCenterX =
+        (lon2TileX(bounds.west, targetZoom) +
+            lon2TileX(bounds.east, targetZoom)) /
+        2;
+    final projectedCenterY =
+        (lat2TileY(bounds.north, targetZoom) +
+            lat2TileY(bounds.south, targetZoom)) /
+        2;
+    final centerTileX = projectedCenterX -
+        (padding.left - padding.right) / (2 * tileWidth);
+    final centerTileY = projectedCenterY -
+        (padding.top - padding.bottom) / (2 * tileHeight);
+    final targetCenter = LatLng(
+      latitude: tileY2Lat(centerTileY, targetZoom),
+      longitude: tileX2Lng(centerTileX, targetZoom),
+    );
+
+    // Zoom first: the manager zoom switches immediately even in the
+    // animated two-phase path, so the pan tween below runs at the target
+    // zoom. Then pan to the (padding-shifted) center.
+    if (targetZoom != manager.zoom) {
+      if (animateFit) {
+        _startZoomAnimation(manager, targetZoom, null);
+      } else {
+        _applyZoomInstantly(manager, targetZoom, null);
+      }
+    }
+    _moveTo(targetCenter, animate: animateFit);
   }
 
   // ── Zoom animation (two-phase) ─────────────────────────────────────

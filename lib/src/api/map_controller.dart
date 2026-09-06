@@ -1,6 +1,8 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart' show EdgeInsets;
 
 import 'geo_point.dart';
+import 'lat_lng_bounds.dart';
 import 'marker.dart';
 import 'marker_manager.dart';
 
@@ -27,6 +29,10 @@ abstract class MapControllerDelegate {
 
   /// Moves the camera to [latLng], optionally animating the pan.
   void moveTo(LatLng latLng, {bool animate});
+
+  /// Navigates the camera so [bounds] fits the viewport (minus
+  /// [padding]), without constraining the camera afterwards.
+  void fitBounds(LatLngBounds bounds, {EdgeInsets padding, bool animate});
 
   /// The marker manager attached to the map, if any.
   MarkerManager? get markerManager;
@@ -112,8 +118,7 @@ class MapController extends ChangeNotifier {
       _delegate?.setZoom(zoom, animate: animate);
 
   /// Zooms in by one level.
-  void zoomIn({bool animate = true}) =>
-      _delegate?.zoomBy(1, animate: animate);
+  void zoomIn({bool animate = true}) => _delegate?.zoomBy(1, animate: animate);
 
   /// Zooms out by one level.
   void zoomOut({bool animate = true}) =>
@@ -125,4 +130,19 @@ class MapController extends ChangeNotifier {
   /// `false`, the camera jumps instantly.
   void moveTo(LatLng latLng, {bool animate = true}) =>
       _delegate?.moveTo(latLng, animate: animate);
+
+  /// Frames [bounds] in the viewport (minus [padding]).
+  ///
+  /// Unlike [MapView.cameraBounds], this only navigates the camera —
+  /// afterwards the user can pan away freely. The resulting zoom is an
+  /// integer clamped to the map's min/max zoom, so the box is fully
+  /// visible subject to the configured minZoom: if the bounds cannot fit
+  /// at minZoom, the view centers on them but their edges may be clipped.
+  /// A no-op when the controller is detached.
+  void fitBounds(
+    LatLngBounds bounds, {
+    EdgeInsets padding = EdgeInsets.zero,
+    bool animate = true,
+  }) =>
+      _delegate?.fitBounds(bounds, padding: padding, animate: animate);
 }
