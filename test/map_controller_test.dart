@@ -4,24 +4,79 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/map_controller.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
 
 const _center = LatLng(latitude: 0, longitude: 0);
 const _testZoom = 3;
 
 final Uint8List _tinyPng = Uint8List.fromList([
-  0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-  0x00, 0x00, 0x00, 0x0D,
-  0x49, 0x48, 0x44, 0x52,
-  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-  0x08, 0x06, 0x00, 0x00, 0x00,
-  0x1F, 0x15, 0xC4, 0x89,
-  0x00, 0x00, 0x00, 0x0A,
-  0x49, 0x44, 0x41, 0x54,
-  0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01,
-  0x0D, 0x0A, 0x2D, 0xB4,
-  0x00, 0x00, 0x00, 0x00,
-  0x49, 0x45, 0x4E, 0x44,
-  0xAE, 0x42, 0x60, 0x82,
+  0x89,
+  0x50,
+  0x4E,
+  0x47,
+  0x0D,
+  0x0A,
+  0x1A,
+  0x0A,
+  0x00,
+  0x00,
+  0x00,
+  0x0D,
+  0x49,
+  0x48,
+  0x44,
+  0x52,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x08,
+  0x06,
+  0x00,
+  0x00,
+  0x00,
+  0x1F,
+  0x15,
+  0xC4,
+  0x89,
+  0x00,
+  0x00,
+  0x00,
+  0x0A,
+  0x49,
+  0x44,
+  0x41,
+  0x54,
+  0x78,
+  0x9C,
+  0x63,
+  0x00,
+  0x01,
+  0x00,
+  0x00,
+  0x05,
+  0x00,
+  0x01,
+  0x0D,
+  0x0A,
+  0x2D,
+  0xB4,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+  0x49,
+  0x45,
+  0x4E,
+  0x44,
+  0xAE,
+  0x42,
+  0x60,
+  0x82,
 ]);
 
 Future<Uint8List> _stubFetcher(int z, int x, int y) async => _tinyPng;
@@ -30,6 +85,8 @@ Future<void> _pumpMap(
   WidgetTester tester, {
   MapController? controller,
   MarkerManager? markers,
+  int minZoom = 1,
+  int maxZoom = 19,
 }) {
   return tester.pumpWidget(
     MaterialApp(
@@ -38,6 +95,8 @@ Future<void> _pumpMap(
           controller: controller,
           latLng: _center,
           zoom: _testZoom,
+          minZoom: minZoom,
+          maxZoom: maxZoom,
           tileFetcher: _stubFetcher,
           markers: markers,
           animateZoom: false,
@@ -52,6 +111,9 @@ class _FakeDelegate implements MapControllerDelegate {
   LatLng _centerValue = _center;
   int _zoomValue = _testZoom;
   MarkerManager? _markerManager;
+  LatLngBounds? _fitBoundsValue;
+  EdgeInsets? _fitPadding;
+  bool? _fitAnimate;
 
   @override
   LatLng get center => _centerValue;
@@ -66,6 +128,19 @@ class _FakeDelegate implements MapControllerDelegate {
   void moveTo(LatLng latLng, {bool animate = true}) {
     _calls.add('moveTo $animate');
     _centerValue = latLng;
+  }
+
+  @override
+  void fitBounds(
+    LatLngBounds bounds, {
+    EdgeInsets padding = EdgeInsets.zero,
+    bool animate = true,
+  }) {
+    _calls.add('fitBounds $animate');
+    _fitBoundsValue = bounds;
+    _fitPadding = padding;
+    _fitAnimate = animate;
+    _centerValue = bounds.center;
   }
 
   @override
@@ -149,6 +224,18 @@ void main() {
         'moveTo false',
       ]);
       expect(controller.center, target);
+
+      final bounds = LatLngBounds(
+        southwest: const LatLng(latitude: 1, longitude: 2),
+        northeast: const LatLng(latitude: 3, longitude: 4),
+      );
+      const padding = EdgeInsets.fromLTRB(10, 20, 30, 40);
+      controller.fitBounds(bounds, padding: padding, animate: false);
+      expect(delegate._calls.last, 'fitBounds false');
+      expect(delegate._fitBoundsValue, bounds);
+      expect(delegate._fitPadding, padding);
+      expect(delegate._fitAnimate, isFalse);
+      expect(controller.center, bounds.center);
     });
 
     test('camera methods are no-ops when detached', () {
@@ -157,6 +244,12 @@ void main() {
       controller.zoomOut();
       controller.setZoom(5);
       controller.moveTo(const LatLng(latitude: 1, longitude: 1));
+      controller.fitBounds(
+        LatLngBounds(
+          southwest: const LatLng(latitude: 1, longitude: 2),
+          northeast: const LatLng(latitude: 3, longitude: 4),
+        ),
+      );
       expect(controller.isAttached, isFalse);
     });
   });
@@ -258,6 +351,130 @@ void main() {
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
       expect(find.byKey(const Key('marker')), findsNothing);
+    });
+  });
+
+  group('MapController.fitBounds (widget)', () {
+    final box = LatLngBounds(
+      southwest: const LatLng(latitude: -5, longitude: -8),
+      northeast: const LatLng(latitude: 5, longitude: 8),
+    );
+
+    testWidgets('instant fit frames the box at the expected integer zoom',
+        (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      controller.fitBounds(box, animate: false);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // 800×600 surface, box spans 16° lng / 10° lat:
+      // scale = min(800, 600) / span → floor(log2) = 6.
+      expect(controller.zoom, 6);
+      expect(controller.center!.latitude, closeTo(0, 0.01));
+      expect(controller.center!.longitude, closeTo(0, 0.01));
+    });
+
+    testWidgets('asymmetric padding shifts the fitted center', (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      controller.fitBounds(
+        box,
+        padding: const EdgeInsets.only(left: 100),
+        animate: false,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // Extra left padding narrows the usable width → zoom drops to 5,
+      // and the camera shifts west so the box centers in the padded area.
+      expect(controller.zoom, 5);
+      expect(controller.center!.longitude, closeTo(-2.1973, 0.01));
+      expect(controller.center!.latitude, closeTo(0, 0.01));
+    });
+
+    testWidgets('centers latitude bounds in projected space', (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      final highLatitudeBox = LatLngBounds(
+        southwest: LatLng(latitude: 0, longitude: -1),
+        northeast: LatLng(latitude: 80, longitude: 1),
+      );
+      controller.fitBounds(
+        highLatitudeBox,
+        padding: const EdgeInsets.only(top: 150),
+        animate: false,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      final zoom = controller.zoom!;
+      final centerY = lat2TileY(controller.center!.latitude, zoom);
+      final northScreenY =
+          (lat2TileY(highLatitudeBox.north, zoom) - centerY) * tileHeight +
+              300;
+      final southScreenY =
+          (lat2TileY(highLatitudeBox.south, zoom) - centerY) * tileHeight +
+              300;
+      expect(zoom, 2);
+      expect(northScreenY, greaterThanOrEqualTo(150));
+      expect(southScreenY, lessThanOrEqualTo(600));
+      expect(northScreenY - 150, closeTo(600 - southScreenY, 0.01));
+    });
+
+    testWidgets('clamps to minZoom for huge boxes', (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      final world = LatLngBounds(
+        southwest: const LatLng(latitude: -80, longitude: -180),
+        northeast: const LatLng(latitude: 80, longitude: 180),
+      );
+      controller.fitBounds(world, animate: false);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      expect(controller.zoom, 1); // MapView's default minZoom
+      expect(controller.center!.latitude, closeTo(0, 0.01));
+      expect(controller.center!.longitude, closeTo(0, 0.01));
+    });
+
+    testWidgets('clamps computed zoom to maxZoom for a nonzero box',
+        (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller, maxZoom: 4);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      controller.fitBounds(
+        LatLngBounds(
+          southwest: LatLng(latitude: -0.001, longitude: -0.001),
+          northeast: LatLng(latitude: 0.001, longitude: 0.001),
+        ),
+        animate: false,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      expect(controller.zoom, 4);
+    });
+
+    testWidgets('degenerate single-point box fits at maxZoom', (tester) async {
+      final controller = MapController();
+      await _pumpMap(tester, controller: controller);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      const point = LatLng(latitude: 10, longitude: 20);
+      controller.fitBounds(
+        LatLngBounds(southwest: point, northeast: point),
+        animate: false,
+      );
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      expect(controller.zoom, 19); // MapView's default maxZoom
+      expect(controller.center!.latitude, closeTo(10, 0.01));
+      expect(controller.center!.longitude, closeTo(20, 0.01));
     });
   });
 
@@ -474,7 +691,8 @@ class _HookTestPageState extends State<_HookTestPage>
               Marker(
                 point: _center,
                 onTap: () {},
-                child: const SizedBox(width: 40, height: 40, key: Key('marker')),
+                child:
+                    const SizedBox(width: 40, height: 40, key: Key('marker')),
               ),
             ),
           animateZoom: false,
