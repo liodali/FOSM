@@ -38,8 +38,7 @@ class LabelOverlay {
   /// Prepared labels keyed by tile index + zoom (stable across pans).
   /// Preserved across tile-arrival rebuilds because the overlay is owned
   /// for the lifetime of the runtime — see [VectorTileRuntime.labelOverlay].
-  final LinkedHashMap<String, List<_PreparedLabel>> _prepared =
-      LinkedHashMap();
+  final LinkedHashMap<String, List<_PreparedLabel>> _prepared = LinkedHashMap();
 
   bool _disposed = false;
 
@@ -83,13 +82,15 @@ class LabelOverlay {
       final parsed = runtime.parsedTileFor(z, x, y);
       if (parsed == null) continue;
 
-      final originX =
-          leftColumnTilesCanvasX + (tile.lngIndex - leftColumnTilesLngIndex) * 256.0;
+      final originX = leftColumnTilesCanvasX +
+          (tile.lngIndex - leftColumnTilesLngIndex) * 256.0;
       final originY =
           topRowTilesCanvasY + (tile.latIndex - topRowTilesLatIndex) * 256.0;
       // Skip tiles fully off-canvas (padding ring included).
-      if (originX <= -256 || originY <= -256 ||
-          originX >= size.width + 256 || originY >= size.height + 256) {
+      if (originX <= -256 ||
+          originY <= -256 ||
+          originX >= size.width + 256 ||
+          originY >= size.height + 256) {
         continue;
       }
 
@@ -154,10 +155,12 @@ class LabelOverlay {
             sprite.draw(canvas, label.icon!, origin, label.iconSize);
           }
           if (haloPainter != null) {
-            haloPainter.paint(canvas, origin + _textOffsetFor(label, haloPainter));
+            haloPainter.paint(
+                canvas, origin + _textOffsetFor(label, haloPainter));
           }
           if (textPainter != null) {
-            textPainter.paint(canvas, origin + _textOffsetFor(label, textPainter));
+            textPainter.paint(
+                canvas, origin + _textOffsetFor(label, textPainter));
           }
           canvas.restore();
         } else {
@@ -165,10 +168,12 @@ class LabelOverlay {
             sprite.draw(canvas, label.icon!, anchor, label.iconSize);
           }
           if (haloPainter != null) {
-            haloPainter.paint(canvas, anchor + _textOffsetFor(label, haloPainter));
+            haloPainter.paint(
+                canvas, anchor + _textOffsetFor(label, haloPainter));
           }
           if (textPainter != null) {
-            textPainter.paint(canvas, anchor + _textOffsetFor(label, textPainter));
+            textPainter.paint(
+                canvas, anchor + _textOffsetFor(label, textPainter));
           }
         }
         drawn++;
@@ -236,10 +241,13 @@ class LabelOverlay {
       final placementExpr = layer.layout['symbol-placement'];
       final isLineLayer = placementExpr == 'line' ||
           (placementExpr is List &&
-              evaluateStringExpr(placementExpr, EvaluationContext(
-                zoom: zoom.toDouble(),
-                properties: null,
-              )) == 'line');
+              evaluateStringExpr(
+                      placementExpr,
+                      EvaluationContext(
+                        zoom: zoom.toDouble(),
+                        properties: null,
+                      )) ==
+                  'line');
 
       for (final feature in data.features) {
         if (feature.geometry.isEmpty || feature.geometry.first.length < 2) {
@@ -256,34 +264,53 @@ class LabelOverlay {
         if (text == null && icon == null) continue;
 
         final fontSize = evaluateNumExpr(
-          layer.layout['text-size'], ctx,
-          fallback: 16, min: 6, max: 64,
+          layer.layout['text-size'],
+          ctx,
+          fallback: 16,
+          min: 6,
+          max: 64,
         );
         final color = evaluateColorExpr(layer.paint['text-color'], ctx) ??
             const ui.Color(0xFF000000);
-        final haloColor = evaluateColorExpr(layer.paint['text-halo-color'], ctx);
+        final haloColor =
+            evaluateColorExpr(layer.paint['text-halo-color'], ctx);
         final haloWidth = evaluateNumExpr(
-          layer.paint['text-halo-width'], ctx,
-          fallback: 0, min: 0, max: 8,
+          layer.paint['text-halo-width'],
+          ctx,
+          fallback: 0,
+          min: 0,
+          max: 8,
         );
         final letterSpacing = evaluateNumExpr(
-          layer.layout['text-letter-spacing'], ctx, fallback: 0,
+          layer.layout['text-letter-spacing'],
+          ctx,
+          fallback: 0,
         );
-        final anchor = evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
+        final anchor =
+            evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
         final offsetDx = _offsetEms(layer, ctx, 0);
         final offsetDy = _offsetEms(layer, ctx, 1);
         final iconSize = evaluateNumExpr(
-          layer.layout['icon-size'], ctx,
-          fallback: 1, min: 0.5, max: 4,
+          layer.layout['icon-size'],
+          ctx,
+          fallback: 1,
+          min: 0.5,
+          max: 4,
         );
 
         if (isLineLayer && feature.geomType == MvtGeomType.lineString) {
           // Line label: sample placements along the geometry.
           _addLineLabels(
-            labels, layer.id, feature, transform,
-            text: text, icon: icon,
-            fontSize: fontSize, color: color,
-            haloColor: haloColor, haloWidth: haloWidth,
+            labels,
+            layer.id,
+            feature,
+            transform,
+            text: text,
+            icon: icon,
+            fontSize: fontSize,
+            color: color,
+            haloColor: haloColor,
+            haloWidth: haloWidth,
             letterSpacing: letterSpacing,
             iconSize: iconSize,
           );
@@ -293,7 +320,8 @@ class LabelOverlay {
           labels.add(_PreparedLabel(
             text: text,
             icon: icon,
-            dedupeKey: '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
+            dedupeKey:
+                '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
             localX: transform.x(first[0]),
             localY: transform.y(first[1]),
             fontSize: fontSize,
@@ -324,9 +352,8 @@ class LabelOverlay {
     final raw = layer.layout['text-field'];
     if (raw == null) return null;
     // Legacy shorthand: a bare string names a property.
-    final value = raw is String
-        ? (ctx.properties?[raw])
-        : evaluateExpression(raw, ctx);
+    final value =
+        raw is String ? (ctx.properties?[raw]) : evaluateExpression(raw, ctx);
     if (value == null) return null;
     var text = stringifyStyleValue(value);
     switch (evaluateStringExpr(layer.layout['text-transform'], ctx)) {
@@ -436,7 +463,8 @@ class LabelOverlay {
         labels.add(_PreparedLabel(
           text: text,
           icon: icon,
-          dedupeKey: '$layerId:${feature.id > 0 ? feature.id : text ?? icon}:$partIdx:$nextDist',
+          dedupeKey:
+              '$layerId:${feature.id > 0 ? feature.id : text ?? icon}:$partIdx:$nextDist',
           localX: px,
           localY: py,
           fontSize: fontSize,
@@ -520,8 +548,7 @@ class _PreparedLabel {
 
   TextPainter painter() => _textPainter ??= _build(foreground: null);
 
-  TextPainter haloPainter() =>
-      _haloPainter ??= _build(
+  TextPainter haloPainter() => _haloPainter ??= _build(
         foreground: ui.Paint()
           ..style = ui.PaintingStyle.stroke
           ..strokeWidth = 2 * haloWidth

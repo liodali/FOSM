@@ -32,9 +32,27 @@ void main() {
       expect(dependsOnProperties(['get', 'class']), isTrue);
       expect(dependsOnProperties(['has', 'name']), isTrue);
       expect(dependsOnProperties(['zoom']), isFalse);
-      expect(dependsOnProperties(['interpolate', ['linear'], ['zoom'],
-          5, ['step', 2, ['get', 'rank'], 5, 3]]), isTrue);
-      expect(dependsOnProperties(['literal', ['get', 'class']]), isFalse);
+      expect(
+          dependsOnProperties([
+            'interpolate',
+            ['linear'],
+            ['zoom'],
+            5,
+            [
+              'step',
+              2,
+              ['get', 'rank'],
+              5,
+              3
+            ]
+          ]),
+          isTrue);
+      expect(
+          dependsOnProperties([
+            'literal',
+            ['get', 'class']
+          ]),
+          isFalse);
     });
   });
 
@@ -49,15 +67,27 @@ void main() {
 
     test('comparisons with coercion', () {
       expect(
-        evaluateExpression(['==', ['get', 'class'], 'motorway'], ctx(7)),
+        evaluateExpression([
+          '==',
+          ['get', 'class'],
+          'motorway'
+        ], ctx(7)),
         isTrue,
       );
       expect(
-        evaluateExpression(['>=', ['get', 'admin_level'], 4], ctx(7)),
+        evaluateExpression([
+          '>=',
+          ['get', 'admin_level'],
+          4
+        ], ctx(7)),
         isTrue,
       );
       expect(
-        evaluateExpression(['<', ['get', 'admin_level'], 4], ctx(7)),
+        evaluateExpression([
+          '<',
+          ['get', 'admin_level'],
+          4
+        ], ctx(7)),
         isFalse,
       );
       // "4" (string) == 4 (number) under loose equality.
@@ -67,22 +97,42 @@ void main() {
     test('all / any', () {
       final all = [
         'all',
-        ['==', ['get', 'class'], 'motorway'],
-        ['>=', ['get', 'admin_level'], 2],
+        [
+          '==',
+          ['get', 'class'],
+          'motorway'
+        ],
+        [
+          '>=',
+          ['get', 'admin_level'],
+          2
+        ],
       ];
       expect(evaluateExpression(all, ctx(7)), isTrue);
 
       final any = [
         'any',
-        ['==', ['get', 'class'], 'residential'],
-        ['==', ['get', 'brunnel'], 'tunnel'],
+        [
+          '==',
+          ['get', 'class'],
+          'residential'
+        ],
+        [
+          '==',
+          ['get', 'brunnel'],
+          'tunnel'
+        ],
       ];
       expect(evaluateExpression(any, ctx(7)), isTrue);
     });
 
     test('concat and to-string', () {
       expect(
-        evaluateExpression(['concat', 'a ', ['get', 'name']], ctx(7)),
+        evaluateExpression([
+          'concat',
+          'a ',
+          ['get', 'name']
+        ], ctx(7)),
         'a Zürich',
       );
       expect(evaluateExpression(['to-string', 1.0], ctx(7)), '1');
@@ -91,7 +141,11 @@ void main() {
     });
 
     test('coalesce picks first non-null', () {
-      final expr = ['coalesce', ['get', 'missing'], ['get', 'name']];
+      final expr = [
+        'coalesce',
+        ['get', 'missing'],
+        ['get', 'name']
+      ];
       expect(evaluateExpression(expr, ctx(7)), 'Zürich');
     });
   });
@@ -144,7 +198,15 @@ void main() {
     });
 
     test('step picks the output for the last reached stop', () {
-      final expr = ['step', ['zoom'], 1, 7, 2, 12, 3];
+      final expr = [
+        'step',
+        ['zoom'],
+        1,
+        7,
+        2,
+        12,
+        3
+      ];
       expect(evaluateExpression(expr, ctx(6)), 1);
       expect(evaluateExpression(expr, ctx(7)), 2);
       expect(evaluateExpression(expr, ctx(12)), 3);
@@ -191,9 +253,17 @@ void main() {
     test('case picks the first true condition', () {
       final expr = [
         'case',
-        ['==', ['get', 'brunnel'], 'tunnel'],
+        [
+          '==',
+          ['get', 'brunnel'],
+          'tunnel'
+        ],
         'tunnel-style',
-        ['==', ['get', 'brunnel'], 'bridge'],
+        [
+          '==',
+          ['get', 'brunnel'],
+          'bridge'
+        ],
         'bridge-style',
         'plain',
       ];
@@ -210,18 +280,32 @@ void main() {
     test('expression-style filter', () {
       final filter = [
         'all',
-        ['==', ['get', 'class'], 'motorway'],
-        ['>=', ['get', 'admin_level'], 2],
+        [
+          '==',
+          ['get', 'class'],
+          'motorway'
+        ],
+        [
+          '>=',
+          ['get', 'admin_level'],
+          2
+        ],
       ];
       expect(matchesFilter(filter, ctx(7)), isTrue);
     });
 
     test('legacy in / !in / has / !has', () {
-      expect(matchesFilter(['in', 'class', 'trunk', 'motorway'], ctx(7)), isTrue);
+      expect(
+          matchesFilter(['in', 'class', 'trunk', 'motorway'], ctx(7)), isTrue);
       expect(matchesFilter(['!in', 'class', 'trunk', 'trunk'], ctx(7)), isTrue);
       expect(matchesFilter(['has', 'name'], ctx(7)), isTrue);
       expect(matchesFilter(['!has', 'missing'], ctx(7)), isTrue);
-      expect(matchesFilter(['none', ['==', 'class', 'x']], ctx(7)), isTrue);
+      expect(
+          matchesFilter([
+            'none',
+            ['==', 'class', 'x']
+          ], ctx(7)),
+          isTrue);
     });
 
     test('null filter matches everything', () {
@@ -240,12 +324,17 @@ void main() {
 
     test('evaluateColorExpr parses strings', () {
       expect(evaluateColorExpr('#ff0000', ctx(7)), const Color(0xFFFF0000));
-      expect(evaluateColorExpr(['to-color', '#00ff0080'], ctx(7)),
-          isA<Color>());
+      expect(
+          evaluateColorExpr(['to-color', '#00ff0080'], ctx(7)), isA<Color>());
     });
 
     test('unknown operator yields typed fallback, not a crash', () {
-      expect(evaluateNumExpr(['voodoo', ['zoom']], ctx(7), fallback: 42), 42);
+      expect(
+          evaluateNumExpr([
+            'voodoo',
+            ['zoom']
+          ], ctx(7), fallback: 42),
+          42);
       expect(evaluateColorExpr(['voodoo'], ctx(7)), isNull);
     });
   });

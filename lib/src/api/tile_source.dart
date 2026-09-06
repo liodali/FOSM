@@ -27,8 +27,7 @@ typedef TileDecoder = Future<ui.Image> Function(
 // Web (same isolate) it saves connection setup cost.
 Dio? _sharedDio;
 
-Dio get _dio =>
-    _sharedDio ??= Dio(BaseOptions(
+Dio get _dio => _sharedDio ??= Dio(BaseOptions(
       connectTimeout: const Duration(seconds: 10),
       receiveTimeout: const Duration(seconds: 15),
       headers: const {

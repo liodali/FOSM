@@ -14,7 +14,8 @@ void main() {
       server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       server.listen((request) {
         request.response.headers.contentType = ContentType(
-          'image', 'png',
+          'image',
+          'png',
         );
         request.response.add(servedBytes);
         request.response.close();
@@ -27,8 +28,7 @@ void main() {
 
     test('returns raw bytes from the server', () async {
       // Point downloadTileBytes at our local server instead of OSM.
-      final url =
-          'http://${server.address.host}:${server.port}/7/67/44.png';
+      final url = 'http://${server.address.host}:${server.port}/7/67/44.png';
       final bytes = await downloadTileBytes(url);
       expect(bytes, servedBytes);
     });

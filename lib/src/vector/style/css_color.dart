@@ -55,11 +55,14 @@ int? _hexNibble(String char) {
   return null;
 }
 
-int? _hexPair(String r1, String r2, String g1, String g2, String b1, String b2) {
+int? _hexPair(
+    String r1, String r2, String g1, String g2, String b1, String b2) {
   final r = _hexByte(r1 + r2);
   final g = _hexByte(g1 + g2);
   final b = _hexByte(b1 + b2);
-  return (r == null || g == null || b == null) ? null : (r << 16) | (g << 8) | b;
+  return (r == null || g == null || b == null)
+      ? null
+      : (r << 16) | (g << 8) | b;
 }
 
 Color? _parseRgb(String body) {
@@ -98,17 +101,29 @@ Color? _parseHsl(String body) {
   final x = c * (1 - (hp % 2 - 1).abs());
   final double r, g, b;
   if (hp < 1) {
-    r = c; g = x; b = 0;
+    r = c;
+    g = x;
+    b = 0;
   } else if (hp < 2) {
-    r = x; g = c; b = 0;
+    r = x;
+    g = c;
+    b = 0;
   } else if (hp < 3) {
-    r = 0; g = c; b = x;
+    r = 0;
+    g = c;
+    b = x;
   } else if (hp < 4) {
-    r = 0; g = x; b = c;
+    r = 0;
+    g = x;
+    b = c;
   } else if (hp < 5) {
-    r = x; g = 0; b = c;
+    r = x;
+    g = 0;
+    b = c;
   } else {
-    r = c; g = 0; b = x;
+    r = c;
+    g = 0;
+    b = x;
   }
   final m = l - c / 2;
   return Color.fromARGB(

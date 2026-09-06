@@ -29,7 +29,8 @@ mixin CacheTiles {
   }
 
   /// Persist a tile's raw PNG bytes under [cacheKey].
-  Future<void> storeTile(String cacheKey, Tile tile, Uint8List imageBytes) async {
+  Future<void> storeTile(
+      String cacheKey, Tile tile, Uint8List imageBytes) async {
     if (!isCacheReady) return;
     await _boxTileCache!.put(cacheKey, tile.toTileJson(imageBytes));
   }
