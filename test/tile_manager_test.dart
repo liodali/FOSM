@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
@@ -711,6 +712,147 @@ void main() {
       // cheap), so the decode count is well above the single visible tile.
       expect(_decodeCount, greaterThan(1),
           reason: 'raster mode must decode padding tiles too');
+
+      manager.dispose();
+    });
+  });
+
+  /// Bigger than the 800×600 viewport at zoom 5 in both axes, so the
+  /// clamp (not the center-pin) applies.
+  final largeBounds = LatLngBounds(
+    southwest: const LatLng(latitude: -60, longitude: -80),
+    northeast: const LatLng(latitude: 60, longitude: 80),
+  );
+
+  TileManager boundedManager() {
+    final manager = TileManager.init(
+      width: 800,
+      height: 600,
+      centerLatLng: const LatLng(latitude: 0, longitude: 0),
+      zoom: 5,
+      fetcher: _fakeFetcher,
+      tilePadding: 0,
+      preloadAdjacentZoom: false,
+      cameraBounds: largeBounds,
+    );
+    manager.calculate();
+    return manager;
+  }
+
+  /// Whether the viewport (given the manager's current camera) stays
+  /// within [bounds] at the current zoom.
+  bool viewportInside(TileManager manager, LatLngBounds bounds) {
+    final halfW = manager.width / (2 * tileWidth);
+    final halfH = manager.height / (2 * tileHeight);
+    return tileX2Lng(manager.centerTileLng - halfW, manager.zoom) >=
+            bounds.west - 0.01 &&
+        tileX2Lng(manager.centerTileLng + halfW, manager.zoom) <=
+            bounds.east + 0.01 &&
+        tileY2Lat(manager.centerTileLat - halfH, manager.zoom) <=
+            bounds.north + 0.01 &&
+        tileY2Lat(manager.centerTileLat + halfH, manager.zoom) >=
+            bounds.south - 0.01;
+  }
+
+  group('TileManager cameraBounds', () {
+    test('setCenterFromTileCoords clamps at the box edges', () {
+      final manager = boundedManager();
+
+      // Far outside the box on both axes.
+      manager.setCenterFromTileCoords(0, 0);
+      expect(viewportInside(manager, largeBounds), isTrue);
+
+      manager.setCenterFromTileCoords(31, 10);
+      expect(viewportInside(manager, largeBounds), isTrue);
+
+      manager.dispose();
+    });
+
+    test('setCenterTile clamps at the box edges', () {
+      final manager = boundedManager();
+
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 50, longitude: 150),
+      );
+      expect(viewportInside(manager, largeBounds), isTrue);
+
+      manager.dispose();
+    });
+
+    test('bounds smaller than the viewport pin the camera to their center', () {
+      final manager = TileManager.init(
+        width: 800,
+        height: 600,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+        cameraBounds: LatLngBounds(
+          southwest: const LatLng(latitude: -1, longitude: -1),
+          northeast: const LatLng(latitude: 1, longitude: 1),
+        ),
+      );
+      manager.calculate();
+
+      manager.setCenterFromTileCoords(2, 2);
+      expect(manager.centerLatLng.longitude, closeTo(0, 0.01));
+      expect(manager.centerLatLng.latitude, closeTo(0, 0.01));
+
+      manager.dispose();
+    });
+
+    test('setCameraBounds snaps an outside camera inside; null frees it', () {
+      final manager = TileManager.init(
+        width: 800,
+        height: 600,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      manager.calculate();
+
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 30, longitude: 150),
+      );
+      expect(manager.centerLatLng.longitude, closeTo(150, 0.01));
+
+      manager.setCameraBounds(largeBounds);
+      expect(viewportInside(manager, largeBounds), isTrue);
+
+      // Removing the constraint lets the camera leave the box again.
+      manager.setCameraBounds(null);
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 30, longitude: 150),
+      );
+      expect(manager.centerLatLng.longitude, closeTo(150, 0.01));
+
+      manager.dispose();
+    });
+
+    test('resize re-clamps against the new viewport size', () {
+      final manager = boundedManager();
+
+      // A tall viewport: the ±60° latitude span (≈13.4 tiles at zoom 5)
+      // is now smaller than the viewport (≈14.8 tiles) → the camera pins
+      // to the box's vertical center, while horizontally it still clamps.
+      manager.resize(const ui.Size(1400, 3800));
+      expect(manager.centerLatLng.latitude, closeTo(0, 0.01));
+
+      // Vertical is pinned (the viewport is taller than the box), so the
+      // viewport legitimately extends past north/south — check that the
+      // horizontal clamp still holds.
+      final halfW = manager.width / (2 * tileWidth);
+      expect(
+        tileX2Lng(manager.centerTileLng - halfW, manager.zoom),
+        greaterThanOrEqualTo(largeBounds.west - 0.01),
+      );
+      expect(
+        tileX2Lng(manager.centerTileLng + halfW, manager.zoom),
+        lessThanOrEqualTo(largeBounds.east + 0.01),
+      );
 
       manager.dispose();
     });
