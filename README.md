@@ -17,6 +17,8 @@ A high-performance Flutter map library with native raster and vector tile render
 - 📱 **Cross-Platform**: iOS, Android, Web, macOS, Linux, Windows
 - 🏷️ **Labels & Icons**: Point labels, line labels (road names), and sprite icons
 - 🔄 **Zoom Animations**: Google Maps-style two-phase transitions — blurred hold while tiles load, then scale reveal. Two intensity levels (`scale` / `crossfade`)
+- **Camera Bounds**: Keep the camera inside a fixed `LatLngBounds` during gestures and programmatic movement
+- **Fit Bounds**: Frame routes and other geographic boxes with optional padding through `MapController.fitBounds`
 - 🧵 **Background Processing**: Compute-based protobuf parsing on separate threads
 - 📊 **Pre-loading**: Intelligent adjacent zoom level pre-loading
 
@@ -87,6 +89,45 @@ MapView(
   vectorStyle: customStyle,
 )
 ```
+
+### Camera bounds and fit bounds
+
+Use `cameraBounds` when the camera must remain inside a fixed geographic box.
+The constraint applies to gestures, zoom focal-point changes, and programmatic
+camera movement:
+
+```dart
+final controller = MapController();
+
+final allowedArea = LatLngBounds(
+  southwest: LatLng(latitude: 47.20, longitude: 8.20),
+  northeast: LatLng(latitude: 47.70, longitude: 8.80),
+);
+
+MapView(
+  controller: controller,
+  latLng: allowedArea.center,
+  zoom: 10,
+  cameraBounds: allowedArea,
+);
+```
+
+Use `fitBounds` to navigate to a box without creating a persistent constraint.
+This is useful for framing routes after the map controller is attached:
+
+```dart
+final routeBounds = LatLngBounds.fromPoints(routePoints);
+controller.fitBounds(
+  routeBounds,
+  padding: const EdgeInsets.all(48),
+  animate: true,
+);
+```
+
+`LatLngBounds` accepts finite coordinates in the Web Mercator latitude range
+and longitudes from `-180` to `180`. Bounds crossing the antimeridian are not
+supported. Remove a persistent constraint by rebuilding `MapView` with
+`cameraBounds: null`.
 
 ### Markers
 
