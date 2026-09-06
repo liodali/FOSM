@@ -10,6 +10,7 @@ import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/isolate/http_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/http_isolate_native.dart'
     if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart';
@@ -86,6 +87,10 @@ class TileManager with CacheTiles {
   final int tilePadding;
   final bool preloadAdjacentZoom;
 
+  /// Optional hard bounding box the camera can never leave. `null`
+  /// disables the constraint.
+  LatLngBounds? cameraBounds;
+
   /// When `true`, the off-screen padding ring is fetched as compressed
   /// bytes only and is **not** decoded until it enters the viewport.
   ///
@@ -142,6 +147,7 @@ class TileManager with CacheTiles {
     this.preloadAdjacentZoom = true,
     this.byteOnlyPadding = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
+    this.cameraBounds,
   })  : _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
         _urlBuilder = urlBuilder {
@@ -184,12 +190,25 @@ class TileManager with CacheTiles {
     centerTileLng = lon2TileX(lng, zoom);
     centerTileLat = lat2TileY(lat, zoom);
     _clampTileCoords();
+    final unclampedLng = centerTileLng;
+    final unclampedLat = centerTileLat;
+    _clampToCameraBounds();
+    // Re-derive the geographic center only when the camera-bounds clamp
+    // actually moved the camera, so an unconstrained setCenterTile keeps
+    // the exact lat/lng it was given.
+    if (centerTileLng != unclampedLng || centerTileLat != unclampedLat) {
+      centerLatLng = LatLng(
+        latitude: tileY2Lat(centerTileLat, zoom),
+        longitude: tileX2Lng(centerTileLng, zoom),
+      );
+    }
   }
 
   void setCenterFromTileCoords(double tileLng, double tileLat) {
     final n = math.pow(2, zoom).toDouble();
     centerTileLng = tileLng.clamp(0.0, n);
     centerTileLat = tileLat.clamp(0.0, n);
+    _clampToCameraBounds();
     centerLatLng = LatLng(
       latitude: tileY2Lat(centerTileLat, zoom),
       longitude: tileX2Lng(centerTileLng, zoom),
@@ -200,6 +219,39 @@ class TileManager with CacheTiles {
     final n = math.pow(2, zoom).toDouble();
     centerTileLng = centerTileLng.clamp(0.0, n);
     centerTileLat = centerTileLat.clamp(0.0, n);
+  }
+
+  /// Constrains the camera center so the viewport never shows anything
+  /// outside [cameraBounds] at the current zoom. When the bounds are
+  /// smaller than the viewport, the camera pins to the bounds' center.
+  void _clampToCameraBounds() {
+    final bounds = cameraBounds;
+    if (bounds == null) return;
+    final minX = lon2TileX(bounds.west, zoom);
+    final maxX = lon2TileX(bounds.east, zoom);
+    final minY = lat2TileY(bounds.north, zoom); // north = smaller tile Y
+    final maxY = lat2TileY(bounds.south, zoom);
+    final halfW = width / (2 * tileWidth);
+    final halfH = height / (2 * tileHeight);
+    // Bounds smaller than viewport → pin to their center; else clamp.
+    centerTileLng = (maxX - minX <= halfW * 2)
+        ? (minX + maxX) / 2
+        : centerTileLng.clamp(minX + halfW, maxX - halfW);
+    centerTileLat = (maxY - minY <= halfH * 2)
+        ? (minY + maxY) / 2
+        : centerTileLat.clamp(minY + halfH, maxY - halfH);
+  }
+
+  /// Sets the hard camera constraint to [bounds] (`null` frees the
+  /// camera) and snaps the current camera inside it if it was outside.
+  void setCameraBounds(LatLngBounds? bounds) {
+    cameraBounds = bounds;
+    _clampToCameraBounds();
+    centerLatLng = LatLng(
+      latitude: tileY2Lat(centerTileLat, zoom),
+      longitude: tileX2Lng(centerTileLng, zoom),
+    );
+    calculate();
   }
 
   /// Projects a geographic point to viewport-local pixels under the
@@ -219,6 +271,15 @@ class TileManager with CacheTiles {
     height = size.height;
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
+    final unclampedLng = centerTileLng;
+    final unclampedLat = centerTileLat;
+    _clampToCameraBounds();
+    if (centerTileLng != unclampedLng || centerTileLat != unclampedLat) {
+      centerLatLng = LatLng(
+        latitude: tileY2Lat(centerTileLat, zoom),
+        longitude: tileX2Lng(centerTileLng, zoom),
+      );
+    }
   }
 
   void setZoom(int newZoom) {
@@ -241,10 +302,10 @@ class TileManager with CacheTiles {
     final newFocalTileLng = lon2TileX(focalLng, newZoom);
     final newFocalTileLat = lat2TileY(focalLat, newZoom);
 
-    final newCenterTileLng = newFocalTileLng -
-        (focalLocal.dx - centerCanvasX) / tileWidth;
-    final newCenterTileLat = newFocalTileLat -
-        (focalLocal.dy - centerCanvasY) / tileHeight;
+    final newCenterTileLng =
+        newFocalTileLng - (focalLocal.dx - centerCanvasX) / tileWidth;
+    final newCenterTileLat =
+        newFocalTileLat - (focalLocal.dy - centerCanvasY) / tileHeight;
 
     zoom = newZoom;
     setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
@@ -264,28 +325,23 @@ class TileManager with CacheTiles {
     final centerCanvasTileX = centerCanvasX - centerPointTileX;
     final centerCanvasTileY = centerCanvasY - centerPointTileY;
 
-    final leftColumnsBeforeCenterCount =
-        (centerCanvasTileX / tileWidth).ceil();
+    final leftColumnsBeforeCenterCount = (centerCanvasTileX / tileWidth).ceil();
     leftColumnTilesCanvasX =
         centerCanvasTileX - leftColumnsBeforeCenterCount * tileWidth;
 
-    final topRowsBeforeCenterCount =
-        (centerCanvasTileY / tileHeight).ceil();
+    final topRowsBeforeCenterCount = (centerCanvasTileY / tileHeight).ceil();
     topRowTilesCanvasY =
         centerCanvasTileY - topRowsBeforeCenterCount * tileHeight;
 
     final centerTileLngIndex = centerTileLng.floor();
-    leftColumnTilesLngIndex =
-        centerTileLngIndex - leftColumnsBeforeCenterCount;
+    leftColumnTilesLngIndex = centerTileLngIndex - leftColumnsBeforeCenterCount;
 
     final centerTileLatIndex = centerTileLat.floor();
-    topRowTilesLatIndex =
-        centerTileLatIndex - topRowsBeforeCenterCount;
+    topRowTilesLatIndex = centerTileLatIndex - topRowsBeforeCenterCount;
 
     horizontalTileCount =
         ((width + -leftColumnTilesCanvasX) / tileWidth).ceil();
-    verticalTileCount =
-        ((height + -topRowTilesCanvasY) / tileHeight).ceil();
+    verticalTileCount = ((height + -topRowTilesCanvasY) / tileHeight).ceil();
 
     // Capture the visible (un-padded) bounds so we can classify each grid
     // cell as visible or padding below. Visible cells are decoded
@@ -299,10 +355,8 @@ class TileManager with CacheTiles {
     final paddedVCount = verticalTileCount + 2 * tilePadding;
     final paddedLeftLng = leftColumnTilesLngIndex - tilePadding;
     final paddedTopLat = topRowTilesLatIndex - tilePadding;
-    final paddedLeftCanvasX =
-        leftColumnTilesCanvasX - tilePadding * tileWidth;
-    final paddedTopCanvasY =
-        topRowTilesCanvasY - tilePadding * tileHeight;
+    final paddedLeftCanvasX = leftColumnTilesCanvasX - tilePadding * tileWidth;
+    final paddedTopCanvasY = topRowTilesCanvasY - tilePadding * tileHeight;
 
     horizontalTileCount = paddedHCount;
     verticalTileCount = paddedVCount;
@@ -325,12 +379,12 @@ class TileManager with CacheTiles {
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
-      final isPaddingH = hIndex < tilePadding ||
-          hIndex >= tilePadding + visibleHCount;
+      final isPaddingH =
+          hIndex < tilePadding || hIndex >= tilePadding + visibleHCount;
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
         final tileLatIndex = topRowTilesLatIndex + vIndex;
-        final isPaddingV = vIndex < tilePadding ||
-            vIndex >= tilePadding + visibleVCount;
+        final isPaddingV =
+            vIndex < tilePadding || vIndex >= tilePadding + visibleVCount;
         final isPadding = isPaddingH || isPaddingV;
         final key = _key(zoom, tileLngIndex, tileLatIndex);
 
@@ -420,7 +474,7 @@ class TileManager with CacheTiles {
   }
 
   Future<void> _decodeFromByteCache(
-    String key, Uint8List bytes, int z, int x, int y) async {
+      String key, Uint8List bytes, int z, int x, int y) async {
     try {
       final image = await _decoder(bytes, z, x, y);
       _complete(key, Tile(image, key, y, x));
@@ -562,10 +616,8 @@ class TileManager with CacheTiles {
     // Visible area (before padding).
     final visibleLeftLng = leftColumnTilesLngIndex + tilePadding;
     final visibleTopLat = topRowTilesLatIndex + tilePadding;
-    final visibleHCount =
-        (horizontalTileCount - 2 * tilePadding).clamp(0, 100);
-    final visibleVCount =
-        (verticalTileCount - 2 * tilePadding).clamp(0, 100);
+    final visibleHCount = (horizontalTileCount - 2 * tilePadding).clamp(0, 100);
+    final visibleVCount = (verticalTileCount - 2 * tilePadding).clamp(0, 100);
 
     // Only preload ±1 zoom (±2 creates 1000+ tiles that compete with
     // visible tile fetches and freeze the UI, especially in vector mode).
@@ -595,10 +647,10 @@ class TileManager with CacheTiles {
 
           // Load all tiles that cover this geographic area at target zoom.
           for (var dx = 0; dx < tileMultiplier; dx++) {
-              for (var dy = 0; dy < tileMultiplier; dy++) {
-                final tx = otherX + dx;
-                final ty = otherY + dy;
-                final key = _key(z, tx, ty);
+            for (var dy = 0; dy < tileMultiplier; dy++) {
+              final tx = otherX + dx;
+              final ty = otherY + dy;
+              final key = _key(z, tx, ty);
 
               // Skip if already cached or in-flight.
               if (_memoryCache.containsKey(key)) continue;
@@ -721,8 +773,7 @@ class TileManager with CacheTiles {
       // If the tile is currently visible, decode it immediately
       // instead of waiting for the next calculate() call.
       final renderIndex = _renderTiles.indexWhere((t) => t.index == key);
-      if (renderIndex != -1 &&
-          _renderTiles[renderIndex].sourceTile == null) {
+      if (renderIndex != -1 && _renderTiles[renderIndex].sourceTile == null) {
         _inFlight.add(key);
         _decodeFromByteCache(key, bytes, z, x, y);
       }
