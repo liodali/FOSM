@@ -83,12 +83,9 @@ StyleLayer? _parseLayer(Map json) {
     source: json['source'] is String ? json['source'] as String : null,
     sourceLayer:
         json['source-layer'] is String ? json['source-layer'] as String : null,
-    minZoom: json['minzoom'] is num
-        ? (json['minzoom'] as num).toDouble()
-        : 0.0,
-    maxZoom: json['maxzoom'] is num
-        ? (json['maxzoom'] as num).toDouble()
-        : 24.0,
+    minZoom: json['minzoom'] is num ? (json['minzoom'] as num).toDouble() : 0.0,
+    maxZoom:
+        json['maxzoom'] is num ? (json['maxzoom'] as num).toDouble() : 24.0,
     filter: json['filter'],
     layout: json['layout'] is Map
         ? Map<String, dynamic>.from(json['layout'] as Map)

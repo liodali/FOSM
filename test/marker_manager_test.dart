@@ -54,8 +54,7 @@ void main() {
       final north = _marker(10, 0);
       final south = _marker(-10, 0);
       manager.addAll([north, south]);
-      final removed =
-          manager.removeWhere((m) => m.point.latitude > 0);
+      final removed = manager.removeWhere((m) => m.point.latitude > 0);
       expect(removed, isTrue);
       expect(manager.markers, [south]);
     });
@@ -105,8 +104,7 @@ void main() {
       expect(notifications, 0);
     });
 
-    test('remove, removeWhere and clear notify when they change something',
-        () {
+    test('remove, removeWhere and clear notify when they change something', () {
       final manager = MarkerManager();
       var notifications = 0;
       manager.addListener(() => notifications++);

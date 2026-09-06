@@ -25,8 +25,7 @@ class Tile {
         lngIndex = tileJson['lngIndex'] as int;
 
   /// Returns a copy with [sourceTile] replaced.
-  Tile copyWithImage(ui.Image image) =>
-      Tile(image, index, latIndex, lngIndex);
+  Tile copyWithImage(ui.Image image) => Tile(image, index, latIndex, lngIndex);
 
   /// Serializes to a Hive-friendly map. [imageBytes] is the raw PNG data.
   Map<String, dynamic> toTileJson(Uint8List imageBytes) => {

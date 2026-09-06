@@ -88,9 +88,8 @@ class MvtBuilder {
       case int i:
         _varintField(b, 4, i); // int_value
       case double d:
-        final payload = (ByteData(8)..setFloat64(0, d, Endian.little))
-            .buffer
-            .asUint8List();
+        final payload =
+            (ByteData(8)..setFloat64(0, d, Endian.little)).buffer.asUint8List();
         _varint(b, (3 << 3) | 1); // double_value (field 3, 64-bit)
         b.add(payload);
       case bool v:

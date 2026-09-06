@@ -39,8 +39,8 @@ void main() {
 
   group('TileTransform (source units → tile pixels)', () {
     test('identity at source zoom with extent 4096', () {
-      final t = TileTransform.forLayer(
-          z: 10, x: 539, y: 372, srcZ: 10, extent: 4096);
+      final t =
+          TileTransform.forLayer(z: 10, x: 539, y: 372, srcZ: 10, extent: 4096);
       expect(t.x(0), 0);
       expect(t.x(4096), closeTo(256, 0.001));
       expect(t.y(4096), closeTo(256, 0.001));
@@ -71,8 +71,8 @@ void main() {
     test('non-4096 extents work at dz = 2', () {
       // z12 tile x=4 with z10 parent x=1: relX = 0, 512 of 2048 units per
       // child tile → scale 0.5 px per source unit.
-      final t = TileTransform.forLayer(
-          z: 12, x: 4, y: 3, srcZ: 10, extent: 2048);
+      final t =
+          TileTransform.forLayer(z: 12, x: 4, y: 3, srcZ: 10, extent: 2048);
       expect(t.scale, closeTo(0.5, 0.0001));
       expect(t.x(0), 0);
       expect(t.x(512), closeTo(256, 0.001));

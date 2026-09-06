@@ -16,12 +16,33 @@ class EvaluationContext {
 /// code can fall back to the style spec default — an unsupported operator
 /// degrades one property, never the whole render.
 const Set<String> _operators = {
-  'zoom', 'get', 'has', 'at', 'length',
-  '==', '!=', '<', '<=', '>', '>=',
-  'all', 'any',
-  'case', 'match', 'step', 'interpolate', 'coalesce',
-  'to-color', 'to-number', 'to-string', 'to-boolean',
-  'literal', 'array', 'concat', 'image', 'format',
+  'zoom',
+  'get',
+  'has',
+  'at',
+  'length',
+  '==',
+  '!=',
+  '<',
+  '<=',
+  '>',
+  '>=',
+  'all',
+  'any',
+  'case',
+  'match',
+  'step',
+  'interpolate',
+  'coalesce',
+  'to-color',
+  'to-number',
+  'to-string',
+  'to-boolean',
+  'literal',
+  'array',
+  'concat',
+  'image',
+  'format',
 };
 
 /// A value is an expression when it is a list whose first element is a
@@ -264,8 +285,7 @@ double _interpolationFactor(double base, double s0, double t, double s1) {
   if (s1 <= s0) return 1;
   if (base <= 0 || base == 1.0) return ((t - s0) / (s1 - s0)).clamp(0.0, 1.0);
   final delta = s1 - s0;
-  final factor =
-      (math.pow(base, t - s0) - 1) / (math.pow(base, delta) - 1);
+  final factor = (math.pow(base, t - s0) - 1) / (math.pow(base, delta) - 1);
   return factor.clamp(0.0, 1.0);
 }
 
@@ -422,7 +442,9 @@ double? _asNum(Object? v) {
 String stringifyStyleValue(Object? v) {
   if (v == null) return '';
   if (v is num) {
-    return v == v.roundToDouble() && v.abs() < 1e15 ? v.toInt().toString() : v.toString();
+    return v == v.roundToDouble() && v.abs() < 1e15
+        ? v.toInt().toString()
+        : v.toString();
   }
   return v.toString();
 }

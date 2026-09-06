@@ -161,8 +161,9 @@ Future<LoadedVectorStyle> loadVectorStyle(VectorMapStyle vectorStyle) async {
         maxZoom = tileJson['maxzoom'] is num
             ? (tileJson['maxzoom'] as num).toInt()
             : maxZoom;
-        attribution ??=
-            tileJson['attribution'] is String ? tileJson['attribution'] as String : null;
+        attribution ??= tileJson['attribution'] is String
+            ? tileJson['attribution'] as String
+            : null;
       }
     }
 

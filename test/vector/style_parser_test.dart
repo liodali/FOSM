@@ -35,11 +35,20 @@ void main() {
           'source-layer': 'water',
           'minzoom': 0,
           'maxzoom': 24,
-          'filter': ['==', ['get', 'class'], 'ocean'],
+          'filter': [
+            '==',
+            ['get', 'class'],
+            'ocean'
+          ],
           'paint': {
             'fill-color': [
-              'interpolate', ['linear'], ['zoom'],
-              0, '#aaa', 8, '#888',
+              'interpolate',
+              ['linear'],
+              ['zoom'],
+              0,
+              '#aaa',
+              8,
+              '#888',
             ],
           },
         },
@@ -75,7 +84,9 @@ void main() {
 
   test('defaults: minzoom 0, maxzoom 24, empty paint/layout', () {
     final style = parseStyleJson(jsonEncode({
-      'sources': {'v': {'type': 'vector', 'url': 'https://x/y.json'}},
+      'sources': {
+        'v': {'type': 'vector', 'url': 'https://x/y.json'}
+      },
       'layers': [
         {'id': 'l', 'type': 'fill', 'source': 'v'},
       ],
