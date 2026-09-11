@@ -2258,4 +2258,44 @@ void main() {
       await tester.pump();
     });
   });
+
+  group('presentation priority', () {
+    testWidgets('visible work outranks off-screen and older generations',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (z, x, y) async => fakeTilePng,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      final visibleCenter = manager.tileDecodePriority(manager.zoom, 4, 4);
+      final offscreen = manager.tileDecodePriority(manager.zoom, 0, 0);
+      expect(visibleCenter, greaterThan(offscreen),
+          reason: 'a visible tile must outrank an off-screen one');
+
+      // A newer camera generation outranks work queued for the old camera.
+      manager.setCenterFromTileCoords(
+        manager.centerTileLng + 1,
+        manager.centerTileLat,
+      );
+      manager.calculate();
+      final afterShift = manager.tileDecodePriority(manager.zoom, 4, 4);
+      expect(afterShift, greaterThan(visibleCenter));
+
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      await tester.pump();
+    });
+  });
 }

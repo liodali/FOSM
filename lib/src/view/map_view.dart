@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 
 import 'package:fosm/src/api/geo_point.dart';
@@ -92,6 +93,11 @@ class _OldGridOverlay extends StatelessWidget {
   final double visualScale;
   final double blurSigma;
 
+  /// Whether the full-viewport blur is allowed. Skipped on web by default
+  /// and during direct manipulation, where opacity + transform are cheaper
+  /// and keep input responsive.
+  final bool blurEnabled;
+
   const _OldGridOverlay({
     required this.manager,
     required this.size,
@@ -101,6 +107,7 @@ class _OldGridOverlay extends StatelessWidget {
     required this.waiting,
     required this.visualScale,
     required this.blurSigma,
+    required this.blurEnabled,
   });
 
   @override
@@ -131,8 +138,10 @@ class _OldGridOverlay extends StatelessWidget {
     }
 
     // Blur: both styles, different intensity. Progressive during scale.
-    final sigma =
-        waiting ? blurSigma : blurSigma * (1.0 + (visualScale - 1.0).abs());
+    // Disabled on web and during direct manipulation.
+    final sigma = !blurEnabled
+        ? 0.0
+        : (waiting ? blurSigma : blurSigma * (1.0 + (visualScale - 1.0).abs()));
     if (sigma > 0.1) {
       grid = ImageFiltered(
         imageFilter: ui.ImageFilter.blur(sigmaX: sigma, sigmaY: sigma),
@@ -453,6 +462,11 @@ class _MapViewState extends State<MapView>
   /// measured relative to it.
   double? _scaleStartScale;
 
+  /// True from gesture start to gesture end. Full-viewport blur is skipped
+  /// during direct manipulation so a pinch/drag never pays for an
+  /// `ImageFiltered` pass while the camera is moving.
+  bool _interacting = false;
+
   // ── Double-tap focal point ──────────────────────────────────────────
   Offset _doubleTapLocal = Offset.zero;
 
@@ -585,8 +599,10 @@ class _MapViewState extends State<MapView>
     );
     manager.onTilesChanged = _notify;
     // Let the vector runtime abort decodes for tiles that leave the
-    // render set before they reach render/`toImage`.
+    // render set before they reach render/`toImage`, and dispatch the
+    // newest centre tile first from its presentation lane.
     runtime?.isTileRelevant = manager.isTileRelevant;
+    runtime?.tilePriority = manager.tileDecodePriority;
     _tileManager = manager;
 
     if (!_readyNotificationDispatched) {
@@ -933,6 +949,7 @@ class _MapViewState extends State<MapView>
     _scaleStartZoom = manager.zoom;
     _scaleStartFocal = details.localFocalPoint;
     _scaleStartScale = 1.0;
+    _interacting = true;
   }
 
   void _onScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
@@ -1004,6 +1021,7 @@ class _MapViewState extends State<MapView>
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
     _scaleStartFocal = null;
+    _interacting = false;
   }
 
   /// Cluster tap: dispatches notification, calls the optional callback,
@@ -1150,6 +1168,7 @@ class _MapViewState extends State<MapView>
                           waiting: _animWaitingTiles,
                           visualScale: _visualScale,
                           blurSigma: _blurSigma,
+                          blurEnabled: !kIsWeb && !_interacting,
                         ),
                       ],
                     ],
