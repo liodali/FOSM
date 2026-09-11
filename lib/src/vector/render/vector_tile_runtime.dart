@@ -6,7 +6,13 @@ import 'package:flutter/foundation.dart';
 
 import 'package:fosm/src/api/tile.dart' show Tile;
 import 'package:fosm/src/api/tile_source.dart'
-    show TileDecoder, TileFetcher, downloadTileBytes;
+    show
+        TileDecodeAborted,
+        TileDecoder,
+        TileFetcher,
+        TilePayloadException,
+        TileResourceKeyBuilder,
+        downloadTileBytes;
 import 'package:fosm/src/isolate/mvt_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/mvt_isolate_native.dart';
 import 'package:fosm/src/isolate/mvt_worker.dart';
@@ -109,7 +115,19 @@ class VectorTileRuntime {
   /// survive. Disposed in [dispose].
   LabelOverlay get labelOverlay => _labelOverlay ??= LabelOverlay(this);
 
+  /// Optional stale-work predicate set by [TileManager]. When it returns
+  /// `false` for a logical tile, an in-progress decode aborts with
+  /// [TileDecodeAborted] before the next expensive stage (parse, style
+  /// evaluation, vector render, `Picture.toImage`) instead of wasting a
+  /// render slot on an off-screen tile.
+  bool Function(int z, int x, int y)? isTileRelevant;
+
   bool _disposed = false;
+
+  /// Number of images disposed because label preparation failed after
+  /// `toImage` created them (test hook).
+  @visibleForTesting
+  int debugDisposedImages = 0;
 
   // ── Decode/render gating ────────────────────────────────────────────
   // Switching to vector mode schedules every visible tile at once; on web
@@ -136,6 +154,14 @@ class VectorTileRuntime {
   /// tile URL with over-zoom applied.
   String Function(int z, int x, int y) get urlBuilder =>
       (z, x, y) => vectorSource.urlFor(z, x, y);
+
+  /// Canonical source identity for [TileManager]: the source name plus the
+  /// resolved (over-zoomed, wrapped) coordinate. This keeps persistent keys
+  /// opaque — no URL, query string, or token is ever stored.
+  TileResourceKeyBuilder get resourceKeyBuilder => (z, x, y) {
+        final coord = vectorSource.resolve(z, x, y);
+        return '${vectorSource.name}/${coord.z}/${coord.x}/${coord.y}';
+      };
 
   /// Tile decoder for [TileManager]: parses MVT bytes, caches the parsed
   /// source tile, and rasterizes the logical 256px tile image. Jobs pass
@@ -171,14 +197,44 @@ class VectorTileRuntime {
     }
   }
 
+  /// Whether the logical tile still justifies further work: not disposed
+  /// and, when a predicate is installed, still relevant.
+  bool _isRelevant(int z, int x, int y) {
+    if (_disposed) return false;
+    final predicate = isTileRelevant;
+    return predicate == null || predicate(z, x, y);
+  }
+
+  /// Aborts the current decode when [isTileRelevant] reports the logical
+  /// tile is no longer needed. No-op when no predicate is installed.
+  void _checkRelevant(int z, int x, int y) {
+    if (!_isRelevant(z, x, y)) {
+      throw const TileDecodeAborted();
+    }
+  }
+
   Future<ui.Image> _decodeAndRender(
       Uint8List bytes, int z, int x, int y) async {
     if (_disposed) throw StateError('runtime disposed');
+    _checkRelevant(z, x, y);
     final source = vectorSource;
     try {
       final coord = source.resolve(z, x, y);
-      final parsed =
-          _parsedTileFor(coord) ?? await _parseAndStoreDedup(bytes, coord);
+      final ParsedVectorTile parsed;
+      try {
+        parsed =
+            _parsedTileFor(coord) ?? await _parseAndStoreDedup(bytes, coord);
+      } on TileDecodeAborted {
+        rethrow;
+      } catch (error) {
+        // The protobuf payload itself could not be parsed. Report it as a
+        // corrupt payload so the caller invalidates and refetches instead of
+        // retrying the same bytes forever.
+        throw TilePayloadException('$error');
+      }
+
+      // The tile can become stale while waiting for the shared parse.
+      _checkRelevant(z, x, y);
 
       // Yield to the event loop between heavy stages so the UI thread
       // can process input and paint. Critical on web where everything
@@ -217,6 +273,9 @@ class VectorTileRuntime {
         throw StateError('runtime disposed during decode');
       }
 
+      // Last relevance gate before the two most expensive stages.
+      _checkRelevant(z, x, y);
+
       // Yield before the heavy Canvas path-building step.
       if (kIsWeb) await Future<void>.delayed(Duration.zero);
 
@@ -232,11 +291,31 @@ class VectorTileRuntime {
         rasterCoords: rasterCoords,
       );
       try {
+        // Skip the `toImage` snapshot too if the tile went stale while
+        // rendering — it is the single most expensive stage.
+        _checkRelevant(z, x, y);
         // Enter a new event-loop turn before toImage. On CanvasKit/SkWasm
         // this snapshot can take 5-15ms; a real timer gives an already
         // scheduled browser/desktop frame a chance to run first.
         await Future<void>.delayed(const Duration(milliseconds: 1));
         final image = await picture.toImage(256, 256);
+        // Prepare this tile's labels before publishing it, so the next paint
+        // only runs viewport collision and drawing instead of feature
+        // scanning and text layout. Preparation is cooperative and aborts
+        // when the tile goes stale; dispose the image on any failure so it
+        // can never leak.
+        try {
+          await labelOverlay.prepare(
+            z,
+            x,
+            y,
+            isRelevant: () => _isRelevant(z, x, y),
+          );
+        } catch (_) {
+          debugDisposedImages++;
+          image.dispose();
+          rethrow;
+        }
         return image;
       } finally {
         picture.dispose();

@@ -282,6 +282,11 @@ enum ZoomAnimationStyle {
 /// The fading old-grid overlay tracks camera pans, so a pinch that keeps
 /// panning mid-animation stays visually aligned.
 class MapView extends StatefulWidget {
+  /// Counts [MapView] rebuilds. Test hook used to prove that several tile
+  /// arrivals in one frame produce a single map update.
+  @visibleForTesting
+  static int debugBuildCount = 0;
+
   final LatLng latLng;
   final int zoom;
   final int minZoom;
@@ -569,6 +574,7 @@ class _MapViewState extends State<MapView>
       fetcher: runtime?.fetcher ?? widget.tileFetcher,
       decoder: runtime?.decoder,
       urlBuilder: runtime?.urlBuilder,
+      resourceKeyBuilder: runtime?.resourceKeyBuilder,
       cacheNamespace: runtime?.namespace ?? '',
       // Vector decodes are expensive (MVT parse + style passes + toImage),
       // so the off-screen padding ring is fetched as bytes only and decoded
@@ -578,6 +584,9 @@ class _MapViewState extends State<MapView>
       cameraBounds: widget.cameraBounds,
     );
     manager.onTilesChanged = _notify;
+    // Let the vector runtime abort decodes for tiles that leave the
+    // render set before they reach render/`toImage`.
+    runtime?.isTileRelevant = manager.isTileRelevant;
     _tileManager = manager;
 
     if (!_readyNotificationDispatched) {
@@ -715,8 +724,8 @@ class _MapViewState extends State<MapView>
   /// Frames [bounds] in the viewport, leaving [padding] around it, then
   /// restores free camera movement (unlike [cameraBounds], nothing stays
   /// constrained afterwards). Zoom is integer-only: the computed zoom is
-  /// floored and clamped to [MapView.minZoom]/[MapView.maxZoom], so the
-  /// box is always fully visible.
+  /// floored and clamped to [MapView.minZoom]/[MapView.maxZoom]. If the bounds
+  /// cannot fit at [MapView.minZoom], their edges may be clipped.
   void _fitBounds(
     LatLngBounds bounds, {
     EdgeInsets padding = EdgeInsets.zero,
@@ -751,18 +760,16 @@ class _MapViewState extends State<MapView>
     }
 
     // Projected bounds center, shifted for asymmetric padding.
-    final projectedCenterX =
-        (lon2TileX(bounds.west, targetZoom) +
+    final projectedCenterX = (lon2TileX(bounds.west, targetZoom) +
             lon2TileX(bounds.east, targetZoom)) /
         2;
-    final projectedCenterY =
-        (lat2TileY(bounds.north, targetZoom) +
+    final projectedCenterY = (lat2TileY(bounds.north, targetZoom) +
             lat2TileY(bounds.south, targetZoom)) /
         2;
-    final centerTileX = projectedCenterX -
-        (padding.left - padding.right) / (2 * tileWidth);
-    final centerTileY = projectedCenterY -
-        (padding.top - padding.bottom) / (2 * tileHeight);
+    final centerTileX =
+        projectedCenterX - (padding.left - padding.right) / (2 * tileWidth);
+    final centerTileY =
+        projectedCenterY - (padding.top - padding.bottom) / (2 * tileHeight);
     final targetCenter = LatLng(
       latitude: tileY2Lat(centerTileY, targetZoom),
       longitude: tileX2Lng(centerTileX, targetZoom),
@@ -832,9 +839,8 @@ class _MapViewState extends State<MapView>
     snap.anchorTileLng = manager.centerTileLng;
     snap.anchorTileLat = manager.centerTileLat;
 
-    // 3. Calculate new tiles and check if all visible tiles are loaded.
-    manager.calculate();
-
+    // 3. The grid was already rebuilt by [setZoomWithFocalPoint] above —
+    //    [calculate] is idempotent, so no extra pass is needed here.
     final ready = _newTilesReady();
     if (ready) {
       // All new tiles already available (cache hit) — start scale
@@ -854,13 +860,15 @@ class _MapViewState extends State<MapView>
     setState(() {});
   }
 
-  /// Returns true when all visible tiles in the new zoom have loaded
-  /// (no placeholders). Called from [_notify] (tiles-changed callback)
-  /// and from the timeout in [_startZoomAnimation].
+  /// Returns true when all strict-viewport tiles in the new zoom have
+  /// loaded. Padding and off-world cells are ignored, so a vector-mode
+  /// padding ring (intentionally bytes-only) never delays the scale
+  /// phase. Called from [_notify] (tiles-changed callback) and from the
+  /// timeout in [_startZoomAnimation].
   bool _newTilesReady() {
     final manager = _tileManager;
     if (manager == null) return true;
-    return !manager.renderTiles.any((t) => t.sourceTile == null);
+    return manager.visibleTilesReady;
   }
 
   /// Transitions from phase 1 (blur + wait) to phase 2 (scale + fade).
@@ -1057,6 +1065,7 @@ class _MapViewState extends State<MapView>
 
   @override
   Widget build(BuildContext context) {
+    MapView.debugBuildCount++;
     if (widget.vectorStyle != null && _vectorRuntime == null) {
       return _buildStylePlaceholder();
     }

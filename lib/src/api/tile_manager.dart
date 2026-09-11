@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
@@ -32,8 +34,21 @@ class TileManager with CacheTiles {
   /// Set to [Duration.zero] to disable debouncing (useful for tests).
   final Duration preloadDebounce;
 
-  /// Maximum number of concurrent pre-load fetches.
+  /// Maximum number of adjacent-zoom preload jobs a single preload pass
+  /// enqueues. This bounds how much work is added to the queue at once; the
+  /// scheduler separately bounds how many actually execute.
   static const int maxConcurrentPreloads = 20;
+
+  /// Maximum number of foreground load jobs executing at once. Foreground
+  /// work is a strict-viewport tile or a raster padding tile. Excess jobs
+  /// stay queued so a newer camera generation can jump ahead of stale
+  /// queued requests instead of them leaving the queue immediately.
+  static const int maxConcurrentVisibleLoads = 6;
+
+  /// Maximum number of background preload jobs executing at once. Background
+  /// work is bytes-only vector padding and adjacent-zoom preloading; it only
+  /// starts when no foreground work is queued or active.
+  static const int maxConcurrentBackgroundLoads = 2;
 
   final TileFetcher _fetcher;
 
@@ -109,15 +124,69 @@ class TileManager with CacheTiles {
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
-  /// How many pre-load fetches are currently in flight.
-  int _activePreloads = 0;
-
   /// The zoom level that was last pre-loaded for.
   int _lastPreloadedZoom = -1;
 
   /// The tile coords of the center when pre-loading last ran.
   int _lastPreloadCenterX = 0;
   int _lastPreloadCenterY = 0;
+
+  // ── Strict viewport (Phase 1) ───────────────────────────────────────
+  //
+  // [calculate] retains the un-padded viewport ranges so readiness checks
+  // and the scheduler can distinguish tiles that must be decoded from the
+  // padding ring that intentionally may stay as bytes only.
+
+  int _visibleHorizontalCount = 0;
+  int _visibleVerticalCount = 0;
+
+  /// Keys of currently visible, valid-world slots.
+  final Set<String> _visibleKeys = {};
+
+  /// Grid signature used to bump [revision]/[generation] only when the
+  /// camera or viewport geometry really changed.
+  double _calcCenterLng = double.nan;
+  double _calcCenterLat = double.nan;
+  int _calcZoom = -1;
+  double _calcWidth = double.nan;
+  double _calcHeight = double.nan;
+
+  // ── Generation-aware scheduler (Phase 2) ────────────────────────────
+  //
+  // All load work enters [_loadQueue] and is drained in priority order:
+  // newer camera generation first, then visible > padding > adjacent
+  // zoom, then nearest-to-center. Visible work has its own concurrency
+  // gate and always runs ahead of background preloads.
+
+  int _generation = 0;
+
+  /// The current camera generation. Bumped whenever grid geometry changes.
+  int get generation => _generation;
+
+  final List<_LoadJob> _loadQueue = [];
+
+  /// Keys that are queued but not yet executing.
+  final Set<String> _queued = {};
+
+  /// Foreground load jobs currently executing. Bounded by
+  /// [maxConcurrentVisibleLoads]; background preloads are held back while
+  /// this is nonzero so visible work never competes for sockets with
+  /// padding/adjacent-zoom fetches.
+  int _activeForegroundLoads = 0;
+
+  /// Background preload jobs currently executing. Bounded by
+  /// [maxConcurrentBackgroundLoads].
+  int _activeBackgroundLoads = 0;
+
+  /// One-shot timers that re-enqueue a failed job after [failureBackoff],
+  /// so retries no longer depend on a grid-rebuilding `calculate()`.
+  final Map<String, Timer> _retryTimers = {};
+
+  /// The latest (highest-priority) job descriptor seen for each key. Retry
+  /// timers use this instead of the descriptor captured when the failure was
+  /// scheduled, so a tile promoted from padding to visible is retried with
+  /// its current generation/class/`byteOnly` rather than stale metadata.
+  final Map<String, _LoadJob> _jobsByKey = {};
 
   // ── HTTP isolate (persistent background isolate for all network I/O) ─
   final HttpIsolate _httpIsolate = HttpIsolate();
@@ -127,12 +196,90 @@ class TileManager with CacheTiles {
   /// falls back to the [_fetcher] function.
   final String Function(int z, int x, int y)? _urlBuilder;
 
+  /// Builds the canonical source identity of a logical tile. When null a
+  /// digest of the URL builder is used, then the wrapped logical coordinates.
+  final TileResourceKeyBuilder? _resourceKeyBuilder;
+
+  /// In-flight shared source fetches keyed by resource identity. A single
+  /// resource future fans out to every logical slot waiting on it, so
+  /// over-zoom siblings and wrapped-X duplicates download once.
+  final Map<String, Future<Uint8List>> _resourceFetches = {};
+
+  /// Resources whose bytes have been scheduled for persistent storage, so a
+  /// resource shared by several logical slots produces one Hive write.
+  final Set<String> _persistedResources = {};
+
+  /// Upper bound on [_persistedResources] bookkeeping before it is reset.
+  /// Resetting can cause a rare duplicate write, never a missing one.
+  static const int _maxPersistedResourceKeys = 1024;
+
   // ── Lifecycle ───────────────────────────────────────────────────────
   bool _disposed = false;
-  int _revision = 0;
-  int get revision => _revision;
+
+  /// Grid/camera revision — bumped only when the visible grid geometry
+  /// (center, zoom, or viewport size) changes.
+  int _gridRevision = 0;
+
+  /// Tile-content revision — bumped when a tile image is published.
+  int _contentRevision = 0;
+
+  /// Combined revision used by painters' `shouldRepaint`. Strictly
+  /// increasing because both parts only ever increment.
+  int get revision => _gridRevision + _contentRevision;
+
+  int get gridRevision => _gridRevision;
+  int get contentRevision => _contentRevision;
+
+  /// True while a content-change notification is registered for the next
+  /// frame. Completing many tiles in one frame produces one callback.
+  bool _tileNotificationScheduled = false;
 
   VoidCallback? onTilesChanged;
+
+  // ── Strict viewport readiness (Phase 1) ─────────────────────────────
+
+  /// Number of tiles in the strict (un-padded) viewport that have no
+  /// image yet. Padding and invalid world-Y cells are ignored, so a
+  /// vector-mode padding ring that is intentionally bytes-only never
+  /// blocks readiness.
+  int get missingVisibleTileCount {
+    if (_visibleHorizontalCount <= 0 || _visibleVerticalCount <= 0) return 0;
+    final n = 1 << zoom;
+    var missing = 0;
+    for (var h = 0; h < _visibleHorizontalCount; h++) {
+      final row = (h + tilePadding) * verticalTileCount;
+      for (var v = 0; v < _visibleVerticalCount; v++) {
+        final listIndex = row + tilePadding + v;
+        if (listIndex >= _renderTiles.length) continue;
+        final tile = _renderTiles[listIndex];
+        if (tile.latIndex < 0 || tile.latIndex >= n) continue;
+        if (tile.sourceTile == null) missing++;
+      }
+    }
+    return missing;
+  }
+
+  /// `true` when every visible, valid-world slot has an image. Padding
+  /// and off-world cells are ignored.
+  bool get visibleTilesReady => missingVisibleTileCount == 0;
+
+  /// Number of strict-viewport grid cells (including off-world rows).
+  int get visibleTileCount => _visibleHorizontalCount * _visibleVerticalCount;
+
+  /// Whether [z]/[x]/[y] still justifies the expensive decode of the
+  /// current mode.
+  ///
+  /// In vector mode (`byteOnlyPadding == true`) only strict-viewport slots
+  /// are decode-relevant: the padding ring is deliberately bytes-only, so a
+  /// visible tile that scrolls into padding must abort before parse/render/
+  /// `toImage` and must not publish an image or repaint. Raster mode keeps
+  /// decoding its padded render set because raster decodes are cheap and the
+  /// padded images make panning instant.
+  bool isTileRelevant(int z, int x, int y) {
+    final key = _key(z, x, y);
+    if (byteOnlyPadding) return _visibleKeys.contains(key);
+    return _renderIndex(key) != -1;
+  }
 
   TileManager.init({
     required this.width,
@@ -142,6 +289,7 @@ class TileManager with CacheTiles {
     TileFetcher? fetcher,
     TileDecoder? decoder,
     String Function(int z, int x, int y)? urlBuilder,
+    TileResourceKeyBuilder? resourceKeyBuilder,
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
@@ -150,7 +298,8 @@ class TileManager with CacheTiles {
     this.cameraBounds,
   })  : _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
-        _urlBuilder = urlBuilder {
+        _urlBuilder = urlBuilder,
+        _resourceKeyBuilder = resourceKeyBuilder {
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
@@ -166,12 +315,25 @@ class TileManager with CacheTiles {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _tileNotificationScheduled = false;
     _preloadTimer?.cancel();
     _preloadTimer = null;
+    for (final timer in _retryTimers.values) {
+      timer.cancel();
+    }
+    _retryTimers.clear();
+    _jobsByKey.clear();
+    _resourceFetches.clear();
     _httpIsolate.dispose();
     onTilesChanged = null;
     _renderTiles.clear();
     _inFlight.clear();
+    _loadQueue.clear();
+    _queued.clear();
+    _visibleKeys.clear();
+    _failedUntil.clear();
+    _activeForegroundLoads = 0;
+    _activeBackgroundLoads = 0;
     for (final image in _memoryCache.values) {
       image.dispose();
     }
@@ -316,8 +478,31 @@ class TileManager with CacheTiles {
 
   /// Rebuilds the visible tile grid. Cheap and synchronous — call on
   /// every pan frame.
+  ///
+  /// Recalculation is idempotent and has a real unchanged-grid fast path:
+  /// when the camera/zoom/viewport geometry has not moved it returns
+  /// immediately without clearing the grid, recreating jobs, sorting, or
+  /// pumping the scheduler. Tile completions update the existing grid in
+  /// place, and failure/backoff retries are driven by timers, so neither
+  /// needs a recalculation to make progress.
+  ///
+  /// Only an actual geometry change bumps [revision]/[generation] and
+  /// rebuilds.
   void calculate() {
     if (_disposed) return;
+
+    final gridChanged = _calcCenterLng != centerTileLng ||
+        _calcCenterLat != centerTileLat ||
+        _calcZoom != zoom ||
+        _calcWidth != width ||
+        _calcHeight != height;
+    _calcCenterLng = centerTileLng;
+    _calcCenterLat = centerTileLat;
+    _calcZoom = zoom;
+    _calcWidth = width;
+    _calcHeight = height;
+    if (!gridChanged) return;
+    _generation++;
 
     final centerPointTileX = (centerTileLng % 1) * tileWidth;
     final centerPointTileY = (centerTileLat % 1) * tileHeight;
@@ -343,10 +528,12 @@ class TileManager with CacheTiles {
         ((width + -leftColumnTilesCanvasX) / tileWidth).ceil();
     verticalTileCount = ((height + -topRowTilesCanvasY) / tileHeight).ceil();
 
-    // Capture the visible (un-padded) bounds so we can classify each grid
-    // cell as visible or padding below. Visible cells are decoded
-    // immediately; padding cells are either decoded (raster) or fetched
-    // as bytes only (vector, see [byteOnlyPadding]).
+    // Capture the strict (un-padded) viewport ranges before expansion so
+    // readiness checks and the scheduler can tell visible slots from the
+    // padding ring that intentionally may never decode in vector mode.
+    _visibleHorizontalCount = horizontalTileCount;
+    _visibleVerticalCount = verticalTileCount;
+
     final visibleHCount = horizontalTileCount;
     final visibleVCount = verticalTileCount;
 
@@ -366,16 +553,13 @@ class TileManager with CacheTiles {
     topRowTilesCanvasY = paddedTopCanvasY;
 
     _renderTiles.clear();
+    _visibleKeys.clear();
 
-    // First pass: build render list and collect tiles that need loading.
-    // We sort pending loads center-first so the user sees the middle of
-    // the map before the edges — critical for vector mode where each
-    // decode is expensive.
-    final pending = <({String key, int lng, int lat, double dist})>[];
-    // Padding cells scheduled for byte-only preload (vector mode). Kept
-    // separate so they never go through the decoder until they become
-    // visible.
-    final bytePreload = <({String key, int lng, int lat, double dist})>[];
+    // Build the render list and collect the work to schedule. Jobs carry
+    // the current generation and a priority class so the scheduler can
+    // keep visible tiles ahead of padding/preloads.
+    final pending = <_LoadJob>[];
+    final bytePreload = <_LoadJob>[];
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
@@ -387,6 +571,10 @@ class TileManager with CacheTiles {
             vIndex < tilePadding || vIndex >= tilePadding + visibleVCount;
         final isPadding = isPaddingH || isPaddingV;
         final key = _key(zoom, tileLngIndex, tileLatIndex);
+
+        if (!isPadding && _isValidWorld(zoom, tileLatIndex)) {
+          _visibleKeys.add(key);
+        }
 
         // Synchronous memory-cache hit → no flicker.
         final cached = _memoryCache.remove(key);
@@ -402,43 +590,43 @@ class TileManager with CacheTiles {
         final dy = tileLatIndex - centerTileLat;
         final dist = dx * dx + dy * dy;
 
-        if (isPadding && byteOnlyPadding) {
+        final job = _LoadJob(
+          key: key,
+          resourceKey: _resourceKey(zoom, tileLngIndex, tileLatIndex),
+          z: zoom,
+          x: tileLngIndex,
+          y: tileLatIndex,
+          generation: _generation,
+          jobClass: isPadding ? _JobClass.padding : _JobClass.visible,
+          distance: dist,
+          byteOnly: isPadding && byteOnlyPadding,
+        );
+
+        if (job.byteOnly) {
           // Off-screen padding ring in vector mode: fetch bytes only,
           // do not decode. Decoded later when the tile scrolls into view.
-          bytePreload.add((
-            key: key,
-            lng: tileLngIndex,
-            lat: tileLatIndex,
-            dist: dist,
-          ));
+          bytePreload.add(job);
         } else {
-          pending.add((
-            key: key,
-            lng: tileLngIndex,
-            lat: tileLatIndex,
-            dist: dist,
-          ));
+          pending.add(job);
         }
       }
     }
 
-    // Schedule visible loads center-first.
-    pending.sort((a, b) => a.dist.compareTo(b.dist));
-    for (final p in pending) {
-      _scheduleLoad(p.key, zoom, p.lng, p.lat);
+    // Drop queued jobs that are no longer on screen (stale after a pan or
+    // zoom), then enqueue the current work and drain in priority order.
+    _pruneStaleQueue();
+    for (final job in pending) {
+      _enqueueJob(job);
     }
-
-    // Schedule byte-only padding preloads center-first, after visible
-    // work has been queued so they never compete with visible decodes.
-    if (bytePreload.isNotEmpty) {
-      bytePreload.sort((a, b) => a.dist.compareTo(b.dist));
-      for (final p in bytePreload) {
-        _scheduleByteOnlyPreload(p.key, zoom, p.lng, p.lat);
-      }
+    for (final job in bytePreload) {
+      _enqueueJob(job);
     }
 
     _trimMemoryCache();
-    _revision++;
+
+    _gridRevision++;
+
+    _pumpLoadQueue();
 
     // Debounce adjacent zoom pre-loading — only after user stops panning.
     if (preloadAdjacentZoom) {
@@ -446,124 +634,542 @@ class TileManager with CacheTiles {
     }
   }
 
-  // ── Async tile loading ──────────────────────────────────────────────
+  // ── Async tile loading (generation-aware priority scheduler) ────────
 
-  void _scheduleLoad(String key, int z, int x, int y) {
-    final n = 1 << z;
-    if (y < 0 || y >= n) return;
-    if (_inFlight.contains(key)) return;
+  /// Orders queued jobs: newest generation first, then visible > padding
+  /// > adjacent zoom, then nearest to the viewport center.
+  static int _compareJobs(_LoadJob a, _LoadJob b) {
+    if (a.generation != b.generation) {
+      return b.generation.compareTo(a.generation);
+    }
+    final cls = a.jobClass.index.compareTo(b.jobClass.index);
+    if (cls != 0) return cls;
+    return a.distance.compareTo(b.distance);
+  }
 
-    final failedUntil = _failedUntil[key];
-    if (failedUntil != null && DateTime.now().isBefore(failedUntil)) return;
-
-    // Check byte cache first (instant decode, no network).
-    final bytes = _byteCache[key];
-    if (bytes != null) {
-      _inFlight.add(key);
-      _decodeFromByteCache(key, bytes, z, x, y);
+  /// Adds [job] to the priority queue unless it is already in flight,
+  /// invalid, or backed off after a failure.
+  ///
+  /// If the same key is already queued, the job is upgraded in place when
+  /// the new one has higher priority (newer generation, more visible class,
+  /// or closer to center). That promotes a padding tile that became visible
+  /// instead of leaving it with its stale generation and priority.
+  void _enqueueJob(_LoadJob job) {
+    if (_disposed) return;
+    if (!_isValidWorld(job.z, job.y)) return;
+    // Record the newest descriptor even when the job is already in flight so
+    // a pending retry timer can pick up the promoted priority.
+    _registerLatestJob(job);
+    if (_inFlight.contains(job.key)) return;
+    // Byte-only work is already done once its bytes are cached; re-enqueueing
+    // it would trigger a redundant network request after a pan.
+    if (job.byteOnly &&
+        (_byteCache.containsKey(job.resourceKey) ||
+            _memoryCache.containsKey(job.key))) {
+      _removeQueued(job.key);
       return;
     }
+    final failedUntil = _failedUntil[job.key];
+    if (failedUntil != null) {
+      if (DateTime.now().isBefore(failedUntil)) {
+        // Retry after the backoff even if an unchanged grid never calls
+        // [calculate] again.
+        _scheduleRetry(job, failedUntil.difference(DateTime.now()));
+        return;
+      }
+      _failedUntil.remove(job.key);
+    }
 
-    _inFlight.add(key);
+    final existingIndex = _queueIndex(job.key);
+    if (existingIndex != -1) {
+      final existing = _loadQueue[existingIndex];
+      if (_compareJobs(job, existing) < 0) {
+        _loadQueue[existingIndex] = job;
+      }
+      return;
+    }
+    _queued.add(job.key);
+    _loadQueue.add(job);
+  }
 
-    if (hasStoredTile(key)) {
-      _loadFromDisk(key);
-    } else {
-      _loadFromNetwork(key, z, x, y);
+  /// Keeps [_jobsByKey] pointing at the highest-priority descriptor seen for
+  /// a key. Retries read this map so they never replay stale metadata.
+  void _registerLatestJob(_LoadJob job) {
+    final existing = _jobsByKey[job.key];
+    if (existing == null || _compareJobs(job, existing) < 0) {
+      _jobsByKey[job.key] = job;
     }
   }
 
-  Future<void> _decodeFromByteCache(
-      String key, Uint8List bytes, int z, int x, int y) async {
-    try {
-      final image = await _decoder(bytes, z, x, y);
-      _complete(key, Tile(image, key, y, x));
-    } catch (_) {
-      _byteCache.remove(key);
-      _inFlight.remove(key);
-      _loadFromNetwork(key, z, x, y);
-    }
+  /// Removes [key] from the pending queue, if present.
+  void _removeQueued(String key) {
+    if (!_queued.remove(key)) return;
+    _loadQueue.removeWhere((job) => job.key == key);
   }
 
-  Future<void> _loadFromDisk(String key) async {
-    Uint8List? bytes;
-    try {
-      bytes = await storedTileBytes(key);
-    } catch (_) {
-      bytes = null;
-    }
+  int _queueIndex(String key) => _loadQueue.indexWhere((job) => job.key == key);
 
-    if (bytes != null && bytes.isNotEmpty) {
-      // Keys may carry a style namespace ("style/z/x/y") — always read
-      // the coordinates from the tail.
-      final parts = key.split('/');
-      final z = int.tryParse(parts[parts.length - 3]);
-      final x = int.tryParse(parts[parts.length - 2]);
-      final y = int.tryParse(parts[parts.length - 1]);
-      if (z != null && x != null && y != null) {
-        try {
-          final image = await _decoder(bytes, z, x, y);
-          _complete(key, Tile(image, key, y, x));
-          return;
-        } catch (_) {
-          await deleteStoredTile(key); // corrupt entry — re-download
+  /// Removes queued jobs that no longer belong to the current camera
+  /// generation.
+  ///
+  /// Non-background jobs are dropped when their tile leaves the render set.
+  /// Adjacent-zoom preloads normally target off-screen tiles, but a new
+  /// generation drops them: a camera move must not keep launching more
+  /// background jobs from the previous generation.
+  void _pruneStaleQueue() {
+    if (_loadQueue.isEmpty) return;
+    _loadQueue.removeWhere((job) {
+      if (job.jobClass == _JobClass.adjacentZoom) {
+        if (job.generation != _generation) {
+          _queued.remove(job.key);
+          _jobsByKey.remove(job.key);
+          return true;
         }
+        return false;
       }
-    } else {
-      try {
-        await deleteStoredTile(key);
-      } catch (_) {}
-    }
-
-    if (_disposed) {
-      _inFlight.remove(key);
-      return;
-    }
-    _inFlight.remove(key);
-    final parts = key.split('/');
-    _scheduleLoad(
-      key,
-      int.tryParse(parts[parts.length - 3]) ?? zoom,
-      int.tryParse(parts[parts.length - 2]) ?? 0,
-      int.tryParse(parts[parts.length - 1]) ?? 0,
-    );
+      final relevant = _renderIndex(job.key) != -1;
+      if (!relevant) {
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+      }
+      return !relevant;
+    });
   }
 
-  Future<void> _loadFromNetwork(String key, int z, int x, int y) async {
-    try {
-      final Uint8List bytes;
-      if (_httpIsolate.isReady && _urlBuilder != null) {
-        // Use persistent HTTP isolate (native) — reuses TCP connections.
-        bytes = await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y));
+  /// A foreground job is required to complete the current viewport: a
+  /// visible slot, or a padding slot that decodes (raster mode). Background
+  /// jobs (vector byte-only padding and adjacent-zoom preloads) are preloads
+  /// that may wait.
+  static bool _isForeground(_LoadJob job) =>
+      job.jobClass == _JobClass.visible ||
+      (job.jobClass == _JobClass.padding && !job.byteOnly);
+
+  /// Starts queued jobs, most important first.
+  ///
+  /// Foreground jobs are bounded by [maxConcurrentVisibleLoads]; the rest
+  /// stay queued so a newer generation can take the next freed slot instead
+  /// of sitting behind dozens of older requests. Background preloads only
+  /// run when no foreground work is queued or active, and are bounded by
+  /// [maxConcurrentBackgroundLoads].
+  void _pumpLoadQueue() {
+    if (_disposed || _loadQueue.isEmpty) return;
+    _loadQueue.sort(_compareJobs);
+
+    final foregroundPending = _loadQueue.any(_isForeground);
+    final backgroundBlocked = foregroundPending || _activeForegroundLoads > 0;
+    var foregroundSlots = maxConcurrentVisibleLoads - _activeForegroundLoads;
+
+    final keep = <_LoadJob>[];
+    for (final job in _loadQueue) {
+      if (_isForeground(job)) {
+        if (foregroundSlots > 0) {
+          foregroundSlots--;
+          _queued.remove(job.key);
+          _activeForegroundLoads++;
+          unawaited(_runJob(job, foreground: true));
+        } else {
+          keep.add(job);
+        }
+      } else if (backgroundBlocked ||
+          _activeBackgroundLoads >= maxConcurrentBackgroundLoads) {
+        keep.add(job);
       } else {
-        // Fall back to fetcher (web or custom).
-        bytes = await _fetcher(z, x, y);
+        _queued.remove(job.key);
+        _activeBackgroundLoads++;
+        unawaited(_runJob(job, foreground: false));
       }
-      _storeInByteCache(key, bytes);
-      final image = await _decoder(bytes, z, x, y);
-      unawaited(storeTile(key, Tile(image, key, y, x), bytes));
-      _complete(key, Tile(image, key, y, x));
-    } catch (_) {
-      _inFlight.remove(key);
-      _failedUntil[key] = DateTime.now().add(failureBackoff);
     }
+    _loadQueue
+      ..clear()
+      ..addAll(keep);
+  }
+
+  Future<void> _runJob(_LoadJob job, {required bool foreground}) async {
+    try {
+      if (_disposed) return;
+      _inFlight.add(job.key);
+      await _executeJob(job);
+    } finally {
+      _inFlight.remove(job.key);
+      if (foreground) {
+        if (_activeForegroundLoads > 0) _activeForegroundLoads--;
+      } else {
+        if (_activeBackgroundLoads > 0) _activeBackgroundLoads--;
+      }
+      if (!_disposed) _pumpLoadQueue();
+    }
+  }
+
+  /// Records a failure and schedules a retry after [failureBackoff] so a
+  /// retry no longer depends on a grid-rebuilding `calculate()`.
+  void _markFailed(_LoadJob job) {
+    if (_disposed) return;
+    final until = DateTime.now().add(failureBackoff);
+    _failedUntil[job.key] = until;
+    _scheduleRetry(job, failureBackoff);
+  }
+
+  void _scheduleRetry(_LoadJob job, Duration delay) {
+    if (_disposed || _retryTimers.containsKey(job.key)) return;
+    final wait = delay.isNegative ? Duration.zero : delay;
+    _retryTimers[job.key] = Timer(wait, () {
+      _retryTimers.remove(job.key);
+      if (_disposed) return;
+      _failedUntil.remove(job.key);
+      // Retry with the newest descriptor for this key, not the one captured
+      // when the failure was scheduled — a padding preload may have been
+      // promoted to a visible foreground decode in the meantime.
+      final latest = _jobsByKey[job.key] ?? job;
+      if (!_shouldRetry(latest)) return;
+      _enqueueJob(latest);
+      _pumpLoadQueue();
+    });
+  }
+
+  /// Whether a failed [job] is still worth retrying.
+  bool _shouldRetry(_LoadJob job) {
+    if (_inFlight.contains(job.key) || _queued.contains(job.key)) return false;
+    if (_memoryCache.containsKey(job.key)) return false;
+    if (job.byteOnly && _byteCache.containsKey(job.resourceKey)) return false;
+    if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _executeJob(_LoadJob job) async {
+    if (_disposed) return;
+    // The tile may have scrolled off screen between queueing and starting.
+    // Adjacent-zoom preloads target tiles outside the render set on
+    // purpose, so they bypass this check.
+    if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
+      return;
+    }
+
+    if (job.byteOnly) {
+      await _fetchBytesOnly(job);
+      return;
+    }
+
+    // Source bytes live under the shared resource key; the rendered image is
+    // still published per logical slot by `_complete`.
+    final resource = job.resourceKey;
+
+    // 1. Byte cache hit — decode without network.
+    Uint8List? corruptBytes;
+    final cachedBytes = _byteCache[resource];
+    if (cachedBytes != null) {
+      final outcome = await _tryDecode(job, cachedBytes);
+      if (outcome == _DecodeOutcome.ok || outcome == _DecodeOutcome.aborted) {
+        return;
+      }
+      if (outcome == _DecodeOutcome.error) {
+        // The decoder failed for a reason unrelated to the bytes; keep the
+        // cached payload and back off instead of deleting it.
+        _markFailed(job);
+        return;
+      }
+      // Corrupt payload: drop the bad entry and try the next source.
+      corruptBytes = cachedBytes;
+      _removeFromByteCache(resource);
+    }
+
+    // 2. Disk cache — canonical resource key first, then the legacy logical
+    //    slot key written by older versions. A validated legacy entry is
+    //    migrated: rewritten under the resource key and then removed.
+    var diskKey = resource;
+    if (!hasStoredTile(diskKey)) {
+      final legacy = _key(job.z, job.x, job.y);
+      if (legacy != resource && hasStoredTile(legacy)) {
+        diskKey = legacy;
+      }
+    }
+    if (hasStoredTile(diskKey)) {
+      Uint8List? bytes;
+      try {
+        bytes = await storedTileBytes(diskKey);
+      } catch (_) {
+        bytes = null;
+      }
+      if (_disposed) return;
+      if (bytes == null || bytes.isEmpty) {
+        // Missing/corrupt persistent record — delete it and re-download.
+        await _deleteStored(diskKey);
+      } else if (diskKey == resource &&
+          corruptBytes != null &&
+          listEquals(bytes, corruptBytes)) {
+        // The persistent copy is byte-identical to the byte-cache copy that
+        // already failed to decode. Invalidate it without spending a second
+        // expensive decode, then recover from the network once.
+        await _deleteStored(diskKey);
+      } else {
+        final outcome = await _tryDecode(job, bytes);
+        if (outcome == _DecodeOutcome.ok || outcome == _DecodeOutcome.aborted) {
+          _ensureBytesCached(resource, bytes);
+          if (diskKey != resource) {
+            // Compatible legacy record: rewrite it under the canonical
+            // resource key and drop the old entry.
+            _persistResource(job, bytes);
+            await _deleteStored(diskKey);
+          }
+          return;
+        }
+        if (outcome == _DecodeOutcome.error) {
+          _markFailed(job);
+          return;
+        }
+        // Corrupt disk bytes: remove the bad persistent entry (and any
+        // byte-cache copy) and recover from the network.
+        corruptBytes = bytes;
+        _removeFromByteCache(resource);
+        await _deleteStored(diskKey);
+      }
+    }
+
+    // 3. Network.
+    if (corruptBytes != null) {
+      _removeFromByteCache(resource);
+    }
+    await _fetchBytesAndDecode(job);
+  }
+
+  Future<void> _deleteStored(String key) async {
+    // Allow a later successful fetch to re-persist this resource.
+    _persistedResources.remove(key);
+    try {
+      await deleteStoredTile(key);
+    } catch (_) {
+      // Best-effort: a failed delete must not block the network retry.
+    }
+  }
+
+  /// Decodes [bytes] and publishes the tile when it is still relevant.
+  ///
+  /// Outcome classification:
+  /// - [TileDecodeAborted] → [aborted]: stale work; keep the bytes, no
+  ///   backoff.
+  /// - [TilePayloadException] → [corrupt]: these bytes can never render;
+  ///   callers invalidate the cache/disk entry and recover from the network.
+  /// - Any other exception → [error]: the decoder failed for a reason that
+  ///   says nothing about the payload (style/render/runtime). The bytes are
+  ///   kept and retried rather than deleted and refetched.
+  Future<_DecodeOutcome> _tryDecode(_LoadJob job, Uint8List bytes) async {
+    if (_disposed) return _DecodeOutcome.aborted;
+    // Cheap pre-gate: never even enter the decoder for a tile that is no
+    // longer relevant (e.g. a stale raster tile that left the render set, or
+    // a visible vector tile that moved into the bytes-only padding ring).
+    if (!isTileRelevant(job.z, job.x, job.y)) {
+      return _DecodeOutcome.aborted;
+    }
+    try {
+      final image = await _decoder(bytes, job.z, job.x, job.y);
+      if (_disposed) {
+        image.dispose();
+        return _DecodeOutcome.aborted;
+      }
+      // The camera may have moved while decoding. In vector mode padding is
+      // not decode-relevant, so a former visible tile that moved into the
+      // padding ring must not publish an image or repaint.
+      if (!isTileRelevant(job.z, job.x, job.y)) {
+        image.dispose();
+        return _DecodeOutcome.aborted;
+      }
+      _complete(job.key, Tile(image, job.key, job.y, job.x));
+      return _DecodeOutcome.ok;
+    } on TileDecodeAborted {
+      // Stale work stopped itself before parse/render/toImage. Keep any
+      // bytes already fetched; this is not a failure.
+      return _DecodeOutcome.aborted;
+    } on TilePayloadException {
+      return _DecodeOutcome.corrupt;
+    } catch (_) {
+      return _DecodeOutcome.error;
+    }
+  }
+
+  Future<void> _fetchBytesAndDecode(_LoadJob job) async {
+    final resource = job.resourceKey;
+    late final Uint8List bytes;
+    try {
+      bytes = await _fetchResource(job);
+    } catch (_) {
+      _markFailed(job);
+      return;
+    }
+    if (_disposed) return;
+
+    final outcome = await _tryDecode(job, bytes);
+    if (outcome == _DecodeOutcome.corrupt) {
+      // A malformed network response must not be persisted. Drop any
+      // byte-cache copy and back off; the retry refetches.
+      _removeFromByteCache(resource);
+      _markFailed(job);
+      return;
+    }
+    // Success, an aborted stale decode, or a non-payload decode error all
+    // have bytes worth keeping; store once per resource (shared by every
+    // over-zoom sibling).
+    _ensureBytesCached(resource, bytes);
+    _persistResource(job, bytes);
+    if (outcome == _DecodeOutcome.error) {
+      // Keep valid payloads so retries decode from cache instead of
+      // refetching bytes the decoder only failed on for another reason.
+      _markFailed(job);
+    }
+  }
+
+  /// Fetches compressed bytes for an off-screen padding or adjacent-zoom
+  /// tile without decoding. If the tile scrolled into view while fetching,
+  /// it is decoded immediately through the same recovery path as a
+  /// foreground job instead of waiting for the next [calculate].
+  Future<void> _fetchBytesOnly(_LoadJob job) async {
+    final resource = job.resourceKey;
+    late final Uint8List bytes;
+    try {
+      bytes = _byteCache[resource] ??
+          (hasStoredTile(resource) ? cachedTileBytes(resource) : null) ??
+          await _fetchResource(job);
+    } catch (_) {
+      _markFailed(job);
+      return;
+    }
+    if (_disposed) return;
+
+    // Still off-screen: cache the bytes without spending a decode. They are
+    // validated only when the tile actually enters the viewport.
+    if (!isTileRelevant(job.z, job.x, job.y)) {
+      _ensureBytesCached(resource, bytes);
+      _persistResource(job, bytes);
+      return;
+    }
+
+    // The tile scrolled into view while preloading: decode now and, on a
+    // corrupt payload, invalidate the persistent entry and refetch once.
+    final foreground = _foregroundJob(job);
+    _registerLatestJob(foreground);
+    final outcome = await _tryDecode(foreground, bytes);
+    if (outcome == _DecodeOutcome.corrupt) {
+      _removeFromByteCache(resource);
+      await _deleteStored(resource);
+      await _fetchBytesAndDecode(foreground);
+      return;
+    }
+    _ensureBytesCached(resource, bytes);
+    _persistResource(foreground, bytes);
+    if (outcome == _DecodeOutcome.error) _markFailed(foreground);
+  }
+
+  /// Stores [bytes] under [resource] only when it is not already present, so
+  /// a resource shared by many logical slots produces one memory insertion.
+  void _ensureBytesCached(String resource, Uint8List bytes) {
+    if (_byteCache.containsKey(resource)) return;
+    _storeInByteCache(resource, bytes);
+  }
+
+  /// Schedules one persistent write per resource, regardless of how many
+  /// logical slots share it. The bookkeeping set is bounded; resetting it can
+  /// cause a rare duplicate write but never a missing one.
+  void _persistResource(_LoadJob job, Uint8List bytes) {
+    final resource = job.resourceKey;
+    if (!_persistedResources.add(resource)) return;
+    if (_persistedResources.length > _maxPersistedResourceKeys) {
+      _persistedResources
+        ..clear()
+        ..add(resource);
+    }
+    unawaited(storeTile(resource, Tile(null, resource, job.y, job.x), bytes));
+  }
+
+  /// Fetches the shared source bytes for [job], deduplicating concurrent
+  /// requests for the same resource. Over-zoom siblings and wrapped-X
+  /// duplicates await one in-flight future instead of downloading once per
+  /// logical slot; the first caller supplies the coordinates the fetcher
+  /// resolves.
+  Future<Uint8List> _fetchResource(_LoadJob job) {
+    final resource = job.resourceKey;
+    final existing = _resourceFetches[resource];
+    if (existing != null) return existing;
+
+    // Forward through a completer so the raw fetch future always has an
+    // error handler attached; a shared failure is then delivered only to
+    // the logical slots that await this resource.
+    final completer = Completer<Uint8List>();
+    _resourceFetches[resource] = completer.future;
+    _fetchBytes(job.z, job.x, job.y).then(
+      (bytes) {
+        // Publish the bytes to the shared memory cache *before* clearing the
+        // in-flight entry. A slot enqueued while the first logical decoder is
+        // still running then reads these bytes instead of starting a
+        // duplicate request.
+        if (!_disposed) _storeInByteCache(resource, bytes);
+        _resourceFetches.remove(resource);
+        if (!completer.isCompleted) completer.complete(bytes);
+      },
+      onError: (Object error, StackTrace stack) {
+        // Drop the in-flight entry so a retry can refetch.
+        _resourceFetches.remove(resource);
+        if (!completer.isCompleted) completer.completeError(error, stack);
+      },
+    );
+    return completer.future;
+  }
+
+  /// Converts a bytes-only preload descriptor into the foreground decode
+  /// descriptor used when the tile becomes visible.
+  static _LoadJob _foregroundJob(_LoadJob job) => _LoadJob(
+        key: job.key,
+        resourceKey: job.resourceKey,
+        z: job.z,
+        x: job.x,
+        y: job.y,
+        generation: job.generation,
+        jobClass: _JobClass.visible,
+        distance: job.distance,
+        byteOnly: false,
+      );
+
+  Future<Uint8List> _fetchBytes(int z, int x, int y) {
+    if (_httpIsolate.isReady && _urlBuilder != null) {
+      // Use persistent HTTP isolate (native) — reuses TCP connections.
+      return _httpIsolate.fetchUrl(_urlBuilder!(z, x, y));
+    }
+    // Fall back to fetcher (web or custom).
+    return _fetcher(z, x, y);
   }
 
   void _complete(String key, Tile tile) {
     _inFlight.remove(key);
+    _jobsByKey.remove(key);
     if (_disposed || tile.sourceTile == null) return;
 
     _memoryCache.remove(key);
     _memoryCache[key] = tile.sourceTile!;
     _trimMemoryCache();
 
-    final i = _renderTiles.indexWhere((t) => t.index == key);
+    final i = _renderIndex(key);
     if (i == -1) return;
     if (_renderTiles[i].sourceTile != null) return;
 
     _renderTiles[i] = tile;
-    _revision++;
-    onTilesChanged?.call();
+    _contentRevision++;
+    _scheduleTileNotification();
+  }
+
+  /// Coalesces tile-completion notifications to one callback per frame.
+  ///
+  /// Completion still updates [_renderTiles] and [revision] synchronously so
+  /// an unrelated rebuild sees the new tile; only the listener callback is
+  /// deferred, so progressive arrivals cannot trigger a full map rebuild and
+  /// label collision pass per tile.
+  void _scheduleTileNotification() {
+    if (_disposed || onTilesChanged == null) return;
+    if (_tileNotificationScheduled) return;
+    _tileNotificationScheduled = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _tileNotificationScheduled = false;
+      if (_disposed) return;
+      onTilesChanged?.call();
+    });
   }
 
   // ── Adjacent zoom pre-loading (debounced, bytes-only) ───────────────
@@ -628,6 +1234,12 @@ class TileManager with CacheTiles {
       if (z >= 0 && z <= 19) zoomDeltas.add(dz);
     }
 
+    // Bound how many adjacent-zoom preloads a single run enqueues (the
+    // next idle debounce enqueues more). Without this cap a low zoom or
+    // large viewport would queue hundreds of background fetches at once.
+    var enqueued = 0;
+
+    outer:
     for (final dz in zoomDeltas) {
       final z = zoom + dz;
       // For zoom-in (dz > 0), one tile at current zoom maps to 2^dz × 2^dz tiles at target zoom.
@@ -652,132 +1264,58 @@ class TileManager with CacheTiles {
               final ty = otherY + dy;
               final key = _key(z, tx, ty);
 
-              // Skip if already cached or in-flight.
+              // Skip if already cached, in-flight, or queued. The memory
+              // cache is per slot; source bytes are per resource.
               if (_memoryCache.containsKey(key)) continue;
-              if (_byteCache.containsKey(key)) continue;
+              if (_byteCache.containsKey(_resourceKey(z, tx, ty))) continue;
               if (_inFlight.contains(key)) continue;
+              if (_queued.contains(key)) continue;
               if (ty < 0 || ty >= (1 << z)) continue;
 
-              // Don't exceed concurrent preload limit.
-              if (_activePreloads >= maxConcurrentPreloads) return;
-
+              if (enqueued >= maxConcurrentPreloads) break outer;
               _preloadTile(key, z, tx, ty);
+              enqueued++;
             }
           }
         }
       }
     }
+
+    _pumpLoadQueue();
   }
 
-  /// Fetches compressed bytes for an off-screen padding tile without
-  /// decoding, used in vector mode ([byteOnlyPadding]). The bytes land
-  /// in [_byteCache] so the next [calculate] that brings this tile into
-  /// the visible area decodes it instantly via [_decodeFromByteCache].
+  /// Enqueues a background, bytes-only preload for an adjacent-zoom tile.
   ///
-  /// Unlike [_preloadTile], this never decodes and never notifies
-  /// [onTilesChanged] — a padding tile completing must not trigger a
-  /// repaint. It shares the [_activePreloads]/[maxConcurrentPreloads]
-  /// gate with adjacent-zoom preloads so the total background fetch
-  /// concurrency stays bounded and never competes with visible fetches.
-  void _scheduleByteOnlyPreload(String key, int z, int x, int y) {
-    final n = 1 << z;
-    if (y < 0 || y >= n) return;
-    if (_inFlight.contains(key)) return;
-    if (_byteCache.containsKey(key) || _memoryCache.containsKey(key)) return;
-    if (_activePreloads >= maxConcurrentPreloads) return;
-
-    final failedUntil = _failedUntil[key];
-    if (failedUntil != null && DateTime.now().isBefore(failedUntil)) return;
-
-    _inFlight.add(key);
-    _activePreloads++;
-
-    () async {
-      Uint8List? bytes;
-      try {
-        if (hasStoredTile(key)) {
-          final cached = cachedTileBytes(key);
-          if (cached != null) bytes = cached;
-        }
-        bytes ??= (_httpIsolate.isReady && _urlBuilder != null)
-            ? await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y))
-            : await _fetcher(z, x, y);
-      } catch (_) {
-        _inFlight.remove(key);
-        _activePreloads--;
-        _failedUntil[key] = DateTime.now().add(failureBackoff);
-        return;
-      }
-      if (_disposed) {
-        _inFlight.remove(key);
-        _activePreloads--;
-        return;
-      }
-      _storeInByteCache(key, bytes);
-      unawaited(storeTile(key, Tile(null, key, y, x), bytes));
-      _inFlight.remove(key);
-      _activePreloads--;
-      // Deliberately no decode and no onTilesChanged notification: an
-      // off-screen padding tile appearing in the byte cache is not a
-      // visible change. The next calculate() will decode on demand.
-    }();
-  }
-
-  /// Pre-loads a single tile.
-  ///
-  /// On native: fetches via the background isolate (persistent HttpClient,
-  /// TCP connection reuse). On web: falls back to the regular [_fetcher]
-  /// (browser fetch API with automatic connection pooling).
-  ///
-  /// Only stores compressed PNG bytes — no image decoding. When a pre-loaded
-  /// tile becomes visible, [_scheduleLoad] finds the bytes in [_byteCache]
-  /// and decodes on-demand.
+  /// Preloads never decode and never notify [onTilesChanged] — they only
+  /// populate the byte/disk cache so a later zoom decodes instantly. The
+  /// scheduler gives preloads the lowest priority and holds them back
+  /// while any visible work is queued or active.
   void _preloadTile(String key, int z, int x, int y) {
-    if (_inFlight.contains(key)) return;
-    _inFlight.add(key);
-    _activePreloads++;
+    _enqueueJob(_LoadJob(
+      key: key,
+      resourceKey: _resourceKey(z, x, y),
+      z: z,
+      x: x,
+      y: y,
+      generation: _generation,
+      jobClass: _JobClass.adjacentZoom,
+      distance: 0,
+      byteOnly: true,
+    ));
+  }
 
-    () async {
-      Uint8List? bytes;
-      try {
-        // Check Hive disk cache first (synchronous check).
-        if (hasStoredTile(key)) {
-          final cached = cachedTileBytes(key);
-          if (cached != null) {
-            bytes = cached;
-          }
-        }
+  // ── Relevance helpers ───────────────────────────────────────────────
 
-        // Fetch bytes — via the persistent HTTP isolate when available
-        // (native, reuses TCP connections), otherwise fall back to the
-        // regular fetcher (web uses browser fetch API).
-        bytes ??= (_httpIsolate.isReady && _urlBuilder != null)
-            ? await _httpIsolate.fetchUrl(_urlBuilder!(z, x, y))
-            : await _fetcher(z, x, y);
-      } catch (_) {
-        _inFlight.remove(key);
-        _activePreloads--;
-        _failedUntil[key] = DateTime.now().add(failureBackoff);
-        return;
-      }
+  /// Whether [y] is a real world row at [z]. Off-world padding rows can
+  /// never load and must never block readiness or be scheduled.
+  bool _isValidWorld(int z, int y) => y >= 0 && y < (1 << z);
 
-      // Store compressed bytes (no decode).
-      _storeInByteCache(key, bytes);
+  int _renderIndex(String key) =>
+      _renderTiles.indexWhere((t) => t.index == key);
 
-      // Persist to Hive disk cache (fire and forget).
-      unawaited(storeTile(key, Tile(null, key, y, x), bytes));
-
-      _inFlight.remove(key);
-      _activePreloads--;
-
-      // If the tile is currently visible, decode it immediately
-      // instead of waiting for the next calculate() call.
-      final renderIndex = _renderTiles.indexWhere((t) => t.index == key);
-      if (renderIndex != -1 && _renderTiles[renderIndex].sourceTile == null) {
-        _inFlight.add(key);
-        _decodeFromByteCache(key, bytes, z, x, y);
-      }
-    }();
+  void _removeFromByteCache(String key) {
+    final old = _byteCache.remove(key);
+    if (old != null) _byteCacheSize -= old.length;
   }
 
   // ── Byte cache management ───────────────────────────────────────────
@@ -812,19 +1350,150 @@ class TileManager with CacheTiles {
 
   // ── Helpers ─────────────────────────────────────────────────────────
 
-  /// Namespaced cache key — `z/x/y` for raster, `style/z/x/y` in vector
-  /// mode so entries from different styles coexist in the caches.
+  /// Namespaced slot key — the rendered-image identity (`z/x/y`, or
+  /// `style/z/x/y` in vector mode). Each logical slot keeps its own image
+  /// because over-zoom children render different sub-rects.
   String _key(int z, int x, int y) =>
       cacheNamespace.isEmpty ? '$z/$x/$y' : '$cacheNamespace/$z/$x/$y';
 
+  /// Canonical source identity of the logical tile at [z]/[x]/[y].
+  ///
+  /// Source bytes (network, byte cache, disk) are keyed by this instead of
+  /// the slot key so wrapped-X duplicates and over-zoom siblings share one
+  /// download and one stored record. It is prefixed with [cacheNamespace]
+  /// so a source record never leaks across styles.
+  String _resourceKey(int z, int x, int y) {
+    final String raw;
+    final builder = _resourceKeyBuilder;
+    if (builder != null) {
+      // Vector sources provide an opaque source-id + resolved coordinate.
+      raw = builder(z, x, y);
+    } else if (_urlBuilder != null) {
+      // Never persist the raw URL: a query string can carry an API token.
+      // A digest of the credential-free URL keeps the resource identity
+      // public while still invalidating when scheme/host/path changes.
+      raw = _digestUrl(_urlBuilder!(z, x, y));
+    } else {
+      // Opaque coordinate identity: wraps X so antimeridian duplicates share,
+      // without encoding any URL.
+      raw = '$z/${_wrapX(z, x)}/$y';
+    }
+    return cacheNamespace.isEmpty ? raw : '$cacheNamespace|$raw';
+  }
+
+  /// Exposes the canonical resource key for tests.
+  @visibleForTesting
+  String resourceKeyFor(int z, int x, int y) => _resourceKey(z, x, y);
+
+  static int _wrapX(int z, int x) {
+    final n = 1 << z;
+    return ((x % n) + n) % n;
+  }
+
+  /// Stable digest of the public part of [url] (scheme, host, port, path).
+  /// Userinfo, query and fragment are dropped so credentials/tokens never
+  /// become persistent keys.
+  static String _digestUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri == null) return 'u${url.hashCode.toRadixString(16)}';
+    final public = Uri(
+      scheme: uri.scheme,
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+      path: uri.path,
+    ).toString();
+    return 'u${_fnv1a64(public)}';
+  }
+
+  static String _fnv1a64(String value) {
+    var hash = 0xcbf29ce484222325;
+    for (final byte in utf8.encode(value)) {
+      hash ^= byte;
+      hash = (hash * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+    }
+    return hash.toRadixString(16).padLeft(16, '0');
+  }
+
   static String tileKey(int z, int x, int y) => '$z/$x/$y';
 
-  /// Raster default decoder: the bytes are an encoded image.
+  /// Raster default decoder: the bytes are an encoded image. A codec failure
+  /// means the payload is malformed, so it is reported as
+  /// [TilePayloadException] for the caller to invalidate and refetch.
   static Future<ui.Image> _decodeRasterTile(
     Uint8List bytes,
     int z,
     int x,
     int y,
-  ) =>
-      Tile.decodeImage(bytes);
+  ) async {
+    try {
+      return await Tile.decodeImage(bytes);
+    } catch (error) {
+      throw TilePayloadException('$error');
+    }
+  }
+}
+
+/// Result of attempting to decode a job's bytes.
+enum _DecodeOutcome {
+  /// Decoded and published.
+  ok,
+
+  /// The tile went stale before publishing. Bytes are valid and retained.
+  aborted,
+
+  /// The decoder reported [TilePayloadException]: these bytes are malformed
+  /// and must be invalidated and refetched.
+  corrupt,
+
+  /// The decoder threw for a reason unrelated to the payload
+  /// (style/render/runtime). Keep the bytes and retry after backoff.
+  error,
+}
+
+/// Priority class for a scheduled load. Lower index wins within the same
+/// camera generation.
+enum _JobClass {
+  /// Strict-viewport tile that must decode to be displayed.
+  visible,
+
+  /// Off-screen padding ring (decoded in raster mode, bytes-only in
+  /// vector mode).
+  padding,
+
+  /// Adjacent zoom level preload (bytes only).
+  adjacentZoom,
+}
+
+/// A unit of tile loading work. Carries the camera [generation] that
+/// requested it and the [jobClass]/[distance] used for priority ordering.
+class _LoadJob {
+  /// Logical slot key — rendered-image identity.
+  final String key;
+
+  /// Canonical source identity shared with sibling slots.
+  final String resourceKey;
+
+  final int z;
+  final int x;
+  final int y;
+  final int generation;
+  final _JobClass jobClass;
+
+  /// Squared distance from the viewport center (ordering only).
+  final double distance;
+
+  /// When `true`, only source bytes are fetched — no decode.
+  final bool byteOnly;
+
+  const _LoadJob({
+    required this.key,
+    required this.resourceKey,
+    required this.z,
+    required this.x,
+    required this.y,
+    required this.generation,
+    required this.jobClass,
+    required this.distance,
+    required this.byteOnly,
+  });
 }
