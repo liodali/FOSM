@@ -2,9 +2,11 @@ import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart' show TextPainter, TextSpan, TextStyle;
 
 import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/api/tile_source.dart' show TileDecodeAborted;
 import 'package:fosm/src/vector/mvt/vector_tile.dart';
 import 'package:fosm/src/vector/style/expression.dart';
 import 'package:fosm/src/vector/style/map_style.dart';
@@ -35,12 +37,20 @@ class LabelOverlay {
   /// Roads typically need ~200-300px gaps to avoid clutter.
   static const double _lineLabelSpacing = 250.0;
 
-  /// Prepared labels keyed by tile index + zoom (stable across pans).
+  /// Prepared labels keyed by `zoom/x/y` (stable across pans).
   /// Preserved across tile-arrival rebuilds because the overlay is owned
   /// for the lifetime of the runtime — see [VectorTileRuntime.labelOverlay].
   final LinkedHashMap<String, List<_PreparedLabel>> _prepared = LinkedHashMap();
 
   bool _disposed = false;
+
+  /// Number of tiles with cached prepared labels (test hook).
+  @visibleForTesting
+  int get preparedTileCount => _prepared.length;
+
+  /// Forces the next [prepare] call to throw, to test lifecycle cleanup.
+  @visibleForTesting
+  bool debugFailNextPrepare = false;
 
   /// Releases all cached text/halo painters and clears prepared labels.
   /// Called once from [VectorTileRuntime.dispose]; the overlay must not
@@ -94,7 +104,7 @@ class LabelOverlay {
         continue;
       }
 
-      final labels = _labelsFor(tile.index, zoom, x, y, parsed);
+      final labels = _labelsFor(zoom, x, y, parsed);
       for (final label in labels) {
         if (drawn >= maxLabelsPerFrame) break;
         if (!seenSymbols.add(label.dedupeKey)) continue;
@@ -202,14 +212,171 @@ class LabelOverlay {
     );
   }
 
+  /// Scans a display-eligible parsed tile's symbol features and lays out its
+  /// text/halo painters ahead of the next paint.
+  ///
+  /// Feature scanning, style expression evaluation, line sampling and
+  /// `TextPainter.layout()` all run here, cooperatively yielding every
+  /// [yieldBudget] so a dense symbol tile never blocks a frame. [paint] then
+  /// only runs viewport collision and drawing for cached tiles.
+  ///
+  /// [isRelevant] is checked between batches; when it returns false (or the
+  /// overlay has been disposed) preparation aborts with [TileDecodeAborted]
+  /// so the caller can discard a now-stale tile.
+  ///
+  /// Idempotent: a second call for the same tile is a cache hit.
+  Future<void> prepare(
+    int zoom,
+    int x,
+    int y, {
+    bool Function()? isRelevant,
+    Duration yieldBudget = const Duration(milliseconds: 4),
+    Future<void> Function()? yieldControl,
+  }) async {
+    if (_disposed) return;
+    if (debugFailNextPrepare) {
+      debugFailNextPrepare = false;
+      throw StateError('debug: label preparation failure');
+    }
+    final parsed = runtime.parsedTileFor(zoom, x, y);
+    if (parsed == null) return;
+
+    final key = '$zoom/$x/$y';
+    final cached = _prepared.remove(key);
+    if (cached != null) {
+      _prepared[key] = cached; // refresh LRU
+      await _layOutLabels(
+        cached,
+        isRelevant: isRelevant,
+        yieldBudget: yieldBudget,
+        yieldControl: yieldControl,
+      );
+      return;
+    }
+
+    final labels = <_PreparedLabel>[];
+    try {
+      await _buildLabels(
+        labels,
+        zoom,
+        x,
+        y,
+        parsed,
+        isRelevant: isRelevant,
+        yieldBudget: yieldBudget,
+        yieldControl: yieldControl,
+      );
+    } catch (_) {
+      // Nothing is cached yet; dispose the partial batch and let the caller
+      // invalidate the tile.
+      for (final label in labels) {
+        label.dispose();
+      }
+      rethrow;
+    }
+    _storePrepared(key, labels);
+    await _layOutLabels(
+      labels,
+      isRelevant: isRelevant,
+      yieldBudget: yieldBudget,
+      yieldControl: yieldControl,
+    );
+  }
+
+  /// Builds [labels] for one tile, yielding every [yieldBudget].
+  Future<void> _buildLabels(
+    List<_PreparedLabel> labels,
+    int zoom,
+    int tileX,
+    int tileY,
+    ParsedVectorTile parsed, {
+    bool Function()? isRelevant,
+    required Duration yieldBudget,
+    Future<void> Function()? yieldControl,
+  }) async {
+    final style = runtime.loaded.style;
+    final stopwatch = Stopwatch()..start();
+
+    for (final layer in style.layers) {
+      if (_stale(isRelevant)) throw const TileDecodeAborted();
+      if (layer.type != StyleLayerType.symbol || !layer.isVisible) continue;
+      if (zoom < layer.minZoom || zoom > layer.maxZoom) continue;
+      final sourceLayer = layer.sourceLayer;
+      if (sourceLayer == null) continue;
+      final data = parsed.decoded.layerByName(sourceLayer);
+      if (data == null) continue;
+
+      final transform = TileTransform.forLayer(
+        z: zoom,
+        x: tileX,
+        y: tileY,
+        srcZ: parsed.srcZ,
+        extent: data.extent,
+      );
+      final isLineLayer = _isLineLayer(layer, zoom);
+
+      for (final feature in data.features) {
+        if (_stale(isRelevant)) throw const TileDecodeAborted();
+        _appendFeatureLabels(
+          labels,
+          layer,
+          feature,
+          transform,
+          isLineLayer,
+          zoom,
+        );
+        await _maybeYield(stopwatch, yieldBudget, yieldControl);
+      }
+    }
+  }
+
+  /// Lays out text/halo painters, yielding every [yieldBudget].
+  Future<void> _layOutLabels(
+    List<_PreparedLabel> labels, {
+    bool Function()? isRelevant,
+    required Duration yieldBudget,
+    Future<void> Function()? yieldControl,
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    for (final label in labels) {
+      if (_stale(isRelevant)) throw const TileDecodeAborted();
+      if (label.text != null) {
+        label.painter();
+        if (label.haloWidth > 0) label.haloPainter();
+      }
+      await _maybeYield(stopwatch, yieldBudget, yieldControl);
+    }
+  }
+
+  bool _stale(bool Function()? isRelevant) {
+    if (_disposed) return true;
+    final check = isRelevant;
+    return check != null && !check();
+  }
+
+  Future<void> _maybeYield(
+    Stopwatch stopwatch,
+    Duration budget,
+    Future<void> Function()? yieldControl,
+  ) async {
+    if (stopwatch.elapsed < budget) return;
+    stopwatch.reset();
+    if (yieldControl != null) {
+      await yieldControl();
+    } else {
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  /// Synchronous fallback used by [paint] for tiles that were not prepared
+  /// ahead of time. Its result is cached for later frames.
   List<_PreparedLabel> _labelsFor(
-    String tileIndex,
     int zoom,
     int tileX,
     int tileY,
     ParsedVectorTile parsed,
   ) {
-    final key = '$tileIndex@$zoom';
+    final key = '$zoom/$tileX/$tileY';
     final hit = _prepared.remove(key);
     if (hit != null) {
       _prepared[key] = hit;
@@ -234,110 +401,134 @@ class LabelOverlay {
         srcZ: parsed.srcZ,
         extent: data.extent,
       );
-
-      // Determine if this layer uses line placement. Liberty uses
-      // ["step", ["zoom"], "point", N, "line"] for shields, plus
-      // plain "line" for road/water names.
-      final placementExpr = layer.layout['symbol-placement'];
-      final isLineLayer = placementExpr == 'line' ||
-          (placementExpr is List &&
-              evaluateStringExpr(
-                      placementExpr,
-                      EvaluationContext(
-                        zoom: zoom.toDouble(),
-                        properties: null,
-                      )) ==
-                  'line');
+      final isLineLayer = _isLineLayer(layer, zoom);
 
       for (final feature in data.features) {
-        if (feature.geometry.isEmpty || feature.geometry.first.length < 2) {
-          continue;
-        }
-        final ctx = EvaluationContext(
-          zoom: zoom.toDouble(),
-          properties: feature.properties,
+        _appendFeatureLabels(
+          labels,
+          layer,
+          feature,
+          transform,
+          isLineLayer,
+          zoom,
         );
-        if (!matchesFilter(layer.filter, ctx)) continue;
-
-        final text = _resolveText(layer, ctx);
-        final icon = _resolveIcon(layer, ctx);
-        if (text == null && icon == null) continue;
-
-        final fontSize = evaluateNumExpr(
-          layer.layout['text-size'],
-          ctx,
-          fallback: 16,
-          min: 6,
-          max: 64,
-        );
-        final color = evaluateColorExpr(layer.paint['text-color'], ctx) ??
-            const ui.Color(0xFF000000);
-        final haloColor =
-            evaluateColorExpr(layer.paint['text-halo-color'], ctx);
-        final haloWidth = evaluateNumExpr(
-          layer.paint['text-halo-width'],
-          ctx,
-          fallback: 0,
-          min: 0,
-          max: 8,
-        );
-        final letterSpacing = evaluateNumExpr(
-          layer.layout['text-letter-spacing'],
-          ctx,
-          fallback: 0,
-        );
-        final anchor =
-            evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
-        final offsetDx = _offsetEms(layer, ctx, 0);
-        final offsetDy = _offsetEms(layer, ctx, 1);
-        final iconSize = evaluateNumExpr(
-          layer.layout['icon-size'],
-          ctx,
-          fallback: 1,
-          min: 0.5,
-          max: 4,
-        );
-
-        if (isLineLayer && feature.geomType == MvtGeomType.lineString) {
-          // Line label: sample placements along the geometry.
-          _addLineLabels(
-            labels,
-            layer.id,
-            feature,
-            transform,
-            text: text,
-            icon: icon,
-            fontSize: fontSize,
-            color: color,
-            haloColor: haloColor,
-            haloWidth: haloWidth,
-            letterSpacing: letterSpacing,
-            iconSize: iconSize,
-          );
-        } else {
-          // Point label: place at the first coordinate.
-          final first = feature.geometry.first;
-          labels.add(_PreparedLabel(
-            text: text,
-            icon: icon,
-            dedupeKey:
-                '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
-            localX: transform.x(first[0]),
-            localY: transform.y(first[1]),
-            fontSize: fontSize,
-            color: color,
-            haloColor: haloColor,
-            haloWidth: haloWidth,
-            letterSpacing: letterSpacing,
-            anchor: anchor,
-            offsetDx: offsetDx,
-            offsetDy: offsetDy,
-            iconSize: iconSize,
-          ));
-        }
       }
     }
 
+    _storePrepared(key, labels);
+    return labels;
+  }
+
+  /// Whether [layer] places its symbols along line geometry. Liberty uses
+  /// `["step", ["zoom"], "point", N, "line"]` for shields, plus plain
+  /// `"line"` for road/water names.
+  bool _isLineLayer(StyleLayer layer, int zoom) {
+    final placementExpr = layer.layout['symbol-placement'];
+    return placementExpr == 'line' ||
+        (placementExpr is List &&
+            evaluateStringExpr(
+                    placementExpr,
+                    EvaluationContext(
+                      zoom: zoom.toDouble(),
+                      properties: null,
+                    )) ==
+                'line');
+  }
+
+  void _appendFeatureLabels(
+    List<_PreparedLabel> labels,
+    StyleLayer layer,
+    DecodedFeature feature,
+    TileTransform transform,
+    bool isLineLayer,
+    int zoom,
+  ) {
+    if (feature.geometry.isEmpty || feature.geometry.first.length < 2) {
+      return;
+    }
+    final ctx = EvaluationContext(
+      zoom: zoom.toDouble(),
+      properties: feature.properties,
+    );
+    if (!matchesFilter(layer.filter, ctx)) return;
+
+    final text = _resolveText(layer, ctx);
+    final icon = _resolveIcon(layer, ctx);
+    if (text == null && icon == null) return;
+
+    final fontSize = evaluateNumExpr(
+      layer.layout['text-size'],
+      ctx,
+      fallback: 16,
+      min: 6,
+      max: 64,
+    );
+    final color = evaluateColorExpr(layer.paint['text-color'], ctx) ??
+        const ui.Color(0xFF000000);
+    final haloColor = evaluateColorExpr(layer.paint['text-halo-color'], ctx);
+    final haloWidth = evaluateNumExpr(
+      layer.paint['text-halo-width'],
+      ctx,
+      fallback: 0,
+      min: 0,
+      max: 8,
+    );
+    final letterSpacing = evaluateNumExpr(
+      layer.layout['text-letter-spacing'],
+      ctx,
+      fallback: 0,
+    );
+    final anchor =
+        evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
+    final offsetDx = _offsetEms(layer, ctx, 0);
+    final offsetDy = _offsetEms(layer, ctx, 1);
+    final iconSize = evaluateNumExpr(
+      layer.layout['icon-size'],
+      ctx,
+      fallback: 1,
+      min: 0.5,
+      max: 4,
+    );
+
+    if (isLineLayer && feature.geomType == MvtGeomType.lineString) {
+      // Line label: sample placements along the geometry.
+      _addLineLabels(
+        labels,
+        layer.id,
+        feature,
+        transform,
+        text: text,
+        icon: icon,
+        fontSize: fontSize,
+        color: color,
+        haloColor: haloColor,
+        haloWidth: haloWidth,
+        letterSpacing: letterSpacing,
+        iconSize: iconSize,
+      );
+    } else {
+      // Point label: place at the first coordinate.
+      final first = feature.geometry.first;
+      labels.add(_PreparedLabel(
+        text: text,
+        icon: icon,
+        dedupeKey: '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
+        localX: transform.x(first[0]),
+        localY: transform.y(first[1]),
+        fontSize: fontSize,
+        color: color,
+        haloColor: haloColor,
+        haloWidth: haloWidth,
+        letterSpacing: letterSpacing,
+        anchor: anchor,
+        offsetDx: offsetDx,
+        offsetDy: offsetDy,
+        iconSize: iconSize,
+      ));
+    }
+  }
+
+  void _storePrepared(String key, List<_PreparedLabel> labels) {
     _prepared[key] = labels;
     while (_prepared.length > _maxPreparedTiles) {
       final evicted = _prepared.remove(_prepared.keys.first);
@@ -345,7 +536,6 @@ class LabelOverlay {
         label.dispose();
       }
     }
-    return labels;
   }
 
   String? _resolveText(StyleLayer layer, EvaluationContext ctx) {

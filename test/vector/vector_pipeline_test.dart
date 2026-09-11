@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/api/tile_source.dart' show TileDecodeAborted;
 import 'package:fosm/src/vector/mvt/vector_tile.dart';
 import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
@@ -85,6 +86,27 @@ Uint8List buildHalfWaterTile() {
           tags: const [0, 0],
           geometryCommands: pointCommands(1024, 2048),
         ),
+      ],
+    );
+  return builder.build();
+}
+
+/// A water layer with many point features so the symbol layer produces a
+/// dense label set for preparation tests.
+Uint8List buildDenseLabelTile({int count = 40}) {
+  final builder = MvtBuilder()
+    ..addLayer(
+      name: 'water',
+      keys: const ['class'],
+      values: const ['ocean'],
+      features: [
+        for (var i = 1; i <= count; i++)
+          TestFeature(
+            id: i,
+            type: TestGeomType.point,
+            tags: const [0, 0],
+            geometryCommands: pointCommands(100 + i * 90, 200 + (i % 10) * 300),
+          ),
       ],
     );
   return builder.build();
@@ -349,6 +371,154 @@ void main() {
 
       manager.dispose();
       runtime.dispose();
+    });
+
+    testWidgets('over-zoom siblings fetch one source, render distinct images',
+        (tester) async {
+      final tileBytes = buildHalfWaterTile();
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'overzoom-fetch',
+        parseOffThread: false,
+      );
+
+      var fetches = 0;
+      final manager = TileManager.init(
+        width: 512,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 13,
+        fetcher: (z, x, y) async {
+          fetches++;
+          return tileBytes;
+        },
+        decoder: runtime.decoder,
+        // Over-zoom resolution is the canonical source identity.
+        resourceKeyBuilder: (z, x, y) =>
+            runtime.vectorSource.resolve(z, x, y).toString(),
+        cacheNamespace: runtime.namespace,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+      addTearDown(runtime.dispose);
+
+      // Run the whole load inside runAsync: the vector renderer yields on
+      // real timers between layers, so a fake-async zone would stall it.
+      await tester.runAsync(() async {
+        manager.setCenterFromTileCoords(7, 4);
+        manager.calculate();
+        final timeout = Stopwatch()..start();
+        while (!manager.visibleTilesReady &&
+            timeout.elapsed < const Duration(seconds: 5)) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+      });
+      await tester.pump();
+
+      // Four logical z13 slots, only two z12 source resources.
+      expect(manager.renderTiles.length, 4);
+      for (final tile in manager.renderTiles) {
+        expect(tile.sourceTile, isNotNull, reason: '${tile.index} rendered');
+      }
+      expect(fetches, 2,
+          reason: 'over-zoom siblings must share one source download');
+      expect(manager.renderTiles.map((t) => t.sourceTile).toSet().length, 4,
+          reason: 'each logical slot keeps its own rendered image');
+    });
+  });
+
+  group('Label preparation', () {
+    VectorTileRuntime makeRuntime(String namespace) => VectorTileRuntime(
+          loaded: buildLoadedStyle(),
+          namespace: namespace,
+          parseOffThread: false,
+        );
+
+    testWidgets('preparation completes before the decoder publishes',
+        (tester) async {
+      final runtime = makeRuntime('label-prep');
+      addTearDown(runtime.dispose);
+      final overlay = runtime.labelOverlay;
+      expect(overlay.preparedTileCount, 0);
+
+      final image = await tester
+          .runAsync(() => runtime.decoder(buildDenseLabelTile(), 12, 3, 2));
+      image?.dispose();
+
+      expect(overlay.preparedTileCount, greaterThan(0),
+          reason: 'labels must be prepared before the tile is returned');
+    });
+
+    testWidgets('preparation yields cooperatively under a dense tile',
+        (tester) async {
+      final runtime = makeRuntime('label-yield');
+      addTearDown(runtime.dispose);
+
+      // Decode first so the parsed tile is available to the overlay.
+      final image = await tester
+          .runAsync(() => runtime.decoder(buildDenseLabelTile(), 12, 3, 2));
+      image?.dispose();
+
+      var yields = 0;
+      await tester.runAsync(() => runtime.labelOverlay.prepare(
+            12,
+            3,
+            2,
+            yieldBudget: Duration.zero,
+            yieldControl: () async {
+              yields++;
+            },
+          ));
+      expect(yields, greaterThan(0),
+          reason: 'a dense symbol tile must yield between batches');
+    });
+
+    testWidgets('preparation aborts when the tile becomes stale',
+        (tester) async {
+      final runtime = makeRuntime('label-stale');
+      addTearDown(runtime.dispose);
+
+      final image = await tester
+          .runAsync(() => runtime.decoder(buildDenseLabelTile(), 12, 3, 2));
+      image?.dispose();
+
+      Object? error;
+      await tester.runAsync(() async {
+        try {
+          await runtime.labelOverlay.prepare(
+            12,
+            3,
+            2,
+            isRelevant: () => false,
+            yieldBudget: Duration.zero,
+          );
+        } catch (e) {
+          error = e;
+        }
+      });
+      expect(error, isA<TileDecodeAborted>());
+    });
+
+    testWidgets('the created image is disposed when preparation fails',
+        (tester) async {
+      final runtime = makeRuntime('label-fail');
+      addTearDown(runtime.dispose);
+
+      runtime.labelOverlay.debugFailNextPrepare = true;
+
+      Object? error;
+      await tester.runAsync(() async {
+        try {
+          final image = await runtime.decoder(buildHalfWaterTile(), 12, 3, 2);
+          image.dispose();
+        } catch (e) {
+          error = e;
+        }
+      });
+      expect(error, isA<StateError>());
+      expect(runtime.debugDisposedImages, 1,
+          reason: 'a failed preparation must not leak the snapshot image');
     });
   });
 }
