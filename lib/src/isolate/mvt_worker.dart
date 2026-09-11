@@ -17,12 +17,17 @@ Future<DecodedVectorTile> decodeMvtAsync(
   Uint8List bytes, {
   bool useIsolate = true,
   Set<String>? sourceLayers,
+  bool Function()? isRelevant,
 }) async {
   if (!useIsolate) {
     return decodeVectorTile(bytes, sourceLayers: sourceLayers);
   }
   if (kIsWeb) {
-    return decodeVectorTileAsync(bytes, sourceLayers: sourceLayers);
+    return decodeVectorTileAsync(
+      bytes,
+      sourceLayers: sourceLayers,
+      isRelevant: isRelevant,
+    );
   }
   return compute(
     decodeMvtRequest,

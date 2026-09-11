@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -519,6 +520,146 @@ void main() {
       expect(error, isA<StateError>());
       expect(runtime.debugDisposedImages, 1,
           reason: 'a failed preparation must not leak the snapshot image');
+    });
+  });
+
+  group('Latest-demand presentation lane', () {
+    testWidgets('renderAsync aborts with VectorTileCancelled when stale',
+        (tester) async {
+      final renderer = VectorTileRenderer(buildLoadedStyle());
+      final decoded = decodeVectorTile(buildHalfWaterTile());
+
+      Object? error;
+      await tester.runAsync(() async {
+        try {
+          final picture = await renderer.renderAsync(
+            decoded: decoded,
+            srcZ: 12,
+            z: 12,
+            x: 3,
+            y: 2,
+            isRelevant: () => false,
+          );
+          picture.dispose();
+        } catch (e) {
+          error = e;
+        }
+      });
+      expect(error, isA<VectorTileCancelled>());
+    });
+
+    testWidgets('the runtime bridges render cancellation to TileDecodeAborted',
+        (tester) async {
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'cancel-bridge',
+        parseOffThread: false,
+      );
+      addTearDown(runtime.dispose);
+
+      // Relevant through the parse/pre-render gates, stale once rendering
+      // (which owns its own checkpoint) starts.
+      var calls = 0;
+      runtime.isTileRelevant = (z, x, y) => calls++ < 3;
+
+      Object? error;
+      await tester.runAsync(() async {
+        try {
+          final image = await runtime.decoder(buildHalfWaterTile(), 12, 3, 2);
+          image.dispose();
+        } catch (e) {
+          error = e;
+        }
+      });
+      expect(error, isA<TileDecodeAborted>());
+    });
+
+    testWidgets('the lane runs the highest-priority waiter first',
+        (tester) async {
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'lane-priority',
+        parseOffThread: false,
+      );
+      addTearDown(runtime.dispose);
+      VectorTileRuntime.debugMaxConcurrentDecodesOverride = 1;
+      addTearDown(
+          () => VectorTileRuntime.debugMaxConcurrentDecodesOverride = null);
+
+      final priorities = <String, int>{
+        '0/0/0': 0,
+        '12/3/2': 10,
+        '12/4/2': 20,
+      };
+      runtime.tilePriority = (z, x, y) => priorities['$z/$x/$y'] ?? 0;
+
+      final firstGate = Completer<void>();
+      runtime.debugOnDecodeStarted = (z, x, y) async {
+        if (z == 0 && x == 0 && y == 0) await firstGate.future;
+      };
+
+      final bytes = buildHalfWaterTile();
+      await tester.runAsync(() async {
+        final futures = <Future<ui.Image>>[
+          runtime.decoder(bytes, 0, 0, 0),
+          runtime.decoder(bytes, 12, 3, 2),
+          runtime.decoder(bytes, 12, 4, 2),
+        ];
+        expect(runtime.debugWaiterCount, 2,
+            reason: 'the two later tiles wait behind the first');
+        firstGate.complete();
+        final images = await Future.wait(futures);
+        for (final image in images) {
+          image.dispose();
+        }
+      });
+
+      expect(runtime.debugDecodeOrder, ['0/0/0', '12/4/2', '12/3/2'],
+          reason: 'the newest/highest-priority waiter must run next');
+    });
+
+    testWidgets('a waiter that leaves the viewport is released, not run',
+        (tester) async {
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'lane-prune',
+        parseOffThread: false,
+      );
+      addTearDown(runtime.dispose);
+      VectorTileRuntime.debugMaxConcurrentDecodesOverride = 1;
+      addTearDown(
+          () => VectorTileRuntime.debugMaxConcurrentDecodesOverride = null);
+
+      final relevant = <String>{'0/0/0', '12/3/2'};
+      runtime.isTileRelevant = (z, x, y) => relevant.contains('$z/$x/$y');
+
+      final firstGate = Completer<void>();
+      runtime.debugOnDecodeStarted = (z, x, y) async {
+        if (z == 0 && x == 0 && y == 0) await firstGate.future;
+      };
+
+      final bytes = buildHalfWaterTile();
+      Object? staleError;
+      await tester.runAsync(() async {
+        final first = runtime.decoder(bytes, 0, 0, 0);
+        final stale = runtime.decoder(bytes, 12, 3, 2);
+        final staleFuture = stale
+            .then<void>((image) => image.dispose())
+            .catchError((Object error) {
+          staleError = error;
+        });
+        expect(runtime.debugWaiterCount, 1);
+
+        // The queued tile scrolls away while the first decode is running.
+        relevant.remove('12/3/2');
+        firstGate.complete();
+        (await first).dispose();
+        await staleFuture;
+      });
+
+      expect(staleError, isA<TileDecodeAborted>());
+      expect(runtime.debugDecodeOrder, ['0/0/0'],
+          reason: 'a stale waiter must never enter the lane');
     });
   });
 }

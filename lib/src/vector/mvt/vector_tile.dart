@@ -69,6 +69,16 @@ class MvtDecodeRequest {
   const MvtDecodeRequest(this.bytes, this.sourceLayers);
 }
 
+/// Thrown by the cooperative vector pipeline when the caller's relevance
+/// predicate reports that the work is no longer needed.
+///
+/// Kept as pure Dart (no `dart:ui` or networking imports) so it can be used
+/// inside the MVT isolate. The vector runtime converts it to
+/// `TileDecodeAborted` at the `TileManager` boundary.
+class VectorTileCancelled implements Exception {
+  const VectorTileCancelled();
+}
+
 /// Decodes a [MvtDecodeRequest]. Top-level so it can be passed to `compute()`.
 DecodedVectorTile decodeMvtRequest(MvtDecodeRequest request) =>
     decodeVectorTile(request.bytes, sourceLayers: request.sourceLayers);
@@ -112,15 +122,19 @@ Future<DecodedVectorTile> decodeVectorTileAsync(
   Set<String>? sourceLayers,
   Duration yieldBudget = const Duration(milliseconds: 4),
   Future<void> Function()? yieldControl,
+  bool Function()? isRelevant,
 }) async {
   final reader = ProtobufReader(bytes);
   final layers = <DecodedLayer>[];
   final budget = _DecodeBudget(
     yieldBudget,
     yieldControl ?? () => Future<void>.delayed(Duration.zero),
+    isRelevant,
   );
 
+  budget.check();
   while (reader.hasMore) {
+    budget.check();
     final tag = reader.readVarint();
     final fieldNumber = tag >> 3;
     final wireType = tag & 0x7;
@@ -133,8 +147,7 @@ Future<DecodedVectorTile> decodeVectorTileAsync(
           budget,
         ));
       }
-      final pendingYield = budget.checkpoint();
-      if (pendingYield != null && reader.hasMore) await pendingYield;
+      await budget.maybeYield();
     } else {
       reader.skipField(wireType);
     }
@@ -145,13 +158,26 @@ Future<DecodedVectorTile> decodeVectorTileAsync(
 class _DecodeBudget {
   final Duration interval;
   final Future<void> Function() yieldControl;
+  final bool Function()? isRelevant;
   final Stopwatch _stopwatch = Stopwatch()..start();
 
-  _DecodeBudget(this.interval, this.yieldControl);
+  _DecodeBudget(this.interval, this.yieldControl, this.isRelevant);
 
-  Future<void>? checkpoint() {
-    if (_stopwatch.elapsed < interval) return null;
-    return yieldControl().whenComplete(_stopwatch.reset);
+  /// Aborts with [VectorTileCancelled] when the caller reports the work is
+  /// no longer relevant.
+  void check() {
+    final check = isRelevant;
+    if (check != null && !check()) throw const VectorTileCancelled();
+  }
+
+  /// Cooperative checkpoint: yields when [interval] elapsed, then re-checks
+  /// relevance after resuming so work cancelled during the yield stops.
+  Future<void> maybeYield() async {
+    if (_stopwatch.elapsed < interval) return;
+    check();
+    await yieldControl();
+    _stopwatch.reset();
+    check();
   }
 }
 
@@ -233,7 +259,9 @@ Future<DecodedLayer> _decodeLayerAsync(
   final keys = <String>[];
   final values = <Object?>[];
 
+  budget.check();
   while (reader.hasMore) {
+    budget.check();
     final tag = reader.readVarint();
     final fieldNumber = tag >> 3;
     final wireType = tag & 0x7;
@@ -257,12 +285,12 @@ Future<DecodedLayer> _decodeLayerAsync(
         reader.skipField(wireType);
     }
 
-    final pendingYield = budget.checkpoint();
-    if (pendingYield != null && reader.hasMore) await pendingYield;
+    await budget.maybeYield();
   }
 
   final decoded = <DecodedFeature>[];
   for (final raw in features) {
+    budget.check();
     final properties = <String, Object?>{};
     for (var i = 0; i + 1 < raw.tags.length; i += 2) {
       final keyIndex = raw.tags[i];
@@ -278,8 +306,7 @@ Future<DecodedLayer> _decodeLayerAsync(
       geometry: _decodeGeometry(raw.geometry, raw.geomType),
     ));
 
-    final pendingYield = budget.checkpoint();
-    if (pendingYield != null) await pendingYield;
+    await budget.maybeYield();
   }
 
   return DecodedLayer(name: name, extent: extent, features: decoded);

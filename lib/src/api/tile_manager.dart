@@ -281,6 +281,28 @@ class TileManager with CacheTiles {
     return _renderIndex(key) != -1;
   }
 
+  /// Presentation priority for [VectorTileRuntime]'s decode lane: higher
+  /// values run first. Newer camera generations outrank older ones; within a
+  /// generation visible tiles outrank padding, and nearer-centre tiles
+  /// outrank the edge.
+  ///
+  /// Evaluated when the single presentation slot frees up, so a camera change
+  /// re-ranks work that is already queued instead of letting the old FIFO
+  /// order persist.
+  int tileDecodePriority(int z, int x, int y) {
+    final key = _key(z, x, y);
+    final visible = _visibleKeys.contains(key);
+    final inRender = _renderIndex(key) != -1;
+    final classRank = visible ? 2 : (inRender ? 1 : 0);
+    var proximity = 0;
+    if (z == zoom) {
+      final dx = (x + 0.5) - centerTileLng;
+      final dy = (y + 0.5) - centerTileLat;
+      proximity = (1000 / (1 + dx * dx + dy * dy)).round().clamp(0, 1000);
+    }
+    return _generation * 100000 + classRank * 10000 + proximity;
+  }
+
   TileManager.init({
     required this.width,
     required this.height,

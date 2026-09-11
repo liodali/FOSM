@@ -79,6 +79,11 @@ class VectorTileRenderer {
   /// Checkpoints exist between layers, features, and geometry batches so a
   /// single dense source layer cannot monopolise the UI isolate.
   ///
+  /// [isRelevant] is checked before work starts and at every cooperative
+  /// checkpoint; when it returns `false` the render aborts with
+  /// [VectorTileCancelled] so a stale camera generation stops at its next
+  /// yield instead of finishing picture recording.
+  ///
   /// [yieldBudget] and [yieldControl] are exposed for deterministic tests;
   /// production callers should use their defaults.
   Future<ui.Picture> renderAsync({
@@ -91,6 +96,7 @@ class VectorTileRenderer {
     Map<String, TileCoord> rasterCoords = const {},
     Duration yieldBudget = defaultYieldBudget,
     Future<void> Function()? yieldControl,
+    bool Function()? isRelevant,
   }) async {
     final recorder = ui.PictureRecorder();
     final canvas =
@@ -109,11 +115,22 @@ class VectorTileRenderer {
     final stopwatch = Stopwatch()..start();
     final yieldNow = yieldControl ?? () => Future<void>.delayed(Duration.zero);
 
-    Future<void>? checkpoint() {
-      if (stopwatch.elapsed < yieldBudget) return null;
-      return yieldNow().whenComplete(stopwatch.reset);
+    void check() {
+      final predicate = isRelevant;
+      if (predicate != null && !predicate()) throw const VectorTileCancelled();
     }
 
+    /// Yields when [yieldBudget] elapsed, re-checking relevance after the
+    /// resume so work cancelled during a yield stops before more CPU is spent.
+    Future<void> maybeYield() async {
+      if (stopwatch.elapsed < yieldBudget) return;
+      check();
+      await yieldNow();
+      stopwatch.reset();
+      check();
+    }
+
+    check();
     for (final layer in visible) {
       Iterable<void> chunks = const <void>[];
       switch (layer.type) {
@@ -174,11 +191,9 @@ class VectorTileRenderer {
       }
 
       for (final _ in chunks) {
-        final pendingYield = checkpoint();
-        if (pendingYield != null) await pendingYield;
+        await maybeYield();
       }
-      final pendingYield = checkpoint();
-      if (pendingYield != null) await pendingYield;
+      await maybeYield();
     }
 
     return recorder.endRecording();

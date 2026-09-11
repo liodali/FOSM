@@ -164,6 +164,71 @@ void main() {
       );
     });
 
+    test('async decoder aborts with VectorTileCancelled when stale', () async {
+      final builder = MvtBuilder()
+        ..addLayer(name: 'boundary', features: const [])
+        ..addLayer(
+          name: 'water',
+          features: [
+            TestFeature(
+              id: 7,
+              type: TestGeomType.polygon,
+              geometryCommands: polygonRingCommands(
+                const [(0, 0), (10, 0), (10, 10), (0, 10)],
+              ),
+            ),
+          ],
+        );
+      final bytes = builder.build();
+
+      Object? error;
+      try {
+        await decodeVectorTileAsync(
+          bytes,
+          yieldBudget: Duration.zero,
+          isRelevant: () => false,
+        );
+      } catch (e) {
+        error = e;
+      }
+      expect(error, isA<VectorTileCancelled>());
+    });
+
+    test('async decoder re-checks relevance after a cooperative yield',
+        () async {
+      final builder = MvtBuilder()
+        ..addLayer(name: 'boundary', features: const [])
+        ..addLayer(
+          name: 'water',
+          features: [
+            TestFeature(
+              id: 7,
+              type: TestGeomType.polygon,
+              geometryCommands: polygonRingCommands(
+                const [(0, 0), (10, 0), (10, 10), (0, 10)],
+              ),
+            ),
+          ],
+        );
+      final bytes = builder.build();
+
+      // Relevance holds for the initial check, then drops once the first
+      // layer has been processed and the budget yields.
+      var relevant = true;
+      Object? error;
+      try {
+        await decodeVectorTileAsync(
+          bytes,
+          yieldBudget: Duration.zero,
+          yieldControl: () async => relevant = false,
+          isRelevant: () => relevant,
+        );
+      } catch (e) {
+        error = e;
+      }
+      expect(error, isA<VectorTileCancelled>());
+    });
+
     test('real-world smoke: decoded tile from bytes is self-consistent', () {
       // A tile with several layers — ensure unknown layers skip cleanly.
       final builder = MvtBuilder()

@@ -100,6 +100,11 @@ class VectorTileRuntime {
   /// result lands in the parsed-tile LRU.
   final Map<TileCoord, Future<ParsedVectorTile>> _inFlightParses = {};
 
+  /// Logical `z/x/y` tiles currently awaiting each shared source parse. A
+  /// shared parse aborts only when *every* waiter has left the viewport, so
+  /// one over-zoom sibling going stale never cancels another's parse.
+  final Map<TileCoord, Set<String>> _parseRequesters = {};
+
   SpriteAtlas? sprite;
   Future<void>? _spriteLoading;
 
@@ -122,6 +127,12 @@ class VectorTileRuntime {
   /// render slot on an off-screen tile.
   bool Function(int z, int x, int y)? isTileRelevant;
 
+  /// Optional decode priority supplied by [TileManager]. Higher values are
+  /// dispatched first when the presentation lane frees up. Evaluated at
+  /// selection time, so a camera change re-ranks already-queued work
+  /// (newest generation, then visible before padding, then centre-most).
+  int Function(int z, int x, int y)? tilePriority;
+
   bool _disposed = false;
 
   /// Number of images disposed because label preparation failed after
@@ -140,8 +151,36 @@ class VectorTileRuntime {
   // a full frame. Running more than one concurrently just piles them up
   // on the event loop and freezes the UI.
   static final int maxConcurrentDecodes = kIsWeb ? 1 : 3;
+
+  /// Test override for [maxConcurrentDecodes] so the demand-aware waiter
+  /// queue can be exercised deterministically (tests run with the native
+  /// concurrency of 3 otherwise).
+  @visibleForTesting
+  static int? debugMaxConcurrentDecodesOverride;
+
+  int get _maxConcurrentDecodes =>
+      debugMaxConcurrentDecodesOverride ?? maxConcurrentDecodes;
+
   int _activeDecodes = 0;
-  final Queue<Completer<void>> _decodeWaiters = Queue();
+
+  /// Demand-aware decode waiters. When the presentation lane frees up the
+  /// highest-priority still-relevant waiter runs next; waiters whose tile
+  /// left the viewport are released immediately without touching CPU.
+  final List<_DecodeWaiter> _decodeWaiters = [];
+
+  /// Coordinates of tiles whose decode slot was acquired, in order (test
+  /// hook for verifying latest-demand ordering).
+  @visibleForTesting
+  final List<String> debugDecodeOrder = [];
+
+  /// Invoked once a decode slot is acquired, before the job runs. Tests use
+  /// it to hold the single lane open deterministically.
+  @visibleForTesting
+  Future<void> Function(int z, int x, int y)? debugOnDecodeStarted;
+
+  /// Number of tiles currently waiting for a presentation slot (test hook).
+  @visibleForTesting
+  int get debugWaiterCount => _decodeWaiters.length;
 
   /// Tile fetcher for [TileManager]: returns raw MVT bytes for a logical
   /// tile, transparently over-zooming to the source's max zoom.
@@ -165,18 +204,28 @@ class VectorTileRuntime {
 
   /// Tile decoder for [TileManager]: parses MVT bytes, caches the parsed
   /// source tile, and rasterizes the logical 256px tile image. Jobs pass
-  /// through a small concurrency gate to keep frames responsive.
-  TileDecoder get decoder =>
-      (bytes, z, x, y) => _gated(() => _decodeAndRender(bytes, z, x, y));
+  /// through a demand-aware concurrency gate to keep frames responsive.
+  TileDecoder get decoder => (bytes, z, x, y) =>
+      _gated(z, x, y, () => _decodeAndRender(bytes, z, x, y));
 
-  Future<T> _gated<T>(Future<T> Function() job) async {
-    while (_activeDecodes >= maxConcurrentDecodes && !_disposed) {
-      final waiter = Completer<void>();
-      _decodeWaiters.addLast(waiter);
-      await waiter.future;
+  Future<T> _gated<T>(int z, int x, int y, Future<T> Function() job) async {
+    while (_activeDecodes >= _maxConcurrentDecodes && !_disposed) {
+      // A tile that scrolled away while queued must not occupy the lane.
+      if (!_isRelevant(z, x, y)) throw const TileDecodeAborted();
+      _pruneStaleWaiters();
+      final waiter = _DecodeWaiter(z, x, y);
+      _decodeWaiters.add(waiter);
+      await waiter.completer.future;
+      // Released by [dispose] or [releaseNext]: if the tile went stale while
+      // waiting, drop out before spending any CPU.
+      if (!_isRelevant(z, x, y)) throw const TileDecodeAborted();
     }
+    if (_disposed) throw const TileDecodeAborted();
     _activeDecodes++;
+    if (debugDecodeOrder.length > 4096) debugDecodeOrder.clear();
+    debugDecodeOrder.add('$z/$x/$y');
     try {
+      await debugOnDecodeStarted?.call(z, x, y);
       if (kIsWeb) {
         // Yield two frames so the browser can paint between decode jobs.
         // One Duration.zero only flushes the microtask queue; a second
@@ -191,10 +240,37 @@ class VectorTileRuntime {
     }
   }
 
+  /// Releases the highest-priority still-relevant waiter, or nothing when
+  /// the queue is empty. Stale waiters are completed and discarded first.
   void _releaseNext() {
-    if (_decodeWaiters.isNotEmpty) {
-      _decodeWaiters.removeFirst().complete();
+    _pruneStaleWaiters();
+    if (_decodeWaiters.isEmpty) return;
+    var best = 0;
+    var bestPriority = _decodePriority(_decodeWaiters[0]);
+    for (var i = 1; i < _decodeWaiters.length; i++) {
+      final priority = _decodePriority(_decodeWaiters[i]);
+      if (priority > bestPriority) {
+        best = i;
+        bestPriority = priority;
+      }
     }
+    _decodeWaiters.removeAt(best).completer.complete();
+  }
+
+  /// Drops waiters whose tile is no longer relevant, releasing their futures
+  /// so the callers can unwind without running any presentation work.
+  void _pruneStaleWaiters() {
+    if (isTileRelevant == null) return;
+    _decodeWaiters.removeWhere((waiter) {
+      if (_isRelevant(waiter.z, waiter.x, waiter.y)) return false;
+      if (!waiter.completer.isCompleted) waiter.completer.complete();
+      return true;
+    });
+  }
+
+  int _decodePriority(_DecodeWaiter waiter) {
+    final priority = tilePriority;
+    return priority == null ? 0 : priority(waiter.z, waiter.x, waiter.y);
   }
 
   /// Whether the logical tile still justifies further work: not disposed
@@ -213,7 +289,19 @@ class VectorTileRuntime {
     }
   }
 
+  /// Bridges the vector pipeline's [VectorTileCancelled] to the package's
+  /// [TileDecodeAborted], which [TileManager] treats as a stale (non-failing)
+  /// outcome so bytes are retained for a later pan.
   Future<ui.Image> _decodeAndRender(
+      Uint8List bytes, int z, int x, int y) async {
+    try {
+      return await _decodeAndRenderInner(bytes, z, x, y);
+    } on VectorTileCancelled {
+      throw const TileDecodeAborted();
+    }
+  }
+
+  Future<ui.Image> _decodeAndRenderInner(
       Uint8List bytes, int z, int x, int y) async {
     if (_disposed) throw StateError('runtime disposed');
     _checkRelevant(z, x, y);
@@ -222,8 +310,8 @@ class VectorTileRuntime {
       final coord = source.resolve(z, x, y);
       final ParsedVectorTile parsed;
       try {
-        parsed =
-            _parsedTileFor(coord) ?? await _parseAndStoreDedup(bytes, coord);
+        parsed = _parsedTileFor(coord) ??
+            await _parseAndStoreDedup(bytes, coord, z, x, y);
       } on TileDecodeAborted {
         rethrow;
       } catch (error) {
@@ -289,6 +377,7 @@ class VectorTileRuntime {
         y: y,
         rasterTiles: rasterImages,
         rasterCoords: rasterCoords,
+        isRelevant: () => _isRelevant(z, x, y),
       );
       try {
         // Skip the `toImage` snapshot too if the tile went stale while
@@ -351,21 +440,52 @@ class VectorTileRuntime {
   /// parse completes, they all share one future (and one decode) instead
   /// of each spawning their own.
   Future<ParsedVectorTile> _parseAndStoreDedup(
-      Uint8List bytes, TileCoord coord) {
+      Uint8List bytes, TileCoord coord, int z, int x, int y) {
+    final requester = '$z/$x/$y';
     final existing = _inFlightParses[coord];
-    if (existing != null) return existing;
-    final future = _parseAndStore(bytes, coord);
+    if (existing != null) {
+      (_parseRequesters[coord] ??= <String>{}).add(requester);
+      return existing;
+    }
+    _parseRequesters[coord] = <String>{requester};
+    final future = _parseAndStore(
+      bytes,
+      coord,
+      isRelevant: () => _anyRequesterRelevant(coord),
+    );
     _inFlightParses[coord] = future;
     // Remove the in-flight entry once it settles so later cache misses
     // (after an LRU eviction) can parse again.
     future.whenComplete(() {
       _inFlightParses.remove(coord);
+      _parseRequesters.remove(coord);
     });
     return future;
   }
 
-  Future<ParsedVectorTile> _parseAndStore(
-      Uint8List bytes, TileCoord coord) async {
+  /// True while at least one logical tile waiting on [coord] is still
+  /// relevant. A shared parse may only abort when every waiter left the
+  /// viewport (or the runtime was disposed).
+  bool _anyRequesterRelevant(TileCoord coord) {
+    if (_disposed) return false;
+    final predicate = isTileRelevant;
+    if (predicate == null) return true;
+    final requesters = _parseRequesters[coord];
+    if (requesters == null || requesters.isEmpty) return true;
+    for (final key in requesters) {
+      final parts = key.split('/');
+      if (parts.length != 3) continue;
+      final z = int.tryParse(parts[0]);
+      final x = int.tryParse(parts[1]);
+      final y = int.tryParse(parts[2]);
+      if (z == null || x == null || y == null) continue;
+      if (predicate(z, x, y)) return true;
+    }
+    return false;
+  }
+
+  Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord,
+      {bool Function()? isRelevant}) async {
     // On native, route through the persistent MVT isolate (one long-lived
     // worker) instead of spawning a fresh `compute()` isolate per tile.
     // On web, or when parseOffThread is false (tests), decode on the
@@ -388,6 +508,7 @@ class VectorTileRuntime {
         bytes,
         useIsolate: parseOffThread,
         sourceLayers: _sourceLayers,
+        isRelevant: isRelevant,
       );
     }
     final parsed = ParsedVectorTile(decoded: decoded, srcZ: coord.z);
@@ -472,6 +593,7 @@ class VectorTileRuntime {
     _labelOverlay = null;
     _inFlightUrls.clear();
     _inFlightParses.clear();
+    _parseRequesters.clear();
     _mvtIsolate.dispose();
     _parsedTiles.clear();
     for (final image in _rasterTiles.values) {
@@ -483,7 +605,20 @@ class VectorTileRuntime {
     // Release queued decodes so their futures complete (and fail fast in
     // the disposed check) instead of hanging forever.
     while (_decodeWaiters.isNotEmpty) {
-      _decodeWaiters.removeFirst().complete();
+      final waiter = _decodeWaiters.removeAt(0);
+      if (!waiter.completer.isCompleted) waiter.completer.complete();
     }
   }
+}
+
+/// A logical tile waiting for one of the runtime's presentation slots.
+/// Carries its coordinates so priority and relevance can be evaluated when
+/// the lane frees up, not when it was queued.
+class _DecodeWaiter {
+  final int z;
+  final int x;
+  final int y;
+  final Completer<void> completer = Completer<void>();
+
+  _DecodeWaiter(this.z, this.x, this.y);
 }
