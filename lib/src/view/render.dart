@@ -158,6 +158,7 @@ class VectorLabelPainter extends CustomPainter {
     required this.revision,
     required this.zoom,
     required this.overlay,
+    super.repaint,
   });
 
   @override
@@ -176,5 +177,12 @@ class VectorLabelPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant VectorLabelPainter oldDelegate) =>
-      oldDelegate.revision != revision;
+      oldDelegate.revision != revision ||
+      oldDelegate.zoom != zoom ||
+      oldDelegate.overlay != overlay ||
+      oldDelegate.leftColumnTilesLngIndex != leftColumnTilesLngIndex ||
+      oldDelegate.topRowTilesLatIndex != topRowTilesLatIndex ||
+      oldDelegate.leftColumnTilesCanvasX != leftColumnTilesCanvasX ||
+      oldDelegate.topRowTilesCanvasY != topRowTilesCanvasY ||
+      oldDelegate.tiles != tiles;
 }

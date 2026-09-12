@@ -178,6 +178,39 @@ class TileManager with CacheTiles {
   /// [maxConcurrentBackgroundLoads].
   int _activeBackgroundLoads = 0;
 
+  // ── Presentation stage (split from resource fetching) ───────────────
+  //
+  // Resource jobs (disk/network) only acquire bytes and populate the byte
+  // cache, then hand off to this separate, bounded presentation queue. The
+  // resource permit is released as soon as bytes exist, so a new camera
+  // generation can fetch its centre tiles without waiting behind an older
+  // tile that is still rendering. Queued presentations are dropped on a
+  // camera change without discarding already-downloaded bytes.
+
+  /// Jobs that have bytes and are waiting for the decode lane.
+  final List<_PresentJob> _presentQueue = [];
+
+  /// Presentation jobs currently decoding.
+  int _activePresentations = 0;
+
+  /// Presentations run on the UI/raster budget independently of network
+  /// fetches. Kept at the visible-fetch limit so raster coverage is not
+  /// slowed; the vector runtime further gates its own lane (1 on web) and
+  /// re-orders waiters by demand.
+  static const int maxConcurrentPresentations = maxConcurrentVisibleLoads;
+
+  /// Payload-versioned corruption recovery per canonical resource. A rejected
+  /// payload keeps one shared recovery future until all presentations holding
+  /// that payload drain, so stale siblings cannot invalidate its replacement.
+  final Map<String, _CorruptResourceState> _corruptResources = {};
+
+  /// Presentations currently inside [_present], used to retire corruption
+  /// state only after no stale sibling can report the rejected payload.
+  final Set<_PresentJob> _activePresentEntries = {};
+
+  /// Stable identity token attached to each in-memory payload object.
+  final Expando<Object> _payloadVersions = Expando<Object>();
+
   /// One-shot timers that re-enqueue a failed job after [failureBackoff],
   /// so retries no longer depend on a grid-rebuilding `calculate()`.
   final Map<String, Timer> _retryTimers = {};
@@ -208,6 +241,14 @@ class TileManager with CacheTiles {
   /// Resources whose bytes have been scheduled for persistent storage, so a
   /// resource shared by several logical slots produces one Hive write.
   final Set<String> _persistedResources = {};
+
+  /// Writes currently committing. Legacy records await this exact future
+  /// before deletion instead of treating a merely scheduled write as success.
+  final Map<String, Future<bool>> _resourceWrites = {};
+
+  /// Legacy logical disk key associated with bytes in [_byteCache]. Retained
+  /// across aborts/transient decoder failures until canonical migration wins.
+  final Map<String, String> _legacyDiskKeys = {};
 
   /// Upper bound on [_persistedResources] bookkeeping before it is reset.
   /// Resetting can cause a rare duplicate write, never a missing one.
@@ -346,6 +387,8 @@ class TileManager with CacheTiles {
     _retryTimers.clear();
     _jobsByKey.clear();
     _resourceFetches.clear();
+    _resourceWrites.clear();
+    _legacyDiskKeys.clear();
     _httpIsolate.dispose();
     onTilesChanged = null;
     _renderTiles.clear();
@@ -354,8 +397,12 @@ class TileManager with CacheTiles {
     _queued.clear();
     _visibleKeys.clear();
     _failedUntil.clear();
+    _presentQueue.clear();
+    _activePresentEntries.clear();
+    _corruptResources.clear();
     _activeForegroundLoads = 0;
     _activeBackgroundLoads = 0;
+    _activePresentations = 0;
     for (final image in _memoryCache.values) {
       image.dispose();
     }
@@ -637,6 +684,7 @@ class TileManager with CacheTiles {
     // Drop queued jobs that are no longer on screen (stale after a pan or
     // zoom), then enqueue the current work and drain in priority order.
     _pruneStaleQueue();
+    _prunePresentQueue();
     for (final job in pending) {
       _enqueueJob(job);
     }
@@ -807,12 +855,18 @@ class TileManager with CacheTiles {
   }
 
   Future<void> _runJob(_LoadJob job, {required bool foreground}) async {
+    var presenting = false;
     try {
       if (_disposed) return;
       _inFlight.add(job.key);
-      await _executeJob(job);
+      // Resource stage only: acquire bytes (disk/network) or cache a
+      // bytes-only preload. The decode runs later on the presentation lane,
+      // so this permit frees as soon as the bytes exist.
+      presenting = await _acquireBytes(job);
     } finally {
-      _inFlight.remove(job.key);
+      // Keep the key in flight while a presentation is outstanding so a
+      // duplicate resource job is not started for the same slot.
+      if (!presenting) _inFlight.remove(job.key);
       if (foreground) {
         if (_activeForegroundLoads > 0) _activeForegroundLoads--;
       } else {
@@ -859,46 +913,65 @@ class TileManager with CacheTiles {
     return true;
   }
 
-  Future<void> _executeJob(_LoadJob job) async {
-    if (_disposed) return;
+  /// Resource stage: resolves compressed bytes for [job] into the byte
+  /// cache without decoding, then hands off to the presentation lane.
+  ///
+  /// Returns `true` when a presentation was scheduled (the caller keeps the
+  /// key in flight), `false` when the resource is complete, failed, or no
+  /// longer needed.
+  Future<bool> _acquireBytes(_LoadJob job) async {
+    if (_disposed) return false;
     // The tile may have scrolled off screen between queueing and starting.
-    // Adjacent-zoom preloads target tiles outside the render set on
-    // purpose, so they bypass this check.
+    // Adjacent-zoom preloads target tiles outside the render set on purpose,
+    // so they bypass this check.
     if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
-      return;
+      return false;
     }
 
     if (job.byteOnly) {
-      await _fetchBytesOnly(job);
-      return;
+      return _acquireBytesOnly(job);
     }
 
     // Source bytes live under the shared resource key; the rendered image is
     // still published per logical slot by `_complete`.
     final resource = job.resourceKey;
 
-    // 1. Byte cache hit — decode without network.
-    Uint8List? corruptBytes;
-    final cachedBytes = _byteCache[resource];
-    if (cachedBytes != null) {
-      final outcome = await _tryDecode(job, cachedBytes);
-      if (outcome == _DecodeOutcome.ok || outcome == _DecodeOutcome.aborted) {
-        return;
-      }
-      if (outcome == _DecodeOutcome.error) {
-        // The decoder failed for a reason unrelated to the bytes; keep the
-        // cached payload and back off instead of deleting it.
+    // 1. Join an existing payload-versioned recovery. Even after the shared
+    //    fetch settles, stale siblings holding the rejected bytes continue to
+    //    see this state and can neither refetch nor invalidate the replacement.
+    final corrupt = _corruptResources[resource];
+    if (corrupt != null) {
+      try {
+        final recovered = corrupt.replacementBytes ??
+            await _recoverCorruptResource(job, corrupt);
+        if (_disposed) return false;
+        return _schedulePresentation(
+          job,
+          bytes: recovered,
+          origin: _ByteOrigin.network,
+          diskKey: _legacyDiskKeys[resource],
+        );
+      } catch (_) {
         _markFailed(job);
-        return;
+        return false;
       }
-      // Corrupt payload: drop the bad entry and try the next source.
-      corruptBytes = cachedBytes;
-      _removeFromByteCache(resource);
     }
 
-    // 2. Disk cache — canonical resource key first, then the legacy logical
-    //    slot key written by older versions. A validated legacy entry is
-    //    migrated: rewritten under the resource key and then removed.
+    // 2. Byte cache hit — hand straight to the presentation lane, preserving
+    //    any legacy provenance discovered by an earlier aborted attempt.
+    final cachedBytes = _byteCache[resource];
+    if (cachedBytes != null) {
+      return _schedulePresentation(
+        job,
+        bytes: cachedBytes,
+        origin: _ByteOrigin.cached,
+        diskKey: _legacyDiskKeys[resource],
+      );
+    }
+
+    // 3. Disk cache — canonical resource key first, then the legacy logical
+    //    slot key written by older versions. A legacy record is rewritten
+    //    under the canonical key after a successful decode.
     var diskKey = resource;
     if (!hasStoredTile(diskKey)) {
       final legacy = _key(job.z, job.x, job.y);
@@ -913,46 +986,311 @@ class TileManager with CacheTiles {
       } catch (_) {
         bytes = null;
       }
-      if (_disposed) return;
+      if (_disposed) return false;
       if (bytes == null || bytes.isEmpty) {
         // Missing/corrupt persistent record — delete it and re-download.
         await _deleteStored(diskKey);
-      } else if (diskKey == resource &&
-          corruptBytes != null &&
-          listEquals(bytes, corruptBytes)) {
-        // The persistent copy is byte-identical to the byte-cache copy that
-        // already failed to decode. Invalidate it without spending a second
-        // expensive decode, then recover from the network once.
-        await _deleteStored(diskKey);
       } else {
-        final outcome = await _tryDecode(job, bytes);
-        if (outcome == _DecodeOutcome.ok || outcome == _DecodeOutcome.aborted) {
-          _ensureBytesCached(resource, bytes);
-          if (diskKey != resource) {
-            // Compatible legacy record: rewrite it under the canonical
-            // resource key and drop the old entry.
-            _persistResource(job, bytes);
-            await _deleteStored(diskKey);
-          }
-          return;
-        }
-        if (outcome == _DecodeOutcome.error) {
-          _markFailed(job);
-          return;
-        }
-        // Corrupt disk bytes: remove the bad persistent entry (and any
-        // byte-cache copy) and recover from the network.
-        corruptBytes = bytes;
-        _removeFromByteCache(resource);
-        await _deleteStored(diskKey);
+        _ensureBytesCached(resource, bytes);
+        final legacyKey = diskKey == resource ? null : diskKey;
+        if (legacyKey != null) _legacyDiskKeys[resource] = legacyKey;
+        return _schedulePresentation(
+          job,
+          bytes: bytes,
+          origin: _ByteOrigin.cached,
+          diskKey: legacyKey,
+        );
       }
     }
 
-    // 3. Network.
-    if (corruptBytes != null) {
-      _removeFromByteCache(resource);
+    // 4. Network.
+    return _fetchNetwork(job);
+  }
+
+  /// Fetches bytes from the network into the byte cache and schedules a
+  /// presentation. Bytes are not persisted until a presentation confirms
+  /// they decode, so a malformed download never reaches disk.
+  Future<bool> _fetchNetwork(_LoadJob job) async {
+    final resource = job.resourceKey;
+    late final Uint8List bytes;
+    try {
+      bytes = await _fetchResource(job);
+    } catch (_) {
+      _markFailed(job);
+      return false;
     }
-    await _fetchBytesAndDecode(job);
+    if (_disposed) return false;
+    _ensureBytesCached(resource, bytes);
+    return _schedulePresentation(
+      job,
+      bytes: bytes,
+      origin: _ByteOrigin.network,
+    );
+  }
+
+  /// Returns the one recovery fetch for [state]. The completed replacement is
+  /// retained until every presentation of [state.rejectedBytes] has drained.
+  Future<Uint8List> _recoverCorruptResource(
+    _LoadJob job,
+    _CorruptResourceState state,
+  ) {
+    final existing = state.recovery;
+    if (existing != null) return existing;
+
+    late final Future<Uint8List> future;
+    future = _fetchResource(job).then((bytes) {
+      if (!_disposed && identical(_corruptResources[job.resourceKey], state)) {
+        state.replacementBytes = bytes;
+        _storeInByteCache(job.resourceKey, bytes);
+      }
+      return bytes;
+    }, onError: (Object error, StackTrace stack) {
+      if (identical(state.recovery, future)) state.recovery = null;
+      Error.throwWithStackTrace(error, stack);
+    });
+    state.recovery = future;
+    return future;
+  }
+
+  /// Resource stage for a bytes-only preload. Off-screen bytes are cached
+  /// (and persisted) without a decode; a tile that scrolled into view while
+  /// preloading is handed to the presentation lane instead.
+  Future<bool> _acquireBytesOnly(_LoadJob job) async {
+    final resource = job.resourceKey;
+    final cached = _byteCache[resource];
+    if (cached != null) {
+      if (!isTileRelevant(job.z, job.x, job.y)) return false;
+      return _schedulePresentation(
+        _promote(job),
+        bytes: cached,
+        origin: _ByteOrigin.cached,
+      );
+    }
+
+    Uint8List? diskBytes;
+    if (hasStoredTile(resource)) {
+      try {
+        diskBytes = cachedTileBytes(resource);
+      } catch (_) {
+        diskBytes = null;
+      }
+    }
+
+    late final Uint8List bytes;
+    final _ByteOrigin origin;
+    if (diskBytes != null && diskBytes.isNotEmpty) {
+      bytes = diskBytes;
+      origin = _ByteOrigin.cached;
+    } else {
+      try {
+        bytes = await _fetchResource(job);
+      } catch (_) {
+        _markFailed(job);
+        return false;
+      }
+      if (_disposed) return false;
+      origin = _ByteOrigin.network;
+    }
+    _ensureBytesCached(resource, bytes);
+
+    // Still off-screen: cache the bytes without spending a decode.
+    if (!isTileRelevant(job.z, job.x, job.y)) {
+      unawaited(_persistResource(job, bytes));
+      return false;
+    }
+
+    // The tile scrolled into view while preloading: present it.
+    return _schedulePresentation(
+      _promote(job),
+      bytes: bytes,
+      origin: origin,
+    );
+  }
+
+  /// Promotes a bytes-only preload to the foreground decode descriptor used
+  /// when the tile becomes visible.
+  _LoadJob _promote(_LoadJob job) {
+    final foreground = _foregroundJob(job);
+    _registerLatestJob(foreground);
+    return foreground;
+  }
+
+  /// Queues [job] for the bounded presentation lane. Assumes its bytes are
+  /// already in the byte cache.
+  bool _schedulePresentation(
+    _LoadJob job, {
+    required Uint8List bytes,
+    required _ByteOrigin origin,
+    String? diskKey,
+  }) {
+    if (_disposed) return false;
+    // A resource that finished after the camera moved keeps its bytes but
+    // must not occupy the newest presentation queue.
+    if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
+      return false;
+    }
+    _presentQueue.add(
+      _PresentJob(
+        job: job,
+        bytes: bytes,
+        payloadId: _payloadVersion(bytes),
+        origin: origin,
+        diskKey: diskKey,
+      ),
+    );
+    _pumpPresentations();
+    return true;
+  }
+
+  /// Starts queued presentations, newest/highest-priority first. The lane is
+  /// bounded by [maxConcurrentPresentations] so decode CPU cannot flood the
+  /// UI isolate.
+  void _pumpPresentations() {
+    if (_disposed) return;
+    if (_presentQueue.isEmpty) return;
+    _presentQueue.sort((a, b) => _compareJobs(a.job, b.job));
+    while (_activePresentations < maxConcurrentPresentations &&
+        _presentQueue.isNotEmpty) {
+      final entry = _presentQueue.removeAt(0);
+      final job = entry.job;
+      if (job.jobClass != _JobClass.adjacentZoom &&
+          _renderIndex(job.key) == -1) {
+        _inFlight.remove(job.key);
+        continue;
+      }
+      _activePresentations++;
+      unawaited(_runPresentation(entry));
+    }
+  }
+
+  Future<void> _runPresentation(_PresentJob entry) async {
+    var refetch = false;
+    _activePresentEntries.add(entry);
+    try {
+      refetch = await _present(entry);
+    } finally {
+      _activePresentEntries.remove(entry);
+      if (_activePresentations > 0) _activePresentations--;
+      _inFlight.remove(entry.job.key);
+      if (!_disposed) {
+        if (refetch) _enqueueJob(_promote(entry.job));
+        _retireCorruptStateIfDrained(entry.job.resourceKey);
+        _pumpPresentations();
+        _pumpLoadQueue();
+      }
+    }
+  }
+
+  /// Decodes and publishes one presentation.
+  ///
+  /// Returns `true` when the bytes were cached/disk bytes found to be
+  /// malformed and a single network refetch should be forced.
+  Future<bool> _present(_PresentJob entry) async {
+    if (_disposed) return false;
+    final job = entry.job;
+    final resource = job.resourceKey;
+    final outcome = await _tryDecode(job, entry.bytes);
+    switch (outcome) {
+      case _DecodeOutcome.ok:
+        // Canonical persistence is part of migration's commit point. Delete a
+        // legacy entry only after that exact write succeeds.
+        final persisted = await _persistResource(job, entry.bytes);
+        final legacyKey = entry.diskKey ?? _legacyDiskKeys[resource];
+        if (persisted && legacyKey != null) {
+          await _deleteStored(legacyKey);
+          if (_legacyDiskKeys[resource] == legacyKey) {
+            _legacyDiskKeys.remove(resource);
+          }
+        }
+        final recovery = _corruptResources[resource];
+        if (recovery != null &&
+            !identical(entry.payloadId, recovery.rejectedPayloadId)) {
+          recovery
+            ..replacementBytes = entry.bytes
+            ..replacementAccepted = true;
+        }
+        return false;
+      case _DecodeOutcome.aborted:
+        return false;
+      case _DecodeOutcome.error:
+        _markFailed(job);
+        return false;
+      case _DecodeOutcome.corrupt:
+        var recovery = _corruptResources[resource];
+        if (recovery == null) {
+          recovery = _CorruptResourceState(
+            rejectedPayloadId: entry.payloadId,
+            rejectedBytes: entry.bytes,
+          );
+          _corruptResources[resource] = recovery;
+        } else if (!identical(
+          entry.payloadId,
+          recovery.rejectedPayloadId,
+        )) {
+          // Only the known replacement may advance the recovery generation.
+          // An unrelated stale sibling must never replace current state.
+          if (identical(entry.bytes, recovery.replacementBytes)) {
+            recovery
+              ..rejectedPayloadId = entry.payloadId
+              ..rejectedBytes = entry.bytes
+              ..replacementBytes = null
+              ..replacementAccepted = false
+              ..recovery = null
+              ..persistentInvalidated = false;
+          } else {
+            return false;
+          }
+        }
+
+        if (identical(_byteCache[resource], entry.bytes)) {
+          _removeFromByteCache(resource);
+        }
+        if (!recovery.persistentInvalidated) {
+          recovery.persistentInvalidated = true;
+          await _deleteStored(resource);
+          final legacyKey = entry.diskKey ?? _legacyDiskKeys[resource];
+          if (legacyKey != null) await _deleteStored(legacyKey);
+        }
+
+        if (entry.origin == _ByteOrigin.network) {
+          // The recovery response itself was malformed. Back off before a new
+          // shared recovery generation; siblings of this payload only join.
+          _markFailed(job);
+          return false;
+        }
+        return true;
+    }
+  }
+
+  /// Drops queued presentations whose tiles left the newest demand set,
+  /// releasing their in-flight keys. Downloaded bytes are retained.
+  void _prunePresentQueue() {
+    if (_presentQueue.isEmpty) return;
+    _presentQueue.removeWhere((entry) {
+      final job = entry.job;
+      final stale = job.jobClass == _JobClass.adjacentZoom
+          ? job.generation != _generation
+          : _renderIndex(job.key) == -1;
+      if (stale) _inFlight.remove(job.key);
+      return stale;
+    });
+  }
+
+  Object _payloadVersion(Uint8List bytes) =>
+      _payloadVersions[bytes] ??= Object();
+
+  void _retireCorruptStateIfDrained(String resource) {
+    final state = _corruptResources[resource];
+    if (state == null || !state.replacementAccepted) return;
+    final rejectedStillQueued = _presentQueue.any((entry) =>
+        entry.job.resourceKey == resource &&
+        identical(entry.payloadId, state.rejectedPayloadId));
+    final rejectedStillActive = _activePresentEntries.any((entry) =>
+        entry.job.resourceKey == resource &&
+        identical(entry.payloadId, state.rejectedPayloadId));
+    if (!rejectedStillQueued && !rejectedStillActive) {
+      _corruptResources.remove(resource);
+    }
   }
 
   Future<void> _deleteStored(String key) async {
@@ -1009,78 +1347,6 @@ class TileManager with CacheTiles {
     }
   }
 
-  Future<void> _fetchBytesAndDecode(_LoadJob job) async {
-    final resource = job.resourceKey;
-    late final Uint8List bytes;
-    try {
-      bytes = await _fetchResource(job);
-    } catch (_) {
-      _markFailed(job);
-      return;
-    }
-    if (_disposed) return;
-
-    final outcome = await _tryDecode(job, bytes);
-    if (outcome == _DecodeOutcome.corrupt) {
-      // A malformed network response must not be persisted. Drop any
-      // byte-cache copy and back off; the retry refetches.
-      _removeFromByteCache(resource);
-      _markFailed(job);
-      return;
-    }
-    // Success, an aborted stale decode, or a non-payload decode error all
-    // have bytes worth keeping; store once per resource (shared by every
-    // over-zoom sibling).
-    _ensureBytesCached(resource, bytes);
-    _persistResource(job, bytes);
-    if (outcome == _DecodeOutcome.error) {
-      // Keep valid payloads so retries decode from cache instead of
-      // refetching bytes the decoder only failed on for another reason.
-      _markFailed(job);
-    }
-  }
-
-  /// Fetches compressed bytes for an off-screen padding or adjacent-zoom
-  /// tile without decoding. If the tile scrolled into view while fetching,
-  /// it is decoded immediately through the same recovery path as a
-  /// foreground job instead of waiting for the next [calculate].
-  Future<void> _fetchBytesOnly(_LoadJob job) async {
-    final resource = job.resourceKey;
-    late final Uint8List bytes;
-    try {
-      bytes = _byteCache[resource] ??
-          (hasStoredTile(resource) ? cachedTileBytes(resource) : null) ??
-          await _fetchResource(job);
-    } catch (_) {
-      _markFailed(job);
-      return;
-    }
-    if (_disposed) return;
-
-    // Still off-screen: cache the bytes without spending a decode. They are
-    // validated only when the tile actually enters the viewport.
-    if (!isTileRelevant(job.z, job.x, job.y)) {
-      _ensureBytesCached(resource, bytes);
-      _persistResource(job, bytes);
-      return;
-    }
-
-    // The tile scrolled into view while preloading: decode now and, on a
-    // corrupt payload, invalidate the persistent entry and refetch once.
-    final foreground = _foregroundJob(job);
-    _registerLatestJob(foreground);
-    final outcome = await _tryDecode(foreground, bytes);
-    if (outcome == _DecodeOutcome.corrupt) {
-      _removeFromByteCache(resource);
-      await _deleteStored(resource);
-      await _fetchBytesAndDecode(foreground);
-      return;
-    }
-    _ensureBytesCached(resource, bytes);
-    _persistResource(foreground, bytes);
-    if (outcome == _DecodeOutcome.error) _markFailed(foreground);
-  }
-
   /// Stores [bytes] under [resource] only when it is not already present, so
   /// a resource shared by many logical slots produces one memory insertion.
   void _ensureBytesCached(String resource, Uint8List bytes) {
@@ -1088,18 +1354,41 @@ class TileManager with CacheTiles {
     _storeInByteCache(resource, bytes);
   }
 
-  /// Schedules one persistent write per resource, regardless of how many
-  /// logical slots share it. The bookkeeping set is bounded; resetting it can
-  /// cause a rare duplicate write but never a missing one.
-  void _persistResource(_LoadJob job, Uint8List bytes) {
+  /// Commits one persistent write per resource. Concurrent callers share the
+  /// exact write future so compatibility migration never deletes a legacy
+  /// record before the canonical write has actually succeeded.
+  Future<bool> _persistResource(_LoadJob job, Uint8List bytes) {
     final resource = job.resourceKey;
-    if (!_persistedResources.add(resource)) return;
-    if (_persistedResources.length > _maxPersistedResourceKeys) {
-      _persistedResources
-        ..clear()
-        ..add(resource);
-    }
-    unawaited(storeTile(resource, Tile(null, resource, job.y, job.x), bytes));
+    if (_persistedResources.contains(resource)) return Future.value(true);
+    final inFlight = _resourceWrites[resource];
+    if (inFlight != null) return inFlight;
+
+    late final Future<bool> write;
+    write = (() async {
+      try {
+        await storeTile(
+          resource,
+          Tile(null, resource, job.y, job.x),
+          bytes,
+        );
+        if (_disposed) return false;
+        _persistedResources.add(resource);
+        if (_persistedResources.length > _maxPersistedResourceKeys) {
+          _persistedResources
+            ..clear()
+            ..add(resource);
+        }
+        return true;
+      } catch (_) {
+        return false;
+      } finally {
+        if (identical(_resourceWrites[resource], write)) {
+          _resourceWrites.remove(resource);
+        }
+      }
+    })();
+    _resourceWrites[resource] = write;
+    return write;
   }
 
   /// Fetches the shared source bytes for [job], deduplicating concurrent
@@ -1412,26 +1701,57 @@ class TileManager with CacheTiles {
     return ((x % n) + n) % n;
   }
 
-  /// Stable digest of the public part of [url] (scheme, host, port, path).
-  /// Userinfo, query and fragment are dropped so credentials/tokens never
-  /// become persistent keys.
+  /// Stable digest of the public URL identity.
+  ///
+  /// Content-affecting query parameters are retained in sorted order while
+  /// credentials and request-signing fields are removed. The digest therefore
+  /// distinguishes public variants such as `style=dark`/`style=light` without
+  /// persisting secrets or changing when a token rotates.
   static String _digestUrl(String url) {
     final uri = Uri.tryParse(url);
-    if (uri == null) return 'u${url.hashCode.toRadixString(16)}';
+    if (uri == null) return 'u${_fnv1a64(url)}';
+
+    final publicQuery = <String, List<String>>{};
+    final keys = uri.queryParametersAll.keys.toList()..sort();
+    for (final key in keys) {
+      if (_isCredentialQueryParameter(key)) continue;
+      publicQuery[key] = List<String>.of(uri.queryParametersAll[key]!)..sort();
+    }
     final public = Uri(
       scheme: uri.scheme,
       host: uri.host,
       port: uri.hasPort ? uri.port : null,
       path: uri.path,
+      queryParameters: publicQuery.isEmpty ? null : publicQuery,
     ).toString();
     return 'u${_fnv1a64(public)}';
   }
 
+  static bool _isCredentialQueryParameter(String name) {
+    final lower = name.toLowerCase();
+    return lower == 'access_token' ||
+        lower == 'access-token' ||
+        lower == 'token' ||
+        lower == 'api_key' ||
+        lower == 'api-key' ||
+        lower == 'apikey' ||
+        lower == 'key' ||
+        lower == 'signature' ||
+        lower == 'sig' ||
+        lower == 'expires' ||
+        lower.startsWith('x-amz-') ||
+        lower.startsWith('x-goog-');
+  }
+
+  /// FNV-1a 64-bit implemented with [BigInt] so the exact same 16-hex-digit
+  /// key is produced by native and JavaScript backends. This preserves all
+  /// cache keys written by the previous native integer implementation.
   static String _fnv1a64(String value) {
-    var hash = 0xcbf29ce484222325;
+    var hash = BigInt.parse('cbf29ce484222325', radix: 16);
+    final prime = BigInt.parse('100000001b3', radix: 16);
+    final mask = BigInt.parse('ffffffffffffffff', radix: 16);
     for (final byte in utf8.encode(value)) {
-      hash ^= byte;
-      hash = (hash * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+      hash = ((hash ^ BigInt.from(byte)) * prime) & mask;
     }
     return hash.toRadixString(16).padLeft(16, '0');
   }
@@ -1517,5 +1837,54 @@ class _LoadJob {
     required this.jobClass,
     required this.distance,
     required this.byteOnly,
+  });
+}
+
+/// Where presentation bytes came from. Only matters for corruption
+/// recovery: cached/disk bytes are invalidated and refetched once, while a
+/// malformed network response backs off rather than looping.
+enum _ByteOrigin { cached, network }
+
+/// A job whose bytes are already in the byte cache and which is waiting for
+/// the bounded presentation lane to decode and publish it.
+class _PresentJob {
+  final _LoadJob job;
+
+  /// Compressed bytes to decode. Already present in the byte cache; held
+  /// here so the presentation never re-reads a mutated cache entry.
+  final Uint8List bytes;
+
+  /// Identity of the byte payload, shared by every sibling presentation.
+  final Object payloadId;
+
+  final _ByteOrigin origin;
+
+  /// Persistent key the bytes were read from when they came from disk. When
+  /// it differs from the canonical resource key the entry is a compatible
+  /// legacy record that is migrated after a successful decode.
+  final String? diskKey;
+
+  const _PresentJob({
+    required this.job,
+    required this.bytes,
+    required this.payloadId,
+    required this.origin,
+    this.diskKey,
+  });
+}
+
+/// Recovery state for one rejected source payload. [recovery] and its settled
+/// [replacementBytes] are shared by every logical over-zoom/wrapped sibling.
+class _CorruptResourceState {
+  Object rejectedPayloadId;
+  Uint8List rejectedBytes;
+  Future<Uint8List>? recovery;
+  Uint8List? replacementBytes;
+  bool replacementAccepted = false;
+  bool persistentInvalidated = false;
+
+  _CorruptResourceState({
+    required this.rejectedPayloadId,
+    required this.rejectedBytes,
   });
 }

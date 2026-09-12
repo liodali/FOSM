@@ -104,7 +104,7 @@ class LabelOverlay {
         continue;
       }
 
-      final labels = _labelsFor(zoom, x, y, parsed);
+      final labels = _labelsFor(zoom, x, y);
       for (final label in labels) {
         if (drawn >= maxLabelsPerFrame) break;
         if (!seenSymbols.add(label.dedupeKey)) continue;
@@ -251,6 +251,7 @@ class LabelOverlay {
         yieldBudget: yieldBudget,
         yieldControl: yieldControl,
       );
+      if (_stale(isRelevant)) throw const TileDecodeAborted();
       return;
     }
 
@@ -274,6 +275,12 @@ class LabelOverlay {
       }
       rethrow;
     }
+    if (_stale(isRelevant)) {
+      for (final label in labels) {
+        label.dispose();
+      }
+      throw const TileDecodeAborted();
+    }
     _storePrepared(key, labels);
     await _layOutLabels(
       labels,
@@ -281,6 +288,7 @@ class LabelOverlay {
       yieldBudget: yieldBudget,
       yieldControl: yieldControl,
     );
+    if (_stale(isRelevant)) throw const TileDecodeAborted();
   }
 
   /// Builds [labels] for one tile, yielding every [yieldBudget].
@@ -368,55 +376,14 @@ class LabelOverlay {
     }
   }
 
-  /// Synchronous fallback used by [paint] for tiles that were not prepared
-  /// ahead of time. Its result is cached for later frames.
-  List<_PreparedLabel> _labelsFor(
-    int zoom,
-    int tileX,
-    int tileY,
-    ParsedVectorTile parsed,
-  ) {
+  /// Returns only labels prepared by the lower-priority runtime queue.
+  /// Paint must never synchronously scan/style a dense tile as a fallback.
+  List<_PreparedLabel> _labelsFor(int zoom, int tileX, int tileY) {
     final key = '$zoom/$tileX/$tileY';
     final hit = _prepared.remove(key);
-    if (hit != null) {
-      _prepared[key] = hit;
-      return hit;
-    }
-
-    final labels = <_PreparedLabel>[];
-    final style = runtime.loaded.style;
-
-    for (final layer in style.layers) {
-      if (layer.type != StyleLayerType.symbol || !layer.isVisible) continue;
-      if (zoom < layer.minZoom || zoom > layer.maxZoom) continue;
-      final sourceLayer = layer.sourceLayer;
-      if (sourceLayer == null) continue;
-      final data = parsed.decoded.layerByName(sourceLayer);
-      if (data == null) continue;
-
-      final transform = TileTransform.forLayer(
-        z: zoom,
-        x: tileX,
-        y: tileY,
-        srcZ: parsed.srcZ,
-        extent: data.extent,
-      );
-      final isLineLayer = _isLineLayer(layer, zoom);
-
-      for (final feature in data.features) {
-        _appendFeatureLabels(
-          labels,
-          layer,
-          feature,
-          transform,
-          isLineLayer,
-          zoom,
-        );
-      }
-    }
-
-    _storePrepared(key, labels);
-    return labels;
+    if (hit == null) return const [];
+    _prepared[key] = hit;
+    return hit;
   }
 
   /// Whether [layer] places its symbols along line geometry. Liberty uses

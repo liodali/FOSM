@@ -136,9 +136,23 @@ class VectorTileRuntime {
   bool _disposed = false;
 
   /// Number of images disposed because label preparation failed after
-  /// `toImage` created them (test hook).
+  /// `toImage` created them (test hook). Retained for compatibility; base
+  /// images are now published before labels, so this stays at zero.
   @visibleForTesting
   int debugDisposedImages = 0;
+
+  /// Fires when a tile's labels finish preparing after its base image was
+  /// already published. The label surface listens so label-only updates
+  /// repaint without rebuilding the base tiles, markers, or controls.
+  final _LabelsNotifier _labelsNotifier = _LabelsNotifier();
+  Listenable get labelsNotifier => _labelsNotifier;
+
+  /// Lower-priority, single-lane label-preparation queue. Kept separate from
+  /// the vector presentation lane so labels never delay base images.
+  final List<_LabelJob> _labelQueue = [];
+  final Set<String> _labelQueued = {};
+  bool _activeLabelPrep = false;
+  Timer? _labelPumpTimer;
 
   // ── Decode/render gating ────────────────────────────────────────────
   // Switching to vector mode schedules every visible tile at once; on web
@@ -289,6 +303,70 @@ class VectorTileRuntime {
     }
   }
 
+  /// Queues label preparation for [z]/[x]/[y] after its base image has been
+  /// published. Deduplicated so a tile re-decoded while its labels are still
+  /// queued does not prepare twice.
+  void _scheduleLabels(int z, int x, int y) {
+    if (_disposed) return;
+    final key = '$z/$x/$y';
+    if (!_labelQueued.add(key)) return;
+    _labelQueue.add(_LabelJob(z, x, y, key));
+    _pumpLabels();
+  }
+
+  void _pumpLabels() {
+    if (_disposed ||
+        _activeLabelPrep ||
+        _labelPumpTimer != null ||
+        _labelQueue.isEmpty) {
+      return;
+    }
+
+    // Labels are intentionally deferred to a later event-loop turn. Calling
+    // prepare directly here would execute its synchronous prefix before the
+    // decoder can publish the already-created base image.
+    _labelPumpTimer = Timer(Duration.zero, () {
+      _labelPumpTimer = null;
+      if (_disposed || _activeLabelPrep) return;
+      _labelQueue.removeWhere((job) {
+        final stale = !_isRelevant(job.z, job.x, job.y);
+        if (stale) _labelQueued.remove(job.key);
+        return stale;
+      });
+      if (_labelQueue.isEmpty) return;
+      _labelQueue
+          .sort((a, b) => _labelPriority(b).compareTo(_labelPriority(a)));
+      _activeLabelPrep = true;
+      unawaited(_runLabelPrep(_labelQueue.removeAt(0)));
+    });
+  }
+
+  int _labelPriority(_LabelJob job) {
+    final priority = tilePriority;
+    return priority == null ? 0 : priority(job.z, job.x, job.y);
+  }
+
+  Future<void> _runLabelPrep(_LabelJob job) async {
+    try {
+      await labelOverlay.prepare(
+        job.z,
+        job.x,
+        job.y,
+        isRelevant: () => _isRelevant(job.z, job.x, job.y),
+      );
+      if (_isRelevant(job.z, job.x, job.y)) {
+        _labelsNotifier.notifyLabelsUpdated();
+      }
+    } catch (_) {
+      // Stale or failed label preparation: the base image is already
+      // published, so these labels are simply skipped.
+    } finally {
+      _labelQueued.remove(job.key);
+      _activeLabelPrep = false;
+      if (!_disposed) _pumpLabels();
+    }
+  }
+
   /// Bridges the vector pipeline's [VectorTileCancelled] to the package's
   /// [TileDecodeAborted], which [TileManager] treats as a stale (non-failing)
   /// outcome so bytes are retained for a later pan.
@@ -313,6 +391,11 @@ class VectorTileRuntime {
         parsed = _parsedTileFor(coord) ??
             await _parseAndStoreDedup(bytes, coord, z, x, y);
       } on TileDecodeAborted {
+        rethrow;
+      } on VectorTileCancelled {
+        // The parser aborted because the camera moved. This is stale work,
+        // not a corrupt payload: rethrow so `_decodeAndRender` bridges it to
+        // `TileDecodeAborted` and the freshly fetched bytes are retained.
         rethrow;
       } catch (error) {
         // The protobuf payload itself could not be parsed. Report it as a
@@ -387,24 +470,15 @@ class VectorTileRuntime {
         // this snapshot can take 5-15ms; a real timer gives an already
         // scheduled browser/desktop frame a chance to run first.
         await Future<void>.delayed(const Duration(milliseconds: 1));
+        // The tile may have gone stale during the delay; never enter
+        // `toImage` (the single most expensive stage) for a stale tile.
+        _checkRelevant(z, x, y);
         final image = await picture.toImage(256, 256);
-        // Prepare this tile's labels before publishing it, so the next paint
-        // only runs viewport collision and drawing instead of feature
-        // scanning and text layout. Preparation is cooperative and aborts
-        // when the tile goes stale; dispose the image on any failure so it
-        // can never leak.
-        try {
-          await labelOverlay.prepare(
-            z,
-            x,
-            y,
-            isRelevant: () => _isRelevant(z, x, y),
-          );
-        } catch (_) {
-          debugDisposedImages++;
-          image.dispose();
-          rethrow;
-        }
+        // Publish the base image immediately. Label preparation runs on a
+        // separate lower-priority lane afterwards and notifies only the label
+        // surface when it finishes, so visible coverage and zoom readiness
+        // never wait for feature scanning and text layout.
+        _scheduleLabels(z, x, y);
         return image;
       } finally {
         picture.dispose();
@@ -455,12 +529,20 @@ class VectorTileRuntime {
     );
     _inFlightParses[coord] = future;
     // Remove the in-flight entry once it settles so later cache misses
-    // (after an LRU eviction) can parse again.
-    future.whenComplete(() {
-      _inFlightParses.remove(coord);
-      _parseRequesters.remove(coord);
-    });
+    // (after an LRU eviction) can parse again. Use an explicit error handler:
+    // `whenComplete()` forwards the error to the returned future, which is
+    // unhandled here and would surface as an uncaught async error whenever a
+    // shared parse is cancelled.
+    unawaited(future.then<void>(
+      (_) => _clearParseBookkeeping(coord),
+      onError: (Object _, StackTrace __) => _clearParseBookkeeping(coord),
+    ));
     return future;
+  }
+
+  void _clearParseBookkeeping(TileCoord coord) {
+    _inFlightParses.remove(coord);
+    _parseRequesters.remove(coord);
   }
 
   /// True while at least one logical tile waiting on [coord] is still
@@ -589,6 +671,11 @@ class VectorTileRuntime {
 
   void dispose() {
     _disposed = true;
+    _labelPumpTimer?.cancel();
+    _labelPumpTimer = null;
+    _labelQueue.clear();
+    _labelQueued.clear();
+    _labelsNotifier.dispose();
     _labelOverlay?.dispose();
     _labelOverlay = null;
     _inFlightUrls.clear();
@@ -609,6 +696,21 @@ class VectorTileRuntime {
       if (!waiter.completer.isCompleted) waiter.completer.complete();
     }
   }
+}
+
+/// Exposes label-change notifications without leaking `notifyListeners`.
+class _LabelsNotifier extends ChangeNotifier {
+  void notifyLabelsUpdated() => notifyListeners();
+}
+
+/// A tile waiting for the lower-priority label-preparation lane.
+class _LabelJob {
+  final int z;
+  final int x;
+  final int y;
+  final String key;
+
+  _LabelJob(this.z, this.x, this.y, this.key);
 }
 
 /// A logical tile waiting for one of the runtime's presentation slots.

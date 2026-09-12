@@ -436,7 +436,7 @@ void main() {
           parseOffThread: false,
         );
 
-    testWidgets('preparation completes before the decoder publishes',
+    testWidgets('base image resolves before labels are prepared',
         (tester) async {
       final runtime = makeRuntime('label-prep');
       addTearDown(runtime.dispose);
@@ -445,10 +445,19 @@ void main() {
 
       final image = await tester
           .runAsync(() => runtime.decoder(buildDenseLabelTile(), 12, 3, 2));
-      image?.dispose();
+      expect(image, isNotNull, reason: 'the base image must publish first');
 
+      // Labels prepare on the separate lane after publication.
+      await tester.runAsync(() async {
+        final stopwatch = Stopwatch()..start();
+        while (overlay.preparedTileCount == 0 &&
+            stopwatch.elapsed < const Duration(seconds: 2)) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      });
       expect(overlay.preparedTileCount, greaterThan(0),
-          reason: 'labels must be prepared before the tile is returned');
+          reason: 'labels still prepare, just after the base image publishes');
+      image?.dispose();
     });
 
     testWidgets('preparation yields cooperatively under a dense tile',
@@ -501,25 +510,53 @@ void main() {
       expect(error, isA<TileDecodeAborted>());
     });
 
-    testWidgets('the created image is disposed when preparation fails',
+    testWidgets('base image publishes before a failing label preparation',
         (tester) async {
       final runtime = makeRuntime('label-fail');
       addTearDown(runtime.dispose);
 
       runtime.labelOverlay.debugFailNextPrepare = true;
 
-      Object? error;
+      ui.Image? image;
       await tester.runAsync(() async {
-        try {
-          final image = await runtime.decoder(buildHalfWaterTile(), 12, 3, 2);
-          image.dispose();
-        } catch (e) {
-          error = e;
+        image = await runtime.decoder(buildHalfWaterTile(), 12, 3, 2);
+      });
+      expect(image, isNotNull,
+          reason: 'a label failure must not delay or discard the base image');
+
+      // Let the deferred label lane settle; the failed preparation is
+      // swallowed and nothing is cached.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      expect(runtime.labelOverlay.preparedTileCount, 0);
+      image?.dispose();
+    });
+
+    testWidgets('labels notify on a separate notifier after the base image',
+        (tester) async {
+      final runtime = makeRuntime('label-notify');
+      addTearDown(runtime.dispose);
+
+      var notifications = 0;
+      runtime.labelsNotifier.addListener(() => notifications++);
+
+      final image = await tester
+          .runAsync(() => runtime.decoder(buildDenseLabelTile(), 12, 3, 2));
+      expect(image, isNotNull);
+
+      // The label lane runs after the base image resolves.
+      await tester.runAsync(() async {
+        final stopwatch = Stopwatch()..start();
+        while (runtime.labelOverlay.preparedTileCount == 0 &&
+            stopwatch.elapsed < const Duration(seconds: 2)) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
         }
       });
-      expect(error, isA<StateError>());
-      expect(runtime.debugDisposedImages, 1,
-          reason: 'a failed preparation must not leak the snapshot image');
+      expect(runtime.labelOverlay.preparedTileCount, greaterThan(0));
+      expect(notifications, greaterThan(0),
+          reason: 'label-only updates must fire the label notifier');
+      image?.dispose();
     });
   });
 
@@ -539,6 +576,35 @@ void main() {
             x: 3,
             y: 2,
             isRelevant: () => false,
+          );
+          picture.dispose();
+        } catch (e) {
+          error = e;
+        }
+      });
+      expect(error, isA<VectorTileCancelled>());
+    });
+
+    testWidgets('renderAsync disposes the partial picture when cancelled late',
+        (tester) async {
+      final renderer = VectorTileRenderer(buildLoadedStyle());
+      final decoded = decodeVectorTile(buildHalfWaterTile());
+
+      // Relevant for the pre-loop check and the first yield, stale after the
+      // resume: cancellation happens after picture recording has started, so
+      // the recorder must still be finalized and disposed.
+      var calls = 0;
+      Object? error;
+      await tester.runAsync(() async {
+        try {
+          final picture = await renderer.renderAsync(
+            decoded: decoded,
+            srcZ: 12,
+            z: 12,
+            x: 3,
+            y: 2,
+            yieldBudget: Duration.zero,
+            isRelevant: () => calls++ < 2,
           );
           picture.dispose();
         } catch (e) {

@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
@@ -82,9 +84,25 @@ final Uint8List _tinyPng = Uint8List.fromList([
 /// Fast fetcher — tiles resolve via microtasks.
 Future<Uint8List> _fastFetcher(int z, int x, int y) async => _tinyPng;
 
-/// Slow fetcher — tiles take 2 seconds, keeping the wait phase active.
-Future<Uint8List> _slowFetcher(int z, int x, int y) =>
-    Future.delayed(const Duration(seconds: 2), () => _tinyPng);
+/// Deterministic fetcher that keeps the zoom animation in its wait phase
+/// without leaving fake-async timers behind when a widget test ends.
+class _BlockingFetcher {
+  final _pending = <Completer<Uint8List>>[];
+
+  Future<Uint8List> call(int z, int x, int y) {
+    final completer = Completer<Uint8List>();
+    _pending.add(completer);
+    return completer.future;
+  }
+
+  void release() {
+    final pending = List<Completer<Uint8List>>.of(_pending);
+    _pending.clear();
+    for (final completer in pending) {
+      if (!completer.isCompleted) completer.complete(_tinyPng);
+    }
+  }
+}
 
 Future<void> _pumpMap(
   WidgetTester tester, {
@@ -122,15 +140,31 @@ Finder _overlayBlurs() => find.descendant(
       matching: find.byType(ImageFiltered),
     );
 
+void _expectPlatformBlurPolicy() {
+  expect(_overlayBlurs(), kIsWeb ? findsNothing : findsOneWidget);
+}
+
+Future<void> _disposeBlockedMap(
+  WidgetTester tester,
+  _BlockingFetcher fetcher,
+) async {
+  // Dispose the manager before resolving requests so their continuations
+  // cannot start another scheduler wave.
+  await tester.pumpWidget(const SizedBox.shrink());
+  fetcher.release();
+  await tester.pump();
+}
+
 void main() {
   group('Two-phase zoom animation', () {
-    testWidgets('scale: wait phase shows blurred overlay while tiles load',
+    testWidgets('scale: wait phase shows platform overlay while tiles load',
         (tester) async {
       final zoomLog = <int>[];
+      final fetcher = _BlockingFetcher();
       await _pumpMap(
         tester,
         onZoomChanged: zoomLog.add,
-        fetcher: _slowFetcher,
+        fetcher: fetcher.call,
       );
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
@@ -139,22 +173,23 @@ void main() {
       await tester.pump(const Duration(milliseconds: 100));
       await tester.tapAt(const Offset(400, 300));
       await tester.pump();
-      // Advance a small amount — tiles still loading (2s fetcher).
+      // Advance a small amount while tile requests remain blocked.
       await tester.pump(const Duration(milliseconds: 50));
 
       expect(zoomLog, [4]);
       // Overlay present in wait phase.
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      // Blur is applied.
-      expect(_overlayBlurs(), findsOneWidget);
+      // Native keeps blur; web deliberately skips the expensive filter.
+      _expectPlatformBlurPolicy();
       // Scale is 1.0 (static — waiting for tiles).
       final scale = tester.widget<Transform>(_overlayTransforms().last);
       expect(scale.transform.getMaxScaleOnAxis(), closeTo(1.0, 0.01));
 
-      // Drain everything: wait timeout (600ms) + scale animation (400ms)
-      // + slow fetcher (2s).
+      // Drain the wait timeout and scale animation, then dispose before
+      // releasing blocked requests so no new scheduler wave can start.
       await tester.pumpAndSettle(const Duration(seconds: 5));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+      await _disposeBlockedMap(tester, fetcher);
     });
 
     testWidgets('scale: fast fetcher skips wait, scale animates and removes',
@@ -173,8 +208,8 @@ void main() {
       expect(zoomLog, [4]);
       // Overlay is present during the animation.
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      // Blur is applied for both styles.
-      expect(_overlayBlurs(), findsOneWidget);
+      // Both styles blur natively; web deliberately skips the filter.
+      _expectPlatformBlurPolicy();
       // translate + scale transforms present.
       expect(_overlayTransforms(), findsNWidgets(2));
 
@@ -201,20 +236,22 @@ void main() {
 
       expect(zoomLog, [4]);
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      expect(_overlayBlurs(), findsOneWidget);
+      _expectPlatformBlurPolicy();
       expect(_overlayTransforms(), findsNWidgets(2));
 
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
     });
 
-    testWidgets('crossfade: wait phase shows blurred overlay', (tester) async {
+    testWidgets('crossfade: wait phase follows platform blur policy',
+        (tester) async {
       final zoomLog = <int>[];
+      final fetcher = _BlockingFetcher();
       await _pumpMap(
         tester,
         onZoomChanged: zoomLog.add,
         style: ZoomAnimationStyle.crossfade,
-        fetcher: _slowFetcher,
+        fetcher: fetcher.call,
       );
       await tester.pumpAndSettle(const Duration(seconds: 1));
 
@@ -226,14 +263,15 @@ void main() {
 
       expect(zoomLog, [4]);
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      expect(_overlayBlurs(), findsOneWidget);
+      _expectPlatformBlurPolicy();
       // Static (not scaling).
       final scale = tester.widget<Transform>(_overlayTransforms().last);
       expect(scale.transform.getMaxScaleOnAxis(), closeTo(1.0, 0.01));
 
-      // Drain everything.
+      // Drain the animation, then dispose before releasing blocked requests.
       await tester.pumpAndSettle(const Duration(seconds: 5));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
+      await _disposeBlockedMap(tester, fetcher);
     });
 
     testWidgets('zoom-out via − button: overlay appears and cleans up',
@@ -250,7 +288,7 @@ void main() {
 
       expect(zoomLog, [2]);
       expect(find.byKey(const ValueKey('zoom-scale')), findsOneWidget);
-      expect(_overlayBlurs(), findsOneWidget);
+      _expectPlatformBlurPolicy();
 
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(find.byKey(const ValueKey('zoom-scale')), findsNothing);
