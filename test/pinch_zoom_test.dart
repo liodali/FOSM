@@ -271,13 +271,14 @@ void main() {
       // scaling and fading out on top.
       expect(_gridPainters, findsNWidgets(2));
 
+      // Direct manipulation keeps the cumulative snapshot alive. Releasing
+      // the fingers starts the trailing settle/fade animation.
+      await g1.up();
+      await g2.up();
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(_gridPainters, findsOneWidget); // overlay removed at the end
       // Zoom result identical to the non-animated path.
       expect(camera.longitude, closeTo(0, 0.01));
-
-      await g1.up();
-      await g2.up();
     });
 
     testWidgets('scale transition duration comes from zoomAnimationDuration',
@@ -300,12 +301,11 @@ void main() {
       await tester.pump(const Duration(milliseconds: 60));
       expect(_gridPainters, findsNWidgets(2)); // still fading
 
+      await g1.up();
+      await g2.up();
       await tester.pump(const Duration(milliseconds: 80)); // 140ms total
       await tester.pumpAndSettle(const Duration(seconds: 1));
       expect(_gridPainters, findsOneWidget);
-
-      await g1.up();
-      await g2.up();
     });
 
     testWidgets('fading old grid follows pans during the animation',

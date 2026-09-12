@@ -1120,7 +1120,9 @@ class _MapViewState extends State<MapView>
 
     final snapshot = _animOldSnapshot;
     if (_pinchTransitionActive && snapshot != null) {
-      _visualScaleFocal = focalLocal;
+      // Keep the transform origin from the first zoom step. Any later focal
+      // drift is already represented by the camera's pan delta; replacing
+      // the origin here would apply that drift a second time.
       _visualScale = math.pow(2, manager.zoom - snapshot.zoom).toDouble();
     }
 
