@@ -12,8 +12,9 @@ class LatLngBounds {
   final LatLng southwest;
   final LatLng northeast;
 
-  /// Validation runs on every construction; the constructor is intentionally
-  /// not `const` because constant constructors cannot dereference parameters.
+  /// Debug assertions validate every construction. The constructor is
+  /// intentionally not `const` because constant constructors cannot
+  /// dereference parameters in assertions.
   LatLngBounds({required this.southwest, required this.northeast})
       : assert(southwest.latitude >= -maxWebMercatorLatitude),
         assert(southwest.latitude <= maxWebMercatorLatitude),

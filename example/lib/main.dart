@@ -405,15 +405,15 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   void _applyStyleUrl() {
     final url = _styleUrlController.text.trim();
     if (url.isEmpty || url == _activeStyleUrl) return;
-    setState(() => _activeStyleUrl = url);
+    _activeStyleUrl = url;
   }
 
-  /// Rebuilds the map (new key) with the current camera, preserving the
-  /// viewport across raster/vector switches. New modes need a fresh
-  /// [MapView] state because they use different tile pipelines.
+  /// Records the requested map mode. Callers are responsible for
+  /// rebuilding — the bottom sheet's [update] helper does that for both
+  /// the page and the open sheet.
   void _setMode(_MapMode mode) {
     if (mode == _mode) return;
-    setState(() => _mode = mode);
+    _mode = mode;
   }
 
   @override
@@ -653,13 +653,28 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   }
 
   void _showTileOptions(BuildContext context) {
+    // The bottom sheet lives on its own route, so page setState() alone
+    // never rebuilds it. Every control below mutates page state; [update]
+    // routes each change through both trees so the sheet stays reactive.
+    StateSetter? setSheetState;
+    void update([VoidCallback? mutate]) {
+      if (mutate != null) mutate();
+      setState(() {});
+      setSheetState?.call(() {});
+    }
+
     showModalBottomSheet<void>(
       context: context,
-      builder: (context) => _buildSourceControls(),
-    );
+      builder: (context) => StatefulBuilder(
+        builder: (context, setModalState) {
+          setSheetState = setModalState;
+          return _buildSourceControls(update);
+        },
+      ),
+    ).whenComplete(() => setSheetState = null);
   }
 
-  Widget _buildSourceControls() {
+  Widget _buildSourceControls(void Function([VoidCallback? mutate]) update) {
     return SafeArea(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
@@ -681,7 +696,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 ),
               ],
               selected: {_mode},
-              onSelectionChanged: (selection) => _setMode(selection.first),
+              onSelectionChanged: (selection) =>
+                  update(() => _setMode(selection.first)),
               showSelectedIcon: false,
             ),
             const SizedBox(height: 12),
@@ -701,7 +717,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 ),
                 Switch(
                   value: _animateZoom,
-                  onChanged: (value) => setState(() => _animateZoom = value),
+                  onChanged: (value) => update(() => _animateZoom = value),
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
               ],
@@ -724,7 +740,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 Switch(
                   value: _clusteringEnabled,
                   onChanged: (value) =>
-                      setState(() => _clusteringEnabled = value),
+                      update(() => _clusteringEnabled = value),
                   materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                 ),
               ],
@@ -745,7 +761,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
               ],
               selected: {_zoomStyle},
               onSelectionChanged: (selection) =>
-                  setState(() => _zoomStyle = selection.first),
+                  update(() => _zoomStyle = selection.first),
               showSelectedIcon: false,
             ),
             const SizedBox(height: 12),
@@ -798,12 +814,12 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                       ),
                       keyboardType: TextInputType.url,
                       autocorrect: false,
-                      onSubmitted: (_) => _applyStyleUrl(),
+                      onSubmitted: (_) => update(_applyStyleUrl),
                     ),
                   ),
                   const SizedBox(width: 8),
                   FilledButton.tonal(
-                    onPressed: _applyStyleUrl,
+                    onPressed: () => update(_applyStyleUrl),
                     child: const Text('Apply'),
                   ),
                 ],
