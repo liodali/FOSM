@@ -229,6 +229,41 @@ void main() {
       expect(error, isA<VectorTileCancelled>());
     });
 
+    test('async decoder cancels inside packed-varint decoding', () async {
+      // A single dense feature whose geometry has far more than one
+      // cooperative-check interval of packed varints. Relevance holds for
+      // the layer-level checks but fails once the geometry reader reaches its
+      // first internal checkpoint, proving cancellation reaches inside a
+      // single feature rather than only between layers.
+      final commands = <int>[1 | (100000 << 3)];
+      commands.addAll(List<int>.filled(200000, 0));
+      final builder = MvtBuilder()
+        ..addLayer(
+          name: 'water',
+          features: [
+            TestFeature(
+              id: 1,
+              type: TestGeomType.polygon,
+              geometryCommands: commands,
+            ),
+          ],
+        );
+      final bytes = builder.build();
+
+      var checks = 0;
+      Object? error;
+      try {
+        await decodeVectorTileAsync(
+          bytes,
+          yieldBudget: const Duration(hours: 1),
+          isRelevant: () => checks++ < 30,
+        );
+      } catch (e) {
+        error = e;
+      }
+      expect(error, isA<VectorTileCancelled>());
+    });
+
     test('real-world smoke: decoded tile from bytes is self-consistent', () {
       // A tile with several layers — ensure unknown layers skip cleanly.
       final builder = MvtBuilder()

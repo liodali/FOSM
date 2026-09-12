@@ -36,8 +36,12 @@ class _GridSnapshot {
   final List<Tile> tiles;
   final int revision;
 
-  /// Zoom of the snapshotted grid.
+  /// Zoom and camera center of the snapshotted grid.
   final int zoom;
+  final double sourceCenterTileLng;
+  final double sourceCenterTileLat;
+  final double sourceCenterCanvasX;
+  final double sourceCenterCanvasY;
 
   /// The POST-step camera center, in the NEW zoom's tile units. The
   /// camera may keep moving while the overlay fades out (an in-progress
@@ -56,6 +60,10 @@ class _GridSnapshot {
     required this.tiles,
     required this.revision,
     required this.zoom,
+    required this.sourceCenterTileLng,
+    required this.sourceCenterTileLat,
+    required this.sourceCenterCanvasX,
+    required this.sourceCenterCanvasY,
     required this.anchorTileLng,
     required this.anchorTileLat,
   });
@@ -70,6 +78,10 @@ class _GridSnapshot {
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
         zoom: m.zoom,
+        sourceCenterTileLng: m.centerTileLng,
+        sourceCenterTileLat: m.centerTileLat,
+        sourceCenterCanvasX: m.centerCanvasX,
+        sourceCenterCanvasY: m.centerCanvasY,
         anchorTileLng: m.centerTileLng,
         anchorTileLat: m.centerTileLat,
       );
@@ -93,6 +105,10 @@ class _OldGridOverlay extends StatelessWidget {
   final double visualScale;
   final double blurSigma;
 
+  /// Whether this is the one gesture-driven snapshot. Its transform is
+  /// derived from the complete camera delta rather than one zoom step.
+  final bool interactionSnapshot;
+
   /// Whether the full-viewport blur is allowed. Skipped on web by default
   /// and during direct manipulation, where opacity + transform are cheaper
   /// and keep input responsive.
@@ -107,6 +123,7 @@ class _OldGridOverlay extends StatelessWidget {
     required this.waiting,
     required this.visualScale,
     required this.blurSigma,
+    required this.interactionSnapshot,
     required this.blurEnabled,
   });
 
@@ -149,12 +166,41 @@ class _OldGridOverlay extends StatelessWidget {
       );
     }
 
-    // Keep the fading overlay glued to the map when the camera pans
-    // between zoom steps.
-    final panShift = Offset(
-      -(manager.centerTileLng - snapshot.anchorTileLng) * tileWidth,
-      -(manager.centerTileLat - snapshot.anchorTileLat) * tileHeight,
-    );
+    // Keep the fading overlay glued to the camera. During a pinch the exact
+    // transform is derived from the snapshot's original camera and current
+    // camera, so any number of zoom levels and focal-point changes compose
+    // into one affine transform.
+    final Offset panShift;
+    if (interactionSnapshot) {
+      final currentScale = math.pow(2, manager.zoom - snapshot.zoom).toDouble();
+      final currentCenterAtSourceZoom = Offset(
+        manager.centerTileLng / currentScale,
+        manager.centerTileLat / currentScale,
+      );
+      final focal = Offset(
+        (scaleAlignment.x + 1) * size.width / 2,
+        (scaleAlignment.y + 1) * size.height / 2,
+      );
+      panShift = Offset(
+        manager.centerCanvasX -
+            focal.dx -
+            (snapshot.sourceCenterCanvasX - focal.dx) * currentScale +
+            (snapshot.sourceCenterTileLng - currentCenterAtSourceZoom.dx) *
+                tileWidth *
+                currentScale,
+        manager.centerCanvasY -
+            focal.dy -
+            (snapshot.sourceCenterCanvasY - focal.dy) * currentScale +
+            (snapshot.sourceCenterTileLat - currentCenterAtSourceZoom.dy) *
+                tileHeight *
+                currentScale,
+      );
+    } else {
+      panShift = Offset(
+        -(manager.centerTileLng - snapshot.anchorTileLng) * tileWidth,
+        -(manager.centerTileLat - snapshot.anchorTileLat) * tileHeight,
+      );
+    }
 
     return Positioned.fill(
       key: const ValueKey('zoom-scale'),
@@ -295,6 +341,11 @@ class MapView extends StatefulWidget {
   /// arrivals in one frame produce a single map update.
   @visibleForTesting
   static int debugBuildCount = 0;
+
+  /// Counts zoom-transition starts. Test hook used to prove a multi-level
+  /// pinch creates one transition rather than one per crossed integer zoom.
+  @visibleForTesting
+  static int debugZoomTransitionCount = 0;
 
   final LatLng latLng;
   final int zoom;
@@ -467,6 +518,12 @@ class _MapViewState extends State<MapView>
   /// `ImageFiltered` pass while the camera is moving.
   bool _interacting = false;
 
+  /// Whether the current pinch already started its one zoom transition.
+  /// Only the first crossed integer zoom builds a snapshot/wait/scale state;
+  /// later steps move the camera and re-anchor that same snapshot instead of
+  /// recreating the transition on every level.
+  bool _pinchTransitionActive = false;
+
   // ── Double-tap focal point ──────────────────────────────────────────
   Offset _doubleTapLocal = Offset.zero;
 
@@ -561,7 +618,7 @@ class _MapViewState extends State<MapView>
   void _notify() {
     // If we're in the wait phase and new tiles are now ready, kick off
     // the scale animation before setState to avoid a wasted frame.
-    if (_animWaitingTiles && _newTilesReady()) {
+    if (_animWaitingTiles && !_interacting && _newTilesReady()) {
       _beginScalePhase();
     }
     if (mounted) setState(() {});
@@ -822,6 +879,8 @@ class _MapViewState extends State<MapView>
 
   void _startZoomAnimation(
       TileManager manager, int targetZoom, Offset? focalLocal) {
+    MapView.debugZoomTransitionCount++;
+    _pinchTransitionActive = false;
     // Cancel any in-progress animation.
     _animController.stop();
     _stopPanAnimation();
@@ -876,6 +935,38 @@ class _MapViewState extends State<MapView>
     setState(() {});
   }
 
+  /// Captures one old grid for the whole pinch and switches the backing
+  /// camera without starting a time-based animation. The snapshot follows
+  /// direct manipulation until scale end, then performs one settle/fade.
+  void _startPinchTransition(
+    TileManager manager,
+    int targetZoom,
+    Offset focal,
+  ) {
+    MapView.debugZoomTransitionCount++;
+    _animController.stop();
+    _stopPanAnimation();
+    _animWaitTimer?.cancel();
+    _animWaitTimer = null;
+
+    manager.calculate();
+    _animOldSnapshot = _GridSnapshot.from(manager);
+    _animIsZoomIn = targetZoom > manager.zoom;
+    _visualScaleFocal = focal;
+    manager.setZoomWithFocalPoint(targetZoom, focal, manager.zoom);
+    _currentZoom = targetZoom;
+    widget.onZoomChanged?.call(targetZoom);
+    MapZoomChangeNotification(targetZoom).dispatch(context);
+    _notifyCamera(manager);
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+        .dispatch(context);
+
+    _animWaitingTiles = true;
+    _visualScale =
+        math.pow(2, manager.zoom - _animOldSnapshot!.zoom).toDouble();
+    setState(() {});
+  }
+
   /// Returns true when all strict-viewport tiles in the new zoom have
   /// loaded. Padding and off-world cells are ignored, so a vector-mode
   /// padding ring (intentionally bytes-only) never delays the scale
@@ -894,15 +985,16 @@ class _MapViewState extends State<MapView>
     _animWaitTimer?.cancel();
     _animWaitTimer = null;
 
+    final settleScale = _visualScale;
     _scaleAnimation = Tween<double>(
-      begin: 1.0,
-      end: _animIsZoomIn ? 2.0 : 0.5,
+      begin: _pinchTransitionActive ? settleScale : 1.0,
+      end: _pinchTransitionActive ? settleScale : (_animIsZoomIn ? 2.0 : 0.5),
     ).animate(CurvedAnimation(
       parent: _animController,
       curve: Curves.easeInOut,
     ));
 
-    _visualScale = 1.0;
+    if (!_pinchTransitionActive) _visualScale = 1.0;
     _animController.forward(from: 0.0);
   }
 
@@ -923,6 +1015,7 @@ class _MapViewState extends State<MapView>
     // Animation done — remove old grid overlay.
     _animOldSnapshot = null;
     _animWaitingTiles = false;
+    _pinchTransitionActive = false;
     _visualScale = 1.0;
     setState(() {});
   }
@@ -940,19 +1033,25 @@ class _MapViewState extends State<MapView>
       _animWaitTimer = null;
       _animOldSnapshot = null;
       _animWaitingTiles = false;
+      _pinchTransitionActive = false;
       _visualScale = 1.0;
     }
     _stopPanAnimation();
+    _interacting = false;
 
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
     _scaleStartZoom = manager.zoom;
     _scaleStartFocal = details.localFocalPoint;
     _scaleStartScale = 1.0;
-    _interacting = true;
+    _pinchTransitionActive = false;
   }
 
   void _onScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
+    // Mark direct manipulation only once the gesture actually moves: a
+    // plain tap also raises scale-start, and that must not disable the
+    // zoom transition's blur.
+    _interacting = true;
     final startZoom = _scaleStartZoom;
     final startFocal = _scaleStartFocal;
     final startScale = _scaleStartScale;
@@ -975,16 +1074,27 @@ class _MapViewState extends State<MapView>
         (startZoom + zoomDelta).round().clamp(widget.minZoom, widget.maxZoom);
 
     if (newZoom != manager.zoom) {
-      if (widget.animateZoom) {
-        // Same scale transition as double-tap and the ± buttons — honors
-        // [MapView.zoomAnimationDuration].
-        _startZoomAnimation(manager, newZoom, focalLocal);
+      if (widget.animateZoom && !_pinchTransitionActive) {
+        // First zoom step of this pinch: build the snapshot/wait/scale
+        // state exactly once. Later steps within the same gesture are
+        // handled below by moving the camera and re-anchoring that snapshot,
+        // so a multi-level pinch no longer recreates a full transition (and
+        // a full-viewport blur layer) at every crossed integer zoom.
+        _pinchTransitionActive = true;
+        _startPinchTransition(manager, newZoom, focalLocal);
       } else {
         manager.setZoomWithFocalPoint(newZoom, focalLocal, manager.zoom);
         _currentZoom = newZoom;
         widget.onZoomChanged?.call(newZoom);
         MapZoomChangeNotification(newZoom).dispatch(context);
         _notifyCamera(manager);
+        // Keep the existing interaction snapshot aligned with the new
+        // camera instead of capturing a fresh one.
+        final snap = _animOldSnapshot;
+        if (snap != null && !_pinchTransitionActive) {
+          snap.anchorTileLng = manager.centerTileLng;
+          snap.anchorTileLat = manager.centerTileLat;
+        }
       }
 
       // Re-baseline the gesture: the camera (and its tile-space anchor)
@@ -1008,6 +1118,12 @@ class _MapViewState extends State<MapView>
       _notifyCamera(manager);
     }
 
+    final snapshot = _animOldSnapshot;
+    if (_pinchTransitionActive && snapshot != null) {
+      _visualScaleFocal = focalLocal;
+      _visualScale = math.pow(2, manager.zoom - snapshot.zoom).toDouble();
+    }
+
     setState(() {});
   }
 
@@ -1021,7 +1137,22 @@ class _MapViewState extends State<MapView>
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
     _scaleStartFocal = null;
+    _scaleStartScale = null;
     _interacting = false;
+
+    if (_pinchTransitionActive && _animOldSnapshot != null) {
+      if (_newTilesReady()) {
+        _beginScalePhase();
+      } else {
+        _animWaitingTiles = true;
+        _animWaitTimer?.cancel();
+        _animWaitTimer = Timer(_animWaitTimeout, () {
+          if (!mounted || !_animWaitingTiles || _interacting) return;
+          _beginScalePhase();
+        });
+      }
+      if (mounted) setState(() {});
+    }
   }
 
   /// Cluster tap: dispatches notification, calls the optional callback,
@@ -1103,12 +1234,12 @@ class _MapViewState extends State<MapView>
 
         // Compute scale alignment from focal point.
         final alignmentX =
-            (size.width > 0) ? _visualScaleFocal.dx / size.width : 0.5;
+            size.width > 0 ? 2 * _visualScaleFocal.dx / size.width - 1 : 0.0;
         final alignmentY =
-            (size.height > 0) ? _visualScaleFocal.dy / size.height : 0.5;
+            size.height > 0 ? 2 * _visualScaleFocal.dy / size.height - 1 : 0.0;
         final scaleAlignment = Alignment(
-          alignmentX.clamp(0.0, 1.0),
-          alignmentY.clamp(0.0, 1.0),
+          alignmentX.clamp(-1.0, 1.0),
+          alignmentY.clamp(-1.0, 1.0),
         );
 
         return GestureDetector(
@@ -1168,6 +1299,7 @@ class _MapViewState extends State<MapView>
                           waiting: _animWaitingTiles,
                           visualScale: _visualScale,
                           blurSigma: _blurSigma,
+                          interactionSnapshot: _pinchTransitionActive,
                           blurEnabled: !kIsWeb && !_interacting,
                         ),
                       ],
@@ -1221,6 +1353,10 @@ class _MapViewState extends State<MapView>
                     child: CustomPaint(
                       size: size,
                       painter: VectorLabelPainter(
+                        // Labels prepare after their base image is published
+                        // and notify this notifier; only the label surface
+                        // repaints, leaving tiles, markers, controls alone.
+                        repaint: runtime.labelsNotifier,
                         horizontalTileCount: manager.horizontalTileCount,
                         verticalTileCount: manager.verticalTileCount,
                         leftColumnTilesLngIndex:

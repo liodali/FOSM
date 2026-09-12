@@ -9,7 +9,7 @@ import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/api/tile_source.dart'
-    show TilePayloadException, tileUrl;
+    show TileDecodeAborted, TilePayloadException, tileUrl;
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
@@ -1769,6 +1769,54 @@ void main() {
       expect(stored, equals(fakeTilePng));
     });
 
+    testWidgets('shared corrupt bytes are invalidated and refetched once',
+        (tester) async {
+      var fetches = 0;
+      Future<Uint8List> fetcher(int z, int x, int y) async {
+        fetches++;
+        return fakeTilePng;
+      }
+
+      final manager = TileManager.init(
+        width: 1024,
+        height: 768,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: fetcher,
+        decoder: sentinelAwareDecoder,
+        resourceKeyBuilder: (z, x, y) => 'res/shared',
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      // Every logical slot resolves the same corrupt resource.
+      await tester.runAsync(() async {
+        await manager.storeTile(
+          'res/shared',
+          Tile(null, 'res/shared', 4, 4),
+          corruptBytes,
+        );
+      });
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await _runUntil(
+        tester,
+        () => manager.renderTiles.any((t) => t.sourceTile != null),
+      );
+
+      expect(fetches, 1,
+          reason: 'siblings must share one recovery refetch, not one each');
+      expect(
+        manager.renderTiles.where((t) => t.sourceTile != null),
+        isNotEmpty,
+        reason: 'the valid replacement payload must still publish',
+      );
+    });
+
     testWidgets('a legacy logical-key entry is read, migrated, and removed',
         (tester) async {
       final fetchCounts = <String, int>{};
@@ -1838,6 +1886,82 @@ void main() {
       expect(migrated, equals(fakeTilePng));
       expect(manager.hasStoredTile(legacyKey), isFalse,
           reason: 'the legacy entry must be removed after migration');
+    });
+
+    testWidgets('a legacy record survives an aborted decode', (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (z, x, y) async => fakeTilePng,
+        resourceKeyBuilder: (z, x, y) => 'res/$z/$x/$y',
+        decoder: (bytes, z, x, y) async => throw const TileDecodeAborted(),
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      const legacyKey = '3/4/4';
+      const canonicalKey = 'res/3/4/4';
+      await tester.runAsync(() async {
+        await manager.storeTile(
+          legacyKey,
+          Tile(null, legacyKey, 4, 4),
+          fakeTilePng,
+        );
+      });
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+
+      expect(manager.hasStoredTile(legacyKey), isTrue,
+          reason: 'an aborted decode must not delete the legacy record');
+      expect(manager.hasStoredTile(canonicalKey), isFalse,
+          reason: 'migration must wait for a successful decode');
+    });
+
+    testWidgets('a legacy record survives a transient decode error',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (z, x, y) async => fakeTilePng,
+        resourceKeyBuilder: (z, x, y) => 'res/$z/$x/$y',
+        decoder: (bytes, z, x, y) async => throw StateError('transient'),
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      const legacyKey = '3/4/4';
+      const canonicalKey = 'res/3/4/4';
+      await tester.runAsync(() async {
+        await manager.storeTile(
+          legacyKey,
+          Tile(null, legacyKey, 4, 4),
+          fakeTilePng,
+        );
+      });
+
+      try {
+        await tester.runAsync(() async {
+          manager.calculate();
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        });
+
+        expect(manager.hasStoredTile(legacyKey), isTrue,
+            reason: 'a transient error must not delete the legacy record');
+        expect(manager.hasStoredTile(canonicalKey), isFalse,
+            reason: 'migration must wait for a successful decode');
+      } finally {
+        // Cancel the failure-backoff retry timer before teardown.
+        manager.dispose();
+      }
     });
 
     testWidgets('malformed network bytes are not persisted', (tester) async {
@@ -2259,6 +2383,67 @@ void main() {
     });
   });
 
+  group('split resource and presentation stages', () {
+    testWidgets('new-camera fetches start while old decodes are still pending',
+        (tester) async {
+      final fetchStarted = <String>[];
+      final decoders = <String, Completer<ui.Image>>{};
+
+      Future<Uint8List> fetcher(int z, int x, int y) async {
+        fetchStarted.add('$z/$x/$y');
+        return fakeTilePng;
+      }
+
+      Future<ui.Image> decoder(Uint8List bytes, int z, int x, int y) {
+        final completer = Completer<ui.Image>();
+        decoders['$z/$x/$y'] = completer;
+        return completer.future;
+      }
+
+      final manager = TileManager.init(
+        width: 2048,
+        height: 512,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: fetcher,
+        decoder: decoder,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Fetches complete quickly; the decodes stay pending and, before the
+      // split, would hold every foreground permit.
+      await _flushAsync(tester);
+      expect(decoders.length,
+          greaterThanOrEqualTo(TileManager.maxConcurrentVisibleLoads));
+      expect(fetchStarted.length,
+          greaterThanOrEqualTo(TileManager.maxConcurrentVisibleLoads));
+      final fetchesBefore = fetchStarted.length;
+
+      // Pan to a completely new set of tiles while the old decodes are still
+      // pending. The new resources must be fetched without waiting for a
+      // decode slot.
+      manager.setCenterFromTileCoords(24, 16);
+      manager.calculate();
+      await _flushAsync(tester);
+
+      expect(fetchStarted.length, greaterThan(fetchesBefore),
+          reason: 'resource permits must not be held across presentation');
+
+      // Release the pending decoders so the manager disposes cleanly.
+      await tester.runAsync(() async {
+        for (final completer in decoders.values.toList()) {
+          if (completer.isCompleted) continue;
+          completer.complete(await Tile.decodeImage(fakeTilePng));
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      manager.dispose();
+    });
+  });
+
   group('presentation priority', () {
     testWidgets('visible work outranks off-screen and older generations',
         (tester) async {
@@ -2297,5 +2482,80 @@ void main() {
       });
       await tester.pump();
     });
+
+    testWidgets('the newest-generation centre starts before held old work',
+        (tester) async {
+      // A viewport large enough that the presentation lane is saturated and
+      // every initial decode can be held open deterministically.
+      final started = <String>[];
+      final gates = <String, Completer<void>>{};
+      Future<ui.Image> holdingDecoder(
+          Uint8List bytes, int z, int x, int y) async {
+        final key = '$z/$x/$y';
+        started.add(key);
+        final gate = gates.putIfAbsent(key, Completer<void>.new);
+        await gate.future;
+        return Tile.decodeImage(fakeTilePng);
+      }
+
+      final manager = TileManager.init(
+        width: 1024,
+        height: 768,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (z, x, y) async => fakeTilePng,
+        decoder: holdingDecoder,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      expect(started.length, greaterThanOrEqualTo(6),
+          reason: 'the initial view must saturate the presentation lane');
+      final heldBefore = started.length;
+
+      // Change zoom while every old-generation presentation is still held.
+      // New-generation presentations can only queue behind them.
+      await tester.runAsync(() async {
+        manager.setZoom(5);
+        manager.calculate();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      expect(started.length, heldBefore,
+          reason: 'no new presentation can start while the lane is full');
+      expect(_containsZoom(started, 5), isFalse);
+
+      final centre = '5/${manager.centerTileLng.floor()}/'
+          '${manager.centerTileLat.floor()}';
+      expect(gates.containsKey(centre), isFalse,
+          reason: 'the newest centre must be queued, not started yet');
+
+      // Free exactly one slot; the scheduler must pick the newest centre
+      // rather than any of the older queued/held work.
+      final nextIndex = started.length;
+      await tester.runAsync(() async {
+        gates.values.firstWhere((g) => !g.isCompleted).complete();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      expect(started.length, greaterThan(nextIndex));
+      expect(started[nextIndex], centre,
+          reason: 'the newest-generation centre tile must start next');
+
+      // Release the remaining decodes so the manager can dispose cleanly.
+      await tester.runAsync(() async {
+        for (final gate in gates.values.toList()) {
+          if (!gate.isCompleted) gate.complete();
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      });
+      manager.dispose();
+    });
   });
 }
+
+bool _containsZoom(List<String> keys, int zoom) =>
+    keys.any((key) => key.startsWith('$zoom/'));

@@ -130,73 +130,86 @@ class VectorTileRenderer {
       check();
     }
 
-    check();
-    for (final layer in visible) {
-      Iterable<void> chunks = const <void>[];
-      switch (layer.type) {
-        case StyleLayerType.background:
-          _paintBackground(canvas, layer, ctx);
-        case StyleLayerType.raster:
-          _paintRaster(canvas, layer, ctx, z, x, y, rasterTiles, rasterCoords);
-        case StyleLayerType.fill:
-          chunks = _paintFillLikeChunks(
-            canvas,
-            layer,
-            decoded,
-            srcZ,
-            z,
-            x,
-            y,
-            ctx,
-            extrusion: false,
-          );
-        case StyleLayerType.line:
-          chunks = _paintLineChunks(
-            canvas,
-            layer,
-            decoded,
-            srcZ,
-            z,
-            x,
-            y,
-            ctx,
-          );
-        case StyleLayerType.circle:
-          chunks = _paintCircleChunks(
-            canvas,
-            layer,
-            decoded,
-            srcZ,
-            z,
-            x,
-            y,
-            ctx,
-          );
-        case StyleLayerType.fillExtrusion:
-          chunks = _paintFillLikeChunks(
-            canvas,
-            layer,
-            decoded,
-            srcZ,
-            z,
-            x,
-            y,
-            ctx,
-            extrusion: true,
-          );
-        case StyleLayerType.symbol:
-          continue; // label overlay
-        case StyleLayerType.unknown:
-          continue;
-      }
+    try {
+      check();
+      for (final layer in visible) {
+        Iterable<void> chunks = const <void>[];
+        switch (layer.type) {
+          case StyleLayerType.background:
+            _paintBackground(canvas, layer, ctx);
+          case StyleLayerType.raster:
+            _paintRaster(
+                canvas, layer, ctx, z, x, y, rasterTiles, rasterCoords);
+          case StyleLayerType.fill:
+            chunks = _paintFillLikeChunks(
+              canvas,
+              layer,
+              decoded,
+              srcZ,
+              z,
+              x,
+              y,
+              ctx,
+              extrusion: false,
+            );
+          case StyleLayerType.line:
+            chunks = _paintLineChunks(
+              canvas,
+              layer,
+              decoded,
+              srcZ,
+              z,
+              x,
+              y,
+              ctx,
+            );
+          case StyleLayerType.circle:
+            chunks = _paintCircleChunks(
+              canvas,
+              layer,
+              decoded,
+              srcZ,
+              z,
+              x,
+              y,
+              ctx,
+            );
+          case StyleLayerType.fillExtrusion:
+            chunks = _paintFillLikeChunks(
+              canvas,
+              layer,
+              decoded,
+              srcZ,
+              z,
+              x,
+              y,
+              ctx,
+              extrusion: true,
+            );
+          case StyleLayerType.symbol:
+            continue; // label overlay
+          case StyleLayerType.unknown:
+            continue;
+        }
 
-      for (final _ in chunks) {
+        for (final _ in chunks) {
+          await maybeYield();
+        }
         await maybeYield();
       }
-      await maybeYield();
-    }
 
-    return recorder.endRecording();
+      return recorder.endRecording();
+    } catch (_) {
+      // Cancellation or render failure: end the recorder and dispose the
+      // partial picture so CanvasKit/Skia resources are released now rather
+      // than when the abandoned recorder is garbage collected.
+      try {
+        recorder.endRecording().dispose();
+      } catch (_) {
+        // The recorder may already be unusable; the dispose is best-effort.
+      }
+      rethrow;
+    }
   }
 
   /// Synchronous render for callers that don't need chunking (tests,
