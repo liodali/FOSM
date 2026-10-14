@@ -664,25 +664,32 @@ Labels are rendered as an overlay (not baked into tiles):
 
 ### Memory Cache (LRU)
 
-```dart
-final LinkedHashMap<String, ui.Image> _memoryCache = LinkedHashMap();
-static const int maxMemoryCachedTiles = 200;
+Rendered tiles use a 50 MiB budget based on estimated RGBA pixel memory
+(`width × height × 4`), rather than a fixed tile count. Recently viewed tiles
+remain available for up to 20 seconds after leaving the grid, so returning to
+an area or zoom level can reuse the same image without decoding it again.
+Unused images are evicted in least-recently-used order when the budget is full,
+and a timer releases expired images even when the camera stays still.
 
-void _trimMemoryCache() {
-  while (_memoryCache.length > maxMemoryCachedTiles) {
-    final oldestKey = _memoryCache.keys.first;
-    final image = _memoryCache.remove(oldestKey);
-    if (!isVisible(oldestKey)) {
-      image.dispose(); // Free GPU memory
-    }
-  }
-}
+Configure the budget and retention on the map; rebuilding with new values
+updates the existing cache:
+
+```dart
+MapView(
+  latLng: const LatLng(latitude: 47.4358, longitude: 8.4737),
+  zoom: 10,
+  maxRenderedCacheBytes: 32 * 1024 * 1024,
+  renderedCacheRetention: const Duration(seconds: 20),
+)
 ```
 
-**Benefits:**
-- O(1) access time
-- Automatic eviction of least-recently-used tiles
-- GPU memory management (dispose off-screen tiles)
+Images used by the current grid (including its padding) or an active zoom
+snapshot are protected from eviction. These images can exceed the budget when
+the viewport or snapshot requires more memory; unused images are released
+first. Snapshot protection ends when the animation completes, is interrupted,
+or the map is disposed or changes style. Set either option to zero to disable
+retention of unused images. The estimate excludes engine/GPU overhead and
+does not include compressed bytes, parsed vector data, or labels.
 
 ### Byte Cache (Pre-loaded Tiles)
 
@@ -703,15 +710,51 @@ void _storeInByteCache(String key, Uint8List bytes) {
 
 ### Disk Cache (Hive)
 
+All maps share a persistent cache with a default **256 MiB compressed-payload
+budget** and **seven-day lifetime**. Expiry is measured from storage; reading a
+tile updates its LRU priority without extending its lifetime. Expired records
+are ignored immediately and removed during initialization, writes, or explicit
+maintenance. Excess records are evicted in least-recently-used order.
+
 ```dart
-await storeTile(key, tile, bytes);           // Write
-final bytes = await storedTileBytes(key);    // Read
+await initMap(
+  diskCacheOptions: const MapDiskCacheOptions(
+    maxBytes: 256 * 1024 * 1024,
+    maxAge: Duration(days: 7),
+  ),
+);
+
+final stats = await MapDiskCache.stats();
+print('${stats.entryCount} tiles, ${stats.sizeBytes} bytes');
+print('${stats.hits} hits, ${stats.misses} misses');
+
+// Update the policy and prune immediately.
+await MapDiskCache.configure(const MapDiskCacheOptions(
+  maxBytes: 128 * 1024 * 1024,
+  maxAge: Duration(days: 7),
+));
+
+await MapDiskCache.prune(); // Also compacts Hive storage where supported.
+await MapDiskCache.clear(); // All FOSM tile namespaces; resets counters.
 ```
 
-**Features:**
-- Persistent across app restarts
-- Separate namespace per vector style
-- Automatic corruption detection (delete + re-download)
+The budget counts compressed tile payloads, excluding Hive metadata and storage
+overhead. It is shared across raster and vector namespaces. Tiles larger than
+the budget are rendered without being stored. Set `maxBytes: 0` to disable
+persistent storage or `maxAge: null` to disable expiry. Select a lifetime that
+meets your tile provider's caching requirements; the standard OSM service
+requires at least seven days when HTTP caching headers are unavailable.
+[OSM tile policy](https://operations.osmfoundation.org/policies/tiles/)
+
+Legacy raw-byte and base64 records remain readable. Records without timestamps
+receive an age baseline when indexed, while retaining their payloads, keys, and
+coordinates. The added metadata is compatible with older readers. LRU access
+metadata is flushed on writes and maintenance (`stats`, `prune`, `configure`).
+
+Clearing affects only the persistent tile box. In-memory tiles and currently
+displayed maps remain usable, and subsequent map activity may populate the disk
+cache again. Before `initMap`, statistics report `isInitialized: false`, clearing
+and pruning are safe no-ops, and configuration is saved for initialization.
 
 ## 📊 Performance Optimizations
 
@@ -916,6 +959,49 @@ MapView(
 ```
 
 ## 🔧 Advanced Usage
+
+### Loading and request failures
+
+`requestTimeout` sets a positive total deadline for each HTTP request, including
+response headers and the complete body (default: 30 seconds). It applies to
+tiles, style documents, TileJSON, raster sources, and sprite downloads. Native
+HTTP and Dio requests are cancelled on timeout/disposal. Custom tile fetchers
+are bounded at the map boundary; their late results are ignored, but the library
+cannot cancel work inside an application-supplied callback. Updating the timeout
+affects subsequent requests.
+
+```dart
+MapView(
+  latLng: const LatLng(latitude: 47.4358, longitude: 8.4737),
+  zoom: 10,
+  requestTimeout: const Duration(seconds: 15),
+  loadingBuilder: (context, state) => Align(
+    alignment: Alignment.topCenter,
+    child: Text('${state.loadedTiles}/${state.totalTiles} tiles loaded'),
+  ),
+  errorBuilder: (context, state, retry) => Align(
+    alignment: Alignment.topLeft,
+    child: TextButton(onPressed: retry, child: const Text('Retry map loading')),
+  ),
+  onTileError: (failure) {
+    print('${failure.zoom}/${failure.x}/${failure.y}: ${failure.error.kind}');
+  },
+)
+```
+
+`MapLoadState` reports the current stage (`style` or `tiles`), loaded/loading
+viewport counts, and typed failures. Padding/preload failures and tiles that
+have left the viewport do not appear in the error overlay. Successfully loaded
+tiles stay visible during partial failures. Loading overlays ignore pointers so
+map gestures and markers continue to work. Style placeholders use the same
+builders before a tile grid is available.
+
+`TileLoadException` exposes `kind`, `statusCode`, and `isRetryable`. Built-in
+messages omit request URLs and credentials. Network, timeout, decode,
+HTTP 408/429, and HTTP 5xx failures retry after the existing five-second backoff.
+Other HTTP failures wait for explicit retry. The default error UI includes a
+Retry button; retry preserves loaded tiles and prioritizes missing viewport
+tiles. Optional missing sprites continue to be omitted without blocking tiles.
 
 ### Custom Tile Source
 
