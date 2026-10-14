@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
+import 'package:fosm/src/view/render.dart';
 
 /// Minimal valid 1×1 RGBA PNG — decodable by Flutter's image codec.
 final Uint8List _tinyPng = Uint8List.fromList([
@@ -106,13 +107,29 @@ void main() {
     expect(completers, isNotEmpty);
 
     // Complete the first foreground batch in the same event-loop turn.
-    for (final completer in completers.values.toList()) {
+    final batch = completers.values.toList();
+    for (final completer in batch) {
       if (!completer.isCompleted) completer.complete(_tinyPng);
     }
 
-    // Raster image decoding needs the real event loop.
+    // Wait for actual decoding without pumping another frame, so the assertion
+    // measures one batch of arrivals even when the test machine is busy.
     await tester.runAsync(() async {
-      await Future<void>.delayed(const Duration(milliseconds: 200));
+      final watch = Stopwatch()..start();
+      bool decoded() =>
+          tester
+              .widgetList<CustomPaint>(find.byType(CustomPaint))
+              .map((paint) => paint.painter)
+              .whereType<RenderCanvasOSM>()
+              .single
+              .tiles
+              .where((tile) => tile.sourceTile != null)
+              .length >=
+          batch.length;
+      while (!decoded() && watch.elapsed < const Duration(seconds: 5)) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(decoded(), isTrue, reason: 'the complete first batch must decode');
     });
 
     await tester.pump();

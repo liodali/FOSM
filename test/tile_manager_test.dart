@@ -310,6 +310,88 @@ void main() {
   });
 
   group('TileManager memory cache', () {
+    testWidgets('return pan and zoom reuse rendered images without decoding',
+        (tester) async {
+      var decodes = 0;
+      final manager = TileManager.init(
+        width: 128,
+        height: 128,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: _fakeFetcher,
+        decoder: (bytes, z, x, y) async {
+          decodes++;
+          return Tile.decodeImage(bytes);
+        },
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+      manager.calculate();
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      final original = {
+        for (final tile in manager.renderTiles) tile.index: tile.sourceTile,
+      };
+
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 0, longitude: 45),
+      );
+      manager.calculate();
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      final afterPan = decodes;
+      manager.setCenterTile(
+        latLng: const LatLng(latitude: 0, longitude: 0),
+      );
+      manager.calculate();
+      expect(manager.visibleTilesReady, isTrue);
+      expect(decodes, afterPan);
+      for (final tile in manager.renderTiles) {
+        expect(tile.sourceTile, same(original[tile.index]));
+      }
+
+      manager.setZoom(6);
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      final afterZoom = decodes;
+      manager.setZoom(5);
+      expect(manager.visibleTilesReady, isTrue);
+      expect(decodes, afterZoom);
+      for (final tile in manager.renderTiles) {
+        expect(tile.sourceTile, same(original[tile.index]));
+      }
+      manager.dispose();
+    });
+
+    testWidgets('snapshot survives grid changes under a zero-byte budget',
+        (tester) async {
+      final manager = TileManager.init(
+        width: 128,
+        height: 128,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: _fakeFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+        maxRenderedCacheBytes: 0,
+      );
+      addTearDown(manager.dispose);
+      manager.calculate();
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      final oldImages = manager.renderTiles.map((t) => t.sourceTile!).toList();
+      final release = manager.retainSnapshot(manager.renderTiles);
+      manager.setZoom(6);
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      expect(oldImages.every((image) => !image.debugDisposed), isTrue);
+      release();
+      expect(oldImages.every((image) => image.debugDisposed), isTrue);
+      expect(
+        manager.renderTiles.every((tile) => !tile.sourceTile!.debugDisposed),
+        isTrue,
+      );
+      manager.dispose();
+      release();
+      expect(manager.renderedCacheBytes, 0);
+    });
+
     testWidgets('memory cache hit avoids re-fetch on recalculate',
         (tester) async {
       var fetchCount = 0;
@@ -1487,6 +1569,7 @@ void main() {
       }
       await _runUntil(
           tester, () => backgroundStarted.length > backgroundBefore);
+      manager.dispose();
     });
   });
 
@@ -1639,6 +1722,92 @@ void main() {
       }
       return Tile.decodeImage(bytes);
     }
+
+    testWidgets('reading existing disk tiles preserves their original age',
+        (tester) async {
+      final oldTimestamp = DateTime.now()
+          .subtract(const Duration(days: 3))
+          .millisecondsSinceEpoch;
+      await tester.runAsync(() async {
+        for (final x in [3, 4]) {
+          for (final y in [3, 4]) {
+            await Hive.box(CacheTiles.boxCache).put('3/$x/$y', {
+              'image': fakeTilePng,
+              'latIndex': y,
+              'lngIndex': x,
+              'cachedAt': oldTimestamp,
+              'lastAccessedAt': oldTimestamp,
+              'byteLength': fakeTilePng.length,
+            });
+          }
+        }
+      });
+      final manager = TileManager.init(
+        width: 128,
+        height: 128,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: _failingFetcher,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+      manager.calculate();
+      await _runUntil(tester, () => manager.visibleTilesReady);
+      await _flushAsync(tester);
+      for (final tile in manager.renderTiles) {
+        expect(
+            (Hive.box(CacheTiles.boxCache).get(tile.index) as Map)['cachedAt'],
+            oldTimestamp);
+      }
+      manager.dispose();
+    });
+
+    testWidgets('a live manager can persist cached bytes again after clearing',
+        (tester) async {
+      var fetches = 0;
+      final manager = TileManager.init(
+        width: 128,
+        height: 128,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (z, x, y) async {
+          fetches++;
+          return fakeTilePng;
+        },
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+        renderedCacheRetention: Duration.zero,
+      );
+      addTearDown(manager.dispose);
+      Future<void> waitForPersistence() async {
+        final watch = Stopwatch()..start();
+        bool persisted() =>
+            manager.visibleTilesReady &&
+            manager.renderTiles
+                .every((tile) => manager.hasStoredTile(tile.index));
+        while (!persisted() && watch.elapsed < const Duration(seconds: 5)) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        expect(persisted(), isTrue);
+      }
+
+      // Keep all file commits in the real async zone. Fake async cannot
+      // drive queued commits while runAsync is awaiting a clear operation.
+      await tester.runAsync(() async {
+        manager.calculate();
+        await waitForPersistence();
+        manager.setZoom(4);
+        await waitForPersistence();
+        final beforeReturn = fetches;
+        await MapDiskCache.clear();
+        manager.setZoom(3);
+        await waitForPersistence();
+        expect(fetches, beforeReturn);
+      });
+      await tester.pump();
+      manager.dispose();
+    });
 
     testWidgets('a corrupt byte-cache entry is dropped and refetched',
         (tester) async {
@@ -1879,9 +2048,12 @@ void main() {
         final stopwatch = Stopwatch()..start();
         while (stopwatch.elapsed < const Duration(seconds: 5)) {
           migrated = await manager.storedTileBytes(canonicalKey);
-          if (migrated != null) break;
+          if (migrated != null && !manager.hasStoredTile(legacyKey)) break;
           await Future<void>.delayed(Duration.zero);
         }
+        // A readable Hive value can appear before the write future settles.
+        // Wait for migration's deletion and the queued maintenance commits.
+        await MapDiskCache.stats();
       });
       expect(migrated, equals(fakeTilePng));
       expect(manager.hasStoredTile(legacyKey), isFalse,
@@ -2312,6 +2484,7 @@ void main() {
       await drain(tester);
       await tester.pump();
       expect(notifications, 2);
+      manager.dispose();
     });
 
     testWidgets('off-screen-only completion never notifies', (tester) async {
@@ -2352,6 +2525,8 @@ void main() {
       await tester.pump();
 
       expect(notifications, 0);
+      manager.dispose();
+      manager.dispose();
     });
 
     testWidgets('camera changes bump the grid revision, not content',
@@ -2481,6 +2656,7 @@ void main() {
         await Future<void>.delayed(const Duration(milliseconds: 50));
       });
       await tester.pump();
+      manager.dispose();
     });
 
     testWidgets('the newest-generation centre starts before held old work',
