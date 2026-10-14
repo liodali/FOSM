@@ -11,6 +11,7 @@ A high-performance Flutter map library with native raster and vector tile render
 - 🗺️ **Dual Rendering Modes**: Native raster (OSM) and vector (Mapbox Vector Tiles) rendering
 - 📍 **Markers**: Any Flutter widget (or plain text) anchored to lat/lon via `MarkerManager` — with tap/long-press gestures (hand cursor on hover) and marker-following overlays
 - 🛣️ **Polylines**: Render decoded route geometry (`List<LatLng>`) in any color/width, above tiles and below markers — works in raster and vector mode
+- **Map interactions**: Geographic taps/long presses, polygon areas with holes, and route/area selection with gesture priority
 - 🚀 **High Performance**: Persistent HTTP isolate with TCP connection reuse
 - 🎯 **Smart Caching**: Memory + disk (Hive) with intelligent eviction
 - 🌍 **OpenFreeMap Integration**: Free, no API key required vector tiles
@@ -372,6 +373,96 @@ geographically aligned through pan, pinch zoom, zoom controls, and
 **Known limitation:** a segment crossing the international date line
 (longitude `179` → `-179`) is drawn as a long straight line across the map
 rather than wrapping around the world.
+
+### Map taps and long presses
+
+Map callbacks receive a `LatLng` in the current camera projection:
+
+```dart
+MapView(
+  latLng: const LatLng(latitude: 47.4358, longitude: 8.4737),
+  zoom: 10,
+  onTap: (point) => print('Tapped ${point.latitude}, ${point.longitude}'),
+  onLongPress: (point) => markers.add(Marker(
+    point: point,
+    alignment: Alignment.bottomCenter,
+    child: const Icon(Icons.location_on),
+  )),
+  markers: markers,
+)
+```
+
+`MapTapNotification` and `MapLongPressNotification` also report `point` and
+`localPosition` (logical pixels relative to the map). The listener mixin exposes
+`onMapTapped` and `onMapLongPressed`. Longitude wraps to `[-180, 180)` and
+latitude clamps to the Web Mercator range at world edges. Dragging, pinching,
+and double-tapping continue to control the camera.
+
+### Polygons and area selection
+
+```dart
+MapView(
+  latLng: areaPoints.first,
+  zoom: 12,
+  polygons: [
+    MapPolygon(
+      points: areaPoints,
+      holes: [courtyardPoints],
+      color: const Color(0x403F51B5),
+      borderColor: Colors.indigo,
+      borderWidth: 2,
+      onTap: (hit) => print('Selected area at ${hit.point.latitude}'),
+      onLongPress: (hit) => print('Area long press'),
+    ),
+  ],
+)
+```
+
+Rings close automatically; winding direction does not matter. Holes should be
+disjoint and contained within the outer ring. Their interiors remain empty and
+pass presses through to underlying features or the map; painted hole borders
+can still be selected. Empty rings and rings with fewer than three vertices are
+valid transient states and paint nothing. Replace the geometry lists and rebuild
+to update or remove areas. Coordinates must be finite, within the Web Mercator
+latitude range and `[-180, 180]` longitude. Date-line wrapping is not supported.
+
+Polygons paint above tiles/zoom snapshots and below routes, markers, and vector
+labels. List order is paint order. Borders and `hitTolerance` use logical pixels.
+
+### Route selection and gesture priority
+
+```dart
+MapPolyline(
+  points: routePoints,
+  strokeWidth: 6,
+  hitTolerance: 10,
+  onTap: (hit) {
+    print('Selected segment ${hit.segmentIndex}');
+    print('Nearest route coordinate: ${hit.nearestPoint.latitude}, '
+        '${hit.nearestPoint.longitude}');
+    print('Distance from route: ${hit.distancePixels} pixels');
+  },
+)
+```
+
+`MapPolylineHit` reports the selected polyline, actual press coordinate (`point`),
+nearest projected route coordinate, segment index, and pixel distance. Hit testing
+uses the stroke width, optional border, and extra `hitTolerance` (default: 10).
+Dashed and dotted routes are selected as continuous lines, including their gaps.
+
+Shapes are decorative by default. A shape callback enables its gesture;
+`interactive: true` enables selection through notifications without callbacks.
+Global `MapView.onPolylineTap`, `onPolylineLongPress`, `onPolygonTap`, and
+`onPolygonLongPress` enable selection for all shapes of that type for that
+gesture. The matching notifications carry the hit result; the listener mixin
+exposes `onMapPolylineTapped`, `onMapPolylineLongPressed`, `onMapPolygonTapped`,
+and `onMapPolygonLongPressed`.
+
+Interactive markers and their overlays retain priority. Routes are considered
+above polygons, and overlapping eligible shapes are selected in reverse paint
+order. Only the selected feature receives the gesture; bare-map callbacks run
+when no feature is hit. Feature taps follow the existing `closeOnMapTap` marker
+overlay setting. Loaded tiles and camera gestures are unaffected by selection.
 
 ## 🏗️ Architecture
 

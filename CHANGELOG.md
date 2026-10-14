@@ -1,5 +1,10 @@
 ## Unreleased
 
+* Add geographic map tap/long-press callbacks and notifications, with feature selection that preserves marker and camera gesture priority.
+* Add `MapPolygon` fills, borders, holes, and selection below routes and markers.
+* Add polyline tap/long-press hit results with the nearest route point, segment index, pixel distance, and configurable hit tolerance.
+* Extend `MapEventListenerMixin` with map, polygon, and polyline interaction hooks and demonstrate area/route selection and long-press pins in the example.
+
 * Add configurable total HTTP request deadlines, cancellation on disposal, and typed `TileLoadException` failures across native and Dio transports.
 * Add `MapLoadState`, `MapView.loadingBuilder`, `errorBuilder`, and `onTileError`, with viewport progress and explicit retry while loaded tiles remain visible.
 * Retry transient failures automatically and require explicit retry for permanent HTTP errors; settle outstanding native worker requests during disposal.
