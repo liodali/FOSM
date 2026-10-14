@@ -5,6 +5,8 @@ import '../api/map_controller.dart';
 import '../api/map_notification.dart';
 import '../api/marker.dart';
 import '../api/marker_cluster.dart';
+import '../api/map_polyline.dart';
+import '../api/map_polygon.dart';
 
 /// Mixin for parent [State]s that want to react to map events.
 ///
@@ -44,6 +46,18 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
 
   bool _handleMapNotification(MapNotification notification) {
     switch (notification) {
+      case MapTapNotification(:final point):
+        onMapTapped(point);
+      case MapLongPressNotification(:final point):
+        onMapLongPressed(point);
+      case MapPolylineTapNotification(:final hit):
+        onMapPolylineTapped(hit);
+      case MapPolylineLongPressNotification(:final hit):
+        onMapPolylineLongPressed(hit);
+      case MapPolygonTapNotification(:final hit):
+        onMapPolygonTapped(hit);
+      case MapPolygonLongPressNotification(:final hit):
+        onMapPolygonLongPressed(hit);
       case MapReadyNotification(:final controller):
         onMapReady(controller);
       case MapCameraChangeNotification(:final center, :final zoom):
@@ -67,6 +81,13 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
   /// Called once after the map grid is laid out and the controller is
   /// attached.
   void onMapReady(MapController controller) {}
+
+  void onMapTapped(LatLng point) {}
+  void onMapLongPressed(LatLng point) {}
+  void onMapPolylineTapped(MapPolylineHit hit) {}
+  void onMapPolylineLongPressed(MapPolylineHit hit) {}
+  void onMapPolygonTapped(MapPolygonHit hit) {}
+  void onMapPolygonLongPressed(MapPolygonHit hit) {}
 
   /// Called whenever the map camera changes (pan or zoom).
   void onMapCameraChanged(LatLng center, int zoom) {}

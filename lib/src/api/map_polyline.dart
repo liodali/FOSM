@@ -63,6 +63,16 @@ class MapPolyline {
   /// Miter limit used when [strokeJoin] is [StrokeJoin.miter].
   final double strokeMiterLimit;
 
+  /// Enables notifications without callbacks. Callbacks also enable hit testing
+  /// for their respective gestures. Decorative routes remain non-interactive.
+  final bool interactive;
+
+  /// Extra selection distance beyond the visible stroke, in logical pixels.
+  /// Dashed/dotted routes are selected as continuous geographic lines.
+  final double hitTolerance;
+  final void Function(MapPolylineHit hit)? onTap;
+  final void Function(MapPolylineHit hit)? onLongPress;
+
   const MapPolyline({
     required this.points,
     this.color = const Color(0xFF1976D2),
@@ -73,10 +83,36 @@ class MapPolyline {
     this.strokeCap = StrokeCap.round,
     this.strokeJoin = StrokeJoin.round,
     this.strokeMiterLimit = 4,
+    this.interactive = false,
+    this.hitTolerance = 10,
+    this.onTap,
+    this.onLongPress,
   })  : assert(strokeWidth > 0 && strokeWidth < double.infinity),
         assert(borderWidth >= 0 && borderWidth < double.infinity),
         assert(strokeWidth + 2 * borderWidth < double.infinity),
-        assert(strokeMiterLimit > 0 && strokeMiterLimit < double.infinity);
+        assert(strokeMiterLimit > 0 && strokeMiterLimit < double.infinity),
+        assert(hitTolerance >= 0 && hitTolerance < double.infinity);
+}
+
+/// Selection of a route segment under the current camera.
+class MapPolylineHit {
+  const MapPolylineHit(
+      {required this.polyline,
+      required this.point,
+      required this.nearestPoint,
+      required this.distancePixels,
+      required this.segmentIndex});
+  final MapPolyline polyline;
+
+  /// Actual press coordinate.
+  final LatLng point;
+
+  /// Closest point on the route centerline in projected screen space.
+  final LatLng nearestPoint;
+  final double distancePixels;
+
+  /// Segment between points[index] and points[index + 1].
+  final int segmentIndex;
 }
 
 /// Describes how a [MapPolyline] should be rendered.

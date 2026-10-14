@@ -447,10 +447,39 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                   });
                 },
                 markers: _markers,
+                onTap: (point) => _showSnack(
+                  'Map: ${point.latitude.toStringAsFixed(4)}, '
+                  '${point.longitude.toStringAsFixed(4)}',
+                ),
+                onLongPress: (point) {
+                  _markers.add(Marker(
+                    point: point,
+                    alignment: Alignment.bottomCenter,
+                    child: const Icon(Icons.location_on,
+                        color: Colors.red, size: 36),
+                  ));
+                  _showSnack('Pin added');
+                },
+                polygons: [
+                  MapPolygon(
+                    points: const [
+                      LatLng(latitude: 47.40, longitude: 8.50),
+                      LatLng(latitude: 47.40, longitude: 8.58),
+                      LatLng(latitude: 47.35, longitude: 8.58),
+                      LatLng(latitude: 47.35, longitude: 8.50),
+                    ],
+                    color: const Color(0x302196F3),
+                    onTap: (_) => _showSnack('Selected Zurich demo area'),
+                  ),
+                ],
                 polylines: [
                   if (_routePoints != null)
                     MapPolyline(
                       points: _routePoints!,
+                      onTap: (hit) => _showSnack(
+                        'Route: ${hit.nearestPoint.latitude.toStringAsFixed(4)}, '
+                        '${hit.nearestPoint.longitude.toStringAsFixed(4)}',
+                      ),
                       color: const Color(0xFF283593),
                       strokeWidth: 6,
                       borderColor: Colors.white,

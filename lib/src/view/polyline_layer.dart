@@ -4,8 +4,8 @@ import 'package:fosm/src/api/tile_manager.dart';
 
 /// Internal rendering layer for [MapView.polylines]: projects each
 /// polyline's vertices to viewport-local pixels and draws them as stroked
-/// paths. Non-interactive — never enters hit testing, so map and marker
-/// gestures are unaffected.
+/// paths. This paint-only layer ignores pointers; optional route selection is
+/// handled by the map's existing gesture surface below markers.
 ///
 /// Positioned above the tile grid (and the old-grid zoom-transition
 /// overlay) and below the marker layer and the vector label overlay.

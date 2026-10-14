@@ -563,6 +563,20 @@ class TileManager with CacheTiles {
     );
   }
 
+  /// Inverse viewport projection. Longitudes wrap to [-180, 180); latitude
+  /// clamps to the Web Mercator range when the press is outside world rows.
+  LatLng screenToLatLng(Offset position) {
+    if (!position.dx.isFinite || !position.dy.isFinite) {
+      throw ArgumentError.value(position, 'position', 'must be finite');
+    }
+    final x = centerTileLng + (position.dx - centerCanvasX) / tileWidth;
+    final y = centerTileLat + (position.dy - centerCanvasY) / tileHeight;
+    return LatLng(
+      latitude: tileY2Lat(y.clamp(0.0, (1 << zoom).toDouble()), zoom),
+      longitude: (tileX2Lng(x, zoom) + 180) % 360 - 180,
+    );
+  }
+
   void resize(Size size) {
     width = size.width;
     height = size.height;

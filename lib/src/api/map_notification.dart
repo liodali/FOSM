@@ -4,6 +4,8 @@ import 'geo_point.dart';
 import 'map_controller.dart';
 import 'marker.dart';
 import 'marker_cluster.dart';
+import 'map_polyline.dart';
+import 'map_polygon.dart';
 
 /// Base class for notifications dispatched by [MapView].
 ///
@@ -11,6 +13,38 @@ import 'marker_cluster.dart';
 /// listen with [NotificationListener] or via [MapEventListenerMixin].
 sealed class MapNotification extends Notification {
   const MapNotification();
+}
+
+class MapTapNotification extends MapNotification {
+  const MapTapNotification(this.point, this.localPosition);
+  final LatLng point;
+  final Offset localPosition;
+}
+
+class MapLongPressNotification extends MapNotification {
+  const MapLongPressNotification(this.point, this.localPosition);
+  final LatLng point;
+  final Offset localPosition;
+}
+
+class MapPolylineTapNotification extends MapNotification {
+  const MapPolylineTapNotification(this.hit);
+  final MapPolylineHit hit;
+}
+
+class MapPolylineLongPressNotification extends MapNotification {
+  const MapPolylineLongPressNotification(this.hit);
+  final MapPolylineHit hit;
+}
+
+class MapPolygonTapNotification extends MapNotification {
+  const MapPolygonTapNotification(this.hit);
+  final MapPolygonHit hit;
+}
+
+class MapPolygonLongPressNotification extends MapNotification {
+  const MapPolygonLongPressNotification(this.hit);
+  final MapPolygonHit hit;
 }
 
 /// Dispatched once after the map grid is first laid out and the

@@ -10,6 +10,7 @@ import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/map_controller.dart';
 import 'package:fosm/src/api/map_notification.dart';
 import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/map_polygon.dart';
 import 'package:fosm/src/api/marker_cluster.dart';
 import 'package:fosm/src/api/marker_manager.dart';
 import 'package:fosm/src/api/tile.dart';
@@ -23,6 +24,8 @@ import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/view/marker_layer.dart';
 import 'package:fosm/src/view/polyline_layer.dart';
+import 'package:fosm/src/view/polygon_layer.dart';
+import 'package:fosm/src/view/shape_geometry.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
 
@@ -386,6 +389,19 @@ class MapView extends StatefulWidget {
   /// List order is paint order: later polylines draw above earlier ones.
   final List<MapPolyline> polylines;
 
+  /// Filled areas, below routes/markers. List order determines paint order.
+  final List<MapPolygon> polygons;
+
+  /// Coordinates of presses that miss interactive markers/routes/polygons.
+  final ValueChanged<LatLng>? onTap;
+  final ValueChanged<LatLng>? onLongPress;
+
+  /// Global feature callbacks enable selection for every feature of that type.
+  final ValueChanged<MapPolylineHit>? onPolylineTap;
+  final ValueChanged<MapPolylineHit>? onPolylineLongPress;
+  final ValueChanged<MapPolygonHit>? onPolygonTap;
+  final ValueChanged<MapPolygonHit>? onPolygonLongPress;
+
   /// Renders a hosted vector style instead of raster tiles (e.g.
   /// [openFreeMapLiberty]). When set, [tileFetcher] is ignored — the
   /// style document defines all tile sources. Raster mode remains the
@@ -443,6 +459,13 @@ class MapView extends StatefulWidget {
     this.markers,
     this.markerClusterOptions,
     this.polylines = const [],
+    this.polygons = const [],
+    this.onTap,
+    this.onLongPress,
+    this.onPolylineTap,
+    this.onPolylineLongPress,
+    this.onPolygonTap,
+    this.onPolygonLongPress,
     this.vectorStyle,
     this.showZoomControls = true,
     this.onZoomChanged,
@@ -1268,12 +1291,60 @@ class _MapViewState extends State<MapView>
   /// Bare-map tap: closes an open marker overlay when its config allows
   /// (`MarkerOverlayConfig.closeOnMapTap`). This detector lives below the
   /// marker layer, so marker taps never reach it.
-  void _onMapTap() {
+  void _closeOverlayOnMapTap() {
     final markers = widget.markers;
     if (markers == null) return;
     final overlay = markers.overlayMarker;
     if (overlay != null && overlay.overlayConfig.closeOnMapTap) {
       markers.hideOverlay();
+    }
+  }
+
+  void _onMapPress(Offset position, {bool longPress = false}) {
+    final manager = _tileManager;
+    if (manager == null) return;
+    if (!longPress) _closeOverlayOnMapTap();
+    final route = hitTestPolylines(widget.polylines, manager, position,
+        longPress: longPress,
+        enableAll: longPress
+            ? widget.onPolylineLongPress != null
+            : widget.onPolylineTap != null);
+    if (route != null) {
+      if (longPress) {
+        route.polyline.onLongPress?.call(route);
+        widget.onPolylineLongPress?.call(route);
+        MapPolylineLongPressNotification(route).dispatch(context);
+      } else {
+        route.polyline.onTap?.call(route);
+        widget.onPolylineTap?.call(route);
+        MapPolylineTapNotification(route).dispatch(context);
+      }
+      return;
+    }
+    final area = hitTestPolygons(widget.polygons, manager, position,
+        longPress: longPress,
+        enableAll: longPress
+            ? widget.onPolygonLongPress != null
+            : widget.onPolygonTap != null);
+    if (area != null) {
+      if (longPress) {
+        area.polygon.onLongPress?.call(area);
+        widget.onPolygonLongPress?.call(area);
+        MapPolygonLongPressNotification(area).dispatch(context);
+      } else {
+        area.polygon.onTap?.call(area);
+        widget.onPolygonTap?.call(area);
+        MapPolygonTapNotification(area).dispatch(context);
+      }
+      return;
+    }
+    final point = manager.screenToLatLng(position);
+    if (longPress) {
+      widget.onLongPress?.call(point);
+      MapLongPressNotification(point, position).dispatch(context);
+    } else {
+      widget.onTap?.call(point);
+      MapTapNotification(point, position).dispatch(context);
     }
   }
 
@@ -1394,7 +1465,9 @@ class _MapViewState extends State<MapView>
               Positioned.fill(
                 child: GestureDetector(
                   behavior: HitTestBehavior.translucent,
-                  onTap: _onMapTap,
+                  onTapUp: (details) => _onMapPress(details.localPosition),
+                  onLongPressStart: (details) =>
+                      _onMapPress(details.localPosition, longPress: true),
                   child: Stack(
                     children: [
                       // ── NEW zoom tiles (background, always at 1.0×) ─
@@ -1439,6 +1512,11 @@ class _MapViewState extends State<MapView>
                   ),
                 ),
               ),
+
+              if (widget.polygons.isNotEmpty)
+                Positioned.fill(
+                    child: PolygonLayer(
+                        polygons: widget.polygons, manager: manager)),
 
               // ── Polylines (above tiles, below markers and labels) ──
               if (widget.polylines.isNotEmpty) ...[

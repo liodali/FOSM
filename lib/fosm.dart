@@ -12,6 +12,7 @@ export 'src/api/map_load_state.dart'
         TileLoadException,
         TileFailureKind;
 export 'src/api/map_polyline.dart';
+export 'src/api/map_polygon.dart';
 export 'src/api/marker.dart';
 export 'src/api/marker_cluster.dart';
 export 'src/api/marker_manager.dart';
