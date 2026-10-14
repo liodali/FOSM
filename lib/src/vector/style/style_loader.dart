@@ -1,6 +1,7 @@
 import 'dart:convert';
 
-import '../../api/tile_source.dart' show downloadTileBytes;
+import '../../api/tile_source.dart' show downloadTileBytes, MapRequestSession;
+import '../../api/map_load_state.dart';
 import 'map_style.dart';
 import 'style_parser.dart';
 
@@ -132,9 +133,15 @@ class LoadedVectorStyle {
 /// Fetches the style document, then resolves every source (fetching
 /// TileJSON documents as needed). Throws on network/parse failure — the
 /// caller decides how to surface that.
-Future<LoadedVectorStyle> loadVectorStyle(VectorMapStyle vectorStyle) async {
+Future<LoadedVectorStyle> loadVectorStyle(
+  VectorMapStyle vectorStyle, {
+  Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+  MapRequestSession? requestSession,
+}) async {
   final style = parseStyleJson(utf8.decode(await downloadTileBytes(
     vectorStyle.styleUrl,
+    requestTimeout: requestTimeout,
+    requestSession: requestSession,
   )));
 
   final resolved = <String, ResolvedTileSource>{};
@@ -148,8 +155,10 @@ Future<LoadedVectorStyle> loadVectorStyle(VectorMapStyle vectorStyle) async {
     var attribution = source.attribution;
 
     if (templates.isEmpty && source.url != null) {
-      final tileJson =
-          jsonDecode(utf8.decode(await downloadTileBytes(source.url!)));
+      final tileJson = jsonDecode(utf8.decode(await downloadTileBytes(
+          source.url!,
+          requestTimeout: requestTimeout,
+          requestSession: requestSession)));
       if (tileJson is Map) {
         final tiles = tileJson['tiles'];
         if (tiles is List) {

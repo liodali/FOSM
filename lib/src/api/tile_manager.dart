@@ -9,6 +9,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
+import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/api/geo_point.dart';
@@ -18,12 +19,18 @@ import 'package:fosm/src/isolate/http_isolate.dart'
     if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_source.dart';
+import 'package:fosm/src/api/map_load_state.dart';
 
 // ─── Tile manager ────────────────────────────────────────────────────────────
 
-/// Manages the visible tile grid, in-memory image cache, and network
-/// fetches for an OSM map view.
+class _PendingFetch {
+  final Completer<Uint8List> result = Completer<Uint8List>();
+  late Timer timer;
+}
+
+/// Manages the visible tile grid, in-memory image cache, and network fetches.
 class TileManager with CacheTiles {
+  @Deprecated('Rendered images now use maxRenderedCacheBytes instead.')
   static const int maxMemoryCachedTiles = 200;
   static const int maxByteCacheBytes = 50 * 1024 * 1024; // 50MB compressed
   static const Duration failureBackoff = Duration(seconds: 5);
@@ -84,8 +91,21 @@ class TileManager with CacheTiles {
 
   // ── Caches ──────────────────────────────────────────────────────────
 
-  /// Decoded images for visible tiles. LRU via LinkedHashMap.
-  final LinkedHashMap<String, ui.Image> _memoryCache = LinkedHashMap();
+  /// Owns decoded images, including recently viewed grids and snapshots.
+  final RenderedTileCache _memoryCache;
+
+  /// Estimated RGBA pixel memory of retained rendered tiles.
+  int get renderedCacheBytes => _memoryCache.bytes;
+
+  /// Protects cached images held by a zoom snapshot until it is released.
+  VoidCallback retainSnapshot(Iterable<Tile> tiles) =>
+      _memoryCache.pin(tiles.map((tile) => tile.index));
+
+  void updateRenderedCachePolicy({
+    required int maxBytes,
+    required Duration retention,
+  }) =>
+      _memoryCache.updatePolicy(maxBytes: maxBytes, retention: retention);
 
   /// Compressed PNG bytes for pre-loaded adjacent zoom tiles.
   /// Checked in [_scheduleLoad] for instant decode when a tile becomes visible.
@@ -97,6 +117,44 @@ class TileManager with CacheTiles {
 
   /// Tiles that failed recently; retried only after [failureBackoff].
   final Map<String, DateTime> _failedUntil = {};
+  final Map<String, TileLoadException> _loadFailures = {};
+  ValueChanged<MapTileFailure>? onTileError;
+  Duration requestTimeout;
+  final Set<_PendingFetch> _pendingFetches = {};
+  final MapRequestSession _networkCancel = MapRequestSession();
+
+  MapLoadState get loadState {
+    final missing = missingVisibleTileCount;
+    final failures = <MapTileFailure>[];
+    for (final key in _visibleKeys) {
+      final error = _loadFailures[key];
+      final job = _jobsByKey[key];
+      if (error != null && job != null && !_memoryCache.containsKey(key)) {
+        failures
+            .add(MapTileFailure(zoom: job.z, x: job.x, y: job.y, error: error));
+      }
+    }
+    return MapLoadState(
+        totalTiles: _visibleKeys.length,
+        loadedTiles: _visibleKeys.length - missing,
+        loadingTiles: missing - failures.length,
+        failures: failures);
+  }
+
+  /// Retries missing viewport tiles immediately, including permanent HTTP
+  /// failures explicitly requested by the user. Loaded tiles stay intact.
+  void retryVisibleTiles() {
+    if (_disposed) return;
+    for (final key in _visibleKeys) {
+      _retryTimers.remove(key)?.cancel();
+      _failedUntil.remove(key);
+      _loadFailures.remove(key);
+      final job = _jobsByKey[key];
+      if (job != null && !_memoryCache.containsKey(key)) _enqueueJob(job);
+    }
+    _scheduleTileNotification();
+    _pumpLoadQueue();
+  }
 
   // ── Padding & pre-loading ───────────────────────────────────────────
   final int tilePadding;
@@ -238,10 +296,6 @@ class TileManager with CacheTiles {
   /// over-zoom siblings and wrapped-X duplicates download once.
   final Map<String, Future<Uint8List>> _resourceFetches = {};
 
-  /// Resources whose bytes have been scheduled for persistent storage, so a
-  /// resource shared by several logical slots produces one Hive write.
-  final Set<String> _persistedResources = {};
-
   /// Writes currently committing. Legacy records await this exact future
   /// before deletion instead of treating a merely scheduled write as success.
   final Map<String, Future<bool>> _resourceWrites = {};
@@ -249,10 +303,6 @@ class TileManager with CacheTiles {
   /// Legacy logical disk key associated with bytes in [_byteCache]. Retained
   /// across aborts/transient decoder failures until canonical migration wins.
   final Map<String, String> _legacyDiskKeys = {};
-
-  /// Upper bound on [_persistedResources] bookkeeping before it is reset.
-  /// Resetting can cause a rare duplicate write, never a missing one.
-  static const int _maxPersistedResourceKeys = 1024;
 
   // ── Lifecycle ───────────────────────────────────────────────────────
   bool _disposed = false;
@@ -359,10 +409,18 @@ class TileManager with CacheTiles {
     this.byteOnlyPadding = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
     this.cameraBounds,
-  })  : _fetcher = fetcher ?? osmTileFetcher,
+    int maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
+    Duration renderedCacheRetention = RenderedTileCache.defaultRetention,
+    this.requestTimeout = TileLoadException.defaultRequestTimeout,
+  })  : _memoryCache = RenderedTileCache(
+          maxBytes: maxRenderedCacheBytes,
+          retention: renderedCacheRetention,
+        ),
+        _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
         _urlBuilder = urlBuilder,
         _resourceKeyBuilder = resourceKeyBuilder {
+    validateRequestTimeout(requestTimeout);
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
@@ -371,7 +429,7 @@ class TileManager with CacheTiles {
     // visible tile fetches and preloads use the persistent background
     // isolate (TCP connection reuse). On web this is a no-op.
     if (urlBuilder != null) {
-      _httpIsolate.spawn();
+      unawaited(_httpIsolate.spawn().catchError((Object _) {}));
     }
   }
 
@@ -390,7 +448,18 @@ class TileManager with CacheTiles {
     _resourceWrites.clear();
     _legacyDiskKeys.clear();
     _httpIsolate.dispose();
+    _networkCancel.cancel('Map disposed');
+    for (final fetch in _pendingFetches.toList()) {
+      fetch.timer.cancel();
+      if (!fetch.result.isCompleted) {
+        fetch.result.completeError(const TileLoadException(
+            TileFailureKind.cancelled, 'Map request cancelled'));
+      }
+    }
+    _pendingFetches.clear();
     onTilesChanged = null;
+    onTileError = null;
+    _loadFailures.clear();
     _renderTiles.clear();
     _inFlight.clear();
     _loadQueue.clear();
@@ -403,10 +472,7 @@ class TileManager with CacheTiles {
     _activeForegroundLoads = 0;
     _activeBackgroundLoads = 0;
     _activePresentations = 0;
-    for (final image in _memoryCache.values) {
-      image.dispose();
-    }
-    _memoryCache.clear();
+    _memoryCache.dispose();
     _byteCache.clear();
     _byteCacheSize = 0;
   }
@@ -621,6 +687,11 @@ class TileManager with CacheTiles {
     leftColumnTilesCanvasX = paddedLeftCanvasX;
     topRowTilesCanvasY = paddedTopCanvasY;
 
+    _memoryCache.setActiveKeys({
+      for (var h = 0; h < horizontalTileCount; h++)
+        for (var v = 0; v < verticalTileCount; v++)
+          _key(zoom, leftColumnTilesLngIndex + h, topRowTilesLatIndex + v),
+    });
     _renderTiles.clear();
     _visibleKeys.clear();
 
@@ -646,9 +717,8 @@ class TileManager with CacheTiles {
         }
 
         // Synchronous memory-cache hit → no flicker.
-        final cached = _memoryCache.remove(key);
+        final cached = _memoryCache.get(key);
         if (cached != null) {
-          _memoryCache[key] = cached; // refresh LRU
           _renderTiles.add(Tile(cached, key, tileLatIndex, tileLngIndex));
           continue;
         }
@@ -681,6 +751,9 @@ class TileManager with CacheTiles {
       }
     }
 
+    final currentKeys = _renderTiles.map((tile) => tile.index).toSet();
+    _loadFailures.removeWhere((key, _) => !currentKeys.contains(key));
+
     // Drop queued jobs that are no longer on screen (stale after a pan or
     // zoom), then enqueue the current work and drain in priority order.
     _pruneStaleQueue();
@@ -691,8 +764,6 @@ class TileManager with CacheTiles {
     for (final job in bytePreload) {
       _enqueueJob(job);
     }
-
-    _trimMemoryCache();
 
     _gridRevision++;
 
@@ -730,6 +801,7 @@ class TileManager with CacheTiles {
     // Record the newest descriptor even when the job is already in flight so
     // a pending retry timer can pick up the promoted priority.
     _registerLatestJob(job);
+    if (_loadFailures[job.key]?.isRetryable == false) return;
     if (_inFlight.contains(job.key)) return;
     // Byte-only work is already done once its bytes are cached; re-enqueueing
     // it would trigger a redundant network request after a pan.
@@ -878,8 +950,20 @@ class TileManager with CacheTiles {
 
   /// Records a failure and schedules a retry after [failureBackoff] so a
   /// retry no longer depends on a grid-rebuilding `calculate()`.
-  void _markFailed(_LoadJob job) {
+  void _markFailed(_LoadJob job, [Object? error]) {
     if (_disposed) return;
+    final failure = error == null
+        ? _loadFailures[job.key] ??
+            const TileLoadException(
+                TileFailureKind.decode, 'Unable to render map tile')
+        : TileLoadException.from(error);
+    _loadFailures[job.key] = failure;
+    if (_visibleKeys.contains(job.key)) {
+      onTileError?.call(
+          MapTileFailure(zoom: job.z, x: job.x, y: job.y, error: failure));
+      _scheduleTileNotification();
+    }
+    if (!failure.isRetryable) return;
     final until = DateTime.now().add(failureBackoff);
     _failedUntil[job.key] = until;
     _scheduleRetry(job, failureBackoff);
@@ -892,6 +976,8 @@ class TileManager with CacheTiles {
       _retryTimers.remove(job.key);
       if (_disposed) return;
       _failedUntil.remove(job.key);
+      _loadFailures.remove(job.key);
+      if (_visibleKeys.contains(job.key)) _scheduleTileNotification();
       // Retry with the newest descriptor for this key, not the one captured
       // when the failure was scheduled — a padding preload may have been
       // promoted to a visible foreground decode in the meantime.
@@ -951,8 +1037,8 @@ class TileManager with CacheTiles {
           origin: _ByteOrigin.network,
           diskKey: _legacyDiskKeys[resource],
         );
-      } catch (_) {
-        _markFailed(job);
+      } catch (error) {
+        _markFailed(job, error);
         return false;
       }
     }
@@ -973,22 +1059,22 @@ class TileManager with CacheTiles {
     //    slot key written by older versions. A legacy record is rewritten
     //    under the canonical key after a successful decode.
     var diskKey = resource;
-    if (!hasStoredTile(diskKey)) {
-      final legacy = _key(job.z, job.x, job.y);
-      if (legacy != resource && hasStoredTile(legacy)) {
-        diskKey = legacy;
+    Uint8List? bytes;
+    try {
+      bytes = cachedTileBytes(diskKey);
+      if (bytes == null) {
+        final legacy = _key(job.z, job.x, job.y);
+        if (legacy != resource) {
+          diskKey = legacy;
+          bytes = cachedTileBytes(diskKey);
+        }
       }
+    } catch (_) {
+      bytes = null;
     }
-    if (hasStoredTile(diskKey)) {
-      Uint8List? bytes;
-      try {
-        bytes = await storedTileBytes(diskKey);
-      } catch (_) {
-        bytes = null;
-      }
-      if (_disposed) return false;
-      if (bytes == null || bytes.isEmpty) {
-        // Missing/corrupt persistent record — delete it and re-download.
+    if (_disposed) return false;
+    if (bytes != null) {
+      if (bytes.isEmpty) {
         await _deleteStored(diskKey);
       } else {
         _ensureBytesCached(resource, bytes);
@@ -1015,8 +1101,8 @@ class TileManager with CacheTiles {
     late final Uint8List bytes;
     try {
       bytes = await _fetchResource(job);
-    } catch (_) {
-      _markFailed(job);
+    } catch (error) {
+      _markFailed(job, error);
       return false;
     }
     if (_disposed) return false;
@@ -1068,12 +1154,10 @@ class TileManager with CacheTiles {
     }
 
     Uint8List? diskBytes;
-    if (hasStoredTile(resource)) {
-      try {
-        diskBytes = cachedTileBytes(resource);
-      } catch (_) {
-        diskBytes = null;
-      }
+    try {
+      diskBytes = cachedTileBytes(resource);
+    } catch (_) {
+      diskBytes = null;
     }
 
     late final Uint8List bytes;
@@ -1084,8 +1168,8 @@ class TileManager with CacheTiles {
     } else {
       try {
         bytes = await _fetchResource(job);
-      } catch (_) {
-        _markFailed(job);
+      } catch (error) {
+        _markFailed(job, error);
         return false;
       }
       if (_disposed) return false;
@@ -1295,7 +1379,6 @@ class TileManager with CacheTiles {
 
   Future<void> _deleteStored(String key) async {
     // Allow a later successful fetch to re-persist this resource.
-    _persistedResources.remove(key);
     try {
       await deleteStoredTile(key);
     } catch (_) {
@@ -1340,9 +1423,13 @@ class TileManager with CacheTiles {
       // Stale work stopped itself before parse/render/toImage. Keep any
       // bytes already fetched; this is not a failure.
       return _DecodeOutcome.aborted;
-    } on TilePayloadException {
+    } on TilePayloadException catch (error) {
+      _loadFailures[job.key] =
+          TileLoadException.from(error, fallback: TileFailureKind.decode);
       return _DecodeOutcome.corrupt;
-    } catch (_) {
+    } catch (error) {
+      _loadFailures[job.key] =
+          TileLoadException.from(error, fallback: TileFailureKind.decode);
       return _DecodeOutcome.error;
     }
   }
@@ -1359,7 +1446,12 @@ class TileManager with CacheTiles {
   /// record before the canonical write has actually succeeded.
   Future<bool> _persistResource(_LoadJob job, Uint8List bytes) {
     final resource = job.resourceKey;
-    if (_persistedResources.contains(resource)) return Future.value(true);
+    // Consult the cache itself: entries may have expired, been evicted, or
+    // been cleared since an earlier presentation. Reading a valid disk tile
+    // must not rewrite its timestamp and extend its absolute lifetime.
+    if (hasStoredTile(resource)) {
+      return Future.value(true);
+    }
     final inFlight = _resourceWrites[resource];
     if (inFlight != null) return inFlight;
 
@@ -1371,13 +1463,7 @@ class TileManager with CacheTiles {
           Tile(null, resource, job.y, job.x),
           bytes,
         );
-        if (_disposed) return false;
-        _persistedResources.add(resource);
-        if (_persistedResources.length > _maxPersistedResourceKeys) {
-          _persistedResources
-            ..clear()
-            ..add(resource);
-        }
+        if (_disposed || !hasStoredTile(resource)) return false;
         return true;
       } catch (_) {
         return false;
@@ -1440,28 +1526,62 @@ class TileManager with CacheTiles {
       );
 
   Future<Uint8List> _fetchBytes(int z, int x, int y) {
-    if (_httpIsolate.isReady && _urlBuilder != null) {
-      // Use persistent HTTP isolate (native) — reuses TCP connections.
-      return _httpIsolate.fetchUrl(_urlBuilder!(z, x, y));
+    Future<Uint8List> fetch;
+    try {
+      if (_httpIsolate.isReady && _urlBuilder != null) {
+        // Use persistent HTTP isolate (native) — reuses TCP connections.
+        fetch = _httpIsolate.fetchUrl(_urlBuilder!(z, x, y),
+            requestTimeout: requestTimeout);
+      } else if (identical(_fetcher, osmTileFetcher)) {
+        fetch = downloadTileBytes(tileUrl(z, x, y),
+            requestTimeout: requestTimeout, requestSession: _networkCancel);
+      } else {
+        fetch = _fetcher(z, x, y);
+      }
+    } catch (error) {
+      return Future.error(TileLoadException.from(error));
     }
-    // Fall back to fetcher (web or custom).
-    return _fetcher(z, x, y);
+    final pending = _PendingFetch();
+    void release() {
+      pending.timer.cancel();
+      _pendingFetches.remove(pending);
+    }
+
+    pending.timer = Timer(requestTimeout, () {
+      if (!pending.result.isCompleted) {
+        pending.result.completeError(const TileLoadException(
+            TileFailureKind.timeout, 'Map request timed out'));
+      }
+      release();
+    });
+    _pendingFetches.add(pending);
+    fetch.then((bytes) {
+      if (!pending.result.isCompleted) pending.result.complete(bytes);
+      release();
+    }, onError: (Object error, StackTrace stack) {
+      if (!pending.result.isCompleted) {
+        pending.result.completeError(TileLoadException.from(error), stack);
+      }
+      release();
+    });
+    return pending.result.future;
   }
 
   void _complete(String key, Tile tile) {
+    _loadFailures.remove(key);
+    _failedUntil.remove(key);
+    _retryTimers.remove(key)?.cancel();
     _inFlight.remove(key);
     _jobsByKey.remove(key);
     if (_disposed || tile.sourceTile == null) return;
 
-    _memoryCache.remove(key);
-    _memoryCache[key] = tile.sourceTile!;
-    _trimMemoryCache();
+    final image = _memoryCache.put(key, tile.sourceTile!);
 
     final i = _renderIndex(key);
     if (i == -1) return;
     if (_renderTiles[i].sourceTile != null) return;
 
-    _renderTiles[i] = tile;
+    _renderTiles[i] = tile.copyWithImage(image);
     _contentRevision++;
     _scheduleTileNotification();
   }
@@ -1645,17 +1765,6 @@ class TileManager with CacheTiles {
       final oldestKey = _byteCache.keys.first;
       final oldestBytes = _byteCache.remove(oldestKey);
       if (oldestBytes != null) _byteCacheSize -= oldestBytes.length;
-    }
-  }
-
-  // ── Memory cache management ─────────────────────────────────────────
-
-  void _trimMemoryCache() {
-    while (_memoryCache.length > maxMemoryCachedTiles) {
-      final oldestKey = _memoryCache.keys.first;
-      final image = _memoryCache.remove(oldestKey);
-      final visible = _renderTiles.any((t) => t.index == oldestKey);
-      if (!visible) image?.dispose();
     }
   }
 

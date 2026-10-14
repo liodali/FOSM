@@ -2,6 +2,7 @@
 // dart.library.js_interop is available.
 
 import 'dart:typed_data';
+import '../api/map_load_state.dart';
 
 /// Persistent HTTP isolate for tile downloads.
 ///
@@ -15,7 +16,10 @@ class HttpIsolate {
   Future<void> spawn() async {}
 
   /// Fetches [url] and returns the raw bytes.
-  Future<Uint8List> fetchUrl(String url) {
+  Future<Uint8List> fetchUrl(
+    String url, {
+    Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+  }) {
     throw UnsupportedError('HttpIsolate is not available on this platform');
   }
 

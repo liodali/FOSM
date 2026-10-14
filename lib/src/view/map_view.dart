@@ -15,14 +15,21 @@ import 'package:fosm/src/api/marker_manager.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/api/tile_source.dart';
+import 'package:fosm/src/api/map_load_state.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/view/marker_layer.dart';
 import 'package:fosm/src/view/polyline_layer.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
+
+typedef MapLoadingBuilder = Widget Function(
+    BuildContext context, MapLoadState state);
+typedef MapErrorBuilder = Widget Function(
+    BuildContext context, MapLoadState state, VoidCallback retry);
 
 /// Captures a snapshot of the tile grid geometry and tiles for rendering
 /// an "old zoom" overlay during the scale transition.
@@ -35,6 +42,7 @@ class _GridSnapshot {
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
   final int revision;
+  final VoidCallback releaseImages;
 
   /// Zoom and camera center of the snapshotted grid.
   final int zoom;
@@ -59,6 +67,7 @@ class _GridSnapshot {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
+    required this.releaseImages,
     required this.zoom,
     required this.sourceCenterTileLng,
     required this.sourceCenterTileLat,
@@ -77,6 +86,7 @@ class _GridSnapshot {
         topRowTilesCanvasY: m.topRowTilesCanvasY,
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
+        releaseImages: m.retainSnapshot(m.renderTiles),
         zoom: m.zoom,
         sourceCenterTileLng: m.centerTileLng,
         sourceCenterTileLat: m.centerTileLat,
@@ -399,6 +409,28 @@ class MapView extends StatefulWidget {
   /// enabled. Defaults to [ZoomAnimationStyle.scale].
   final ZoomAnimationStyle zoomAnimationStyle;
 
+  /// Budget for estimated RGBA rendered-tile memory. The current grid and
+  /// active zoom snapshot are protected and may temporarily exceed it.
+  /// Unused images are evicted first. Zero retains only protected images.
+  final int maxRenderedCacheBytes;
+
+  /// How long unused rendered tiles remain available for return pans/zooms,
+  /// subject to [maxRenderedCacheBytes]. Defaults to 20 seconds.
+  final Duration renderedCacheRetention;
+
+  /// Deadline for each HTTP request, including headers and the full body.
+  /// Custom fetchers are bounded too; their underlying work cannot be cancelled.
+  final Duration requestTimeout;
+
+  /// Optional viewport loading overlay. It ignores pointers so map gestures
+  /// and markers remain usable. Raster tiles otherwise retain checkerboards.
+  final MapLoadingBuilder? loadingBuilder;
+
+  /// Optional error overlay for style failures or failed visible tiles.
+  /// The retry callback reloads a style or retries missing viewport tiles.
+  final MapErrorBuilder? errorBuilder;
+  final ValueChanged<MapTileFailure>? onTileError;
+
   const MapView({
     super.key,
     required this.latLng,
@@ -419,7 +451,13 @@ class MapView extends StatefulWidget {
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
     this.zoomAnimationStyle = ZoomAnimationStyle.scale,
-  });
+    this.maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
+    this.renderedCacheRetention = RenderedTileCache.defaultRetention,
+    this.requestTimeout = TileLoadException.defaultRequestTimeout,
+    this.loadingBuilder,
+    this.errorBuilder,
+    this.onTileError,
+  }) : assert(maxRenderedCacheBytes >= 0);
 
   @override
   State<MapView> createState() => _MapViewState();
@@ -433,7 +471,9 @@ class _MapViewState extends State<MapView>
 
   // ── Vector style session ────────────────────────────────────────────
   VectorTileRuntime? _vectorRuntime;
-  Object? _vectorError;
+  TileLoadException? _vectorError;
+  int _styleLoadGeneration = 0;
+  MapRequestSession? _styleCancel;
 
   // ── Zoom animation ──────────────────────────────────────────────────
   late AnimationController _animController;
@@ -530,6 +570,7 @@ class _MapViewState extends State<MapView>
   @override
   void initState() {
     super.initState();
+    validateRequestTimeout(widget.requestTimeout);
     _currentZoom = widget.zoom;
     if (widget.vectorStyle != null) {
       _loadVectorStyle();
@@ -548,17 +589,32 @@ class _MapViewState extends State<MapView>
   Future<void> _loadVectorStyle() async {
     final style = widget.vectorStyle;
     if (style == null) return;
+    final generation = ++_styleLoadGeneration;
+    _styleCancel?.cancel('Style load replaced');
+    final cancel = MapRequestSession();
+    _styleCancel = cancel;
     setState(() => _vectorError = null);
     try {
-      final loaded = await loadVectorStyle(style);
-      if (!mounted || widget.vectorStyle != style) return;
+      final loaded = await loadVectorStyle(style,
+          requestTimeout: widget.requestTimeout, requestSession: cancel);
+      if (!mounted ||
+          widget.vectorStyle != style ||
+          generation != _styleLoadGeneration) {
+        return;
+      }
       _vectorRuntime = VectorTileRuntime(
         loaded: loaded,
         namespace: style.id,
+        requestTimeout: widget.requestTimeout,
       );
     } catch (error) {
-      if (!mounted || widget.vectorStyle != style) return;
-      _vectorError = error;
+      if (!mounted ||
+          widget.vectorStyle != style ||
+          generation != _styleLoadGeneration) {
+        return;
+      }
+      _vectorError =
+          TileLoadException.from(error, fallback: TileFailureKind.style);
     }
     if (mounted) setState(() {});
   }
@@ -566,6 +622,9 @@ class _MapViewState extends State<MapView>
   @override
   void didUpdateWidget(MapView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    validateRequestTimeout(widget.requestTimeout);
+    _tileManager?.requestTimeout = widget.requestTimeout;
+    _vectorRuntime?.requestTimeout = widget.requestTimeout;
     if (widget.controller != oldWidget.controller) {
       oldWidget.controller?.detach(this);
       widget.controller?.attach(this);
@@ -574,7 +633,16 @@ class _MapViewState extends State<MapView>
       _animController.duration = widget.zoomAnimationDuration;
     }
     if (widget.vectorStyle != oldWidget.vectorStyle) {
+      _styleCancel?.cancel('Style changed');
       // Style switch: tear everything down and reload.
+      _animController.stop();
+      _stopPanAnimation();
+      _animWaitTimer?.cancel();
+      _animWaitTimer = null;
+      _clearZoomSnapshot();
+      _animWaitingTiles = false;
+      _pinchTransitionActive = false;
+      _visualScale = 1.0;
       _tileManager?.dispose();
       _tileManager = null;
       _vectorRuntime?.dispose();
@@ -586,6 +654,13 @@ class _MapViewState extends State<MapView>
         setState(() {});
       }
       return;
+    }
+    if (widget.maxRenderedCacheBytes != oldWidget.maxRenderedCacheBytes ||
+        widget.renderedCacheRetention != oldWidget.renderedCacheRetention) {
+      _tileManager?.updateRenderedCachePolicy(
+        maxBytes: widget.maxRenderedCacheBytes,
+        retention: widget.renderedCacheRetention,
+      );
     }
     if (widget.cameraBounds != oldWidget.cameraBounds) {
       _tileManager?.setCameraBounds(widget.cameraBounds);
@@ -604,12 +679,14 @@ class _MapViewState extends State<MapView>
 
   @override
   void dispose() {
+    _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
     _animController.removeListener(_onAnimTick);
     _animController.removeStatusListener(_onAnimStatus);
     _animController.dispose();
     _stopPanAnimation();
     _animWaitTimer?.cancel();
+    _clearZoomSnapshot();
     _tileManager?.dispose();
     _vectorRuntime?.dispose();
     super.dispose();
@@ -653,8 +730,12 @@ class _MapViewState extends State<MapView>
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
       cameraBounds: widget.cameraBounds,
+      maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+      renderedCacheRetention: widget.renderedCacheRetention,
+      requestTimeout: widget.requestTimeout,
     );
     manager.onTilesChanged = _notify;
+    manager.onTileError = (error) => widget.onTileError?.call(error);
     // Let the vector runtime abort decodes for tiles that leave the
     // render set before they reach render/`toImage`, and dispatch the
     // newest centre tile first from its presentation lane.
@@ -714,6 +795,13 @@ class _MapViewState extends State<MapView>
 
   void _applyZoomInstantly(
       TileManager manager, int newZoom, Offset? focalLocal) {
+    _animController.stop();
+    _animWaitTimer?.cancel();
+    _animWaitTimer = null;
+    _clearZoomSnapshot();
+    _animWaitingTiles = false;
+    _pinchTransitionActive = false;
+    _visualScale = 1.0;
     final oldZoom = manager.zoom;
     final focal =
         focalLocal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
@@ -886,7 +974,7 @@ class _MapViewState extends State<MapView>
     _stopPanAnimation();
     _animWaitTimer?.cancel();
     _animWaitTimer = null;
-    _animOldSnapshot = null;
+    _clearZoomSnapshot();
     _animWaitingTiles = false;
 
     // 1. Ensure grid is up-to-date and snapshot the OLD grid.
@@ -949,6 +1037,7 @@ class _MapViewState extends State<MapView>
     _animWaitTimer?.cancel();
     _animWaitTimer = null;
 
+    _clearZoomSnapshot();
     manager.calculate();
     _animOldSnapshot = _GridSnapshot.from(manager);
     _animIsZoomIn = targetZoom > manager.zoom;
@@ -1013,11 +1102,16 @@ class _MapViewState extends State<MapView>
     if (!mounted) return;
 
     // Animation done — remove old grid overlay.
-    _animOldSnapshot = null;
+    _clearZoomSnapshot();
     _animWaitingTiles = false;
     _pinchTransitionActive = false;
     _visualScale = 1.0;
     setState(() {});
+  }
+
+  void _clearZoomSnapshot() {
+    _animOldSnapshot?.releaseImages();
+    _animOldSnapshot = null;
   }
 
   // ── Scale gesture handlers (pan + pinch-to-zoom) ────────────────────
@@ -1031,7 +1125,7 @@ class _MapViewState extends State<MapView>
       _animController.stop();
       _animWaitTimer?.cancel();
       _animWaitTimer = null;
-      _animOldSnapshot = null;
+      _clearZoomSnapshot();
       _animWaitingTiles = false;
       _pinchTransitionActive = false;
       _visualScale = 1.0;
@@ -1188,7 +1282,12 @@ class _MapViewState extends State<MapView>
   /// Shown while a vector style loads (style JSON + TileJSON fetch) or if
   /// it failed — no tile grid can be built until sources resolve.
   Widget _buildStylePlaceholder() {
+    final state =
+        MapLoadState(stage: MapLoadingStage.style, styleError: _vectorError);
     if (_vectorError != null) {
+      if (widget.errorBuilder != null) {
+        return widget.errorBuilder!(context, state, _loadVectorStyle);
+      }
       return ColoredBox(
         color: Colors.grey.shade200,
         child: Center(
@@ -1201,10 +1300,14 @@ class _MapViewState extends State<MapView>
                 'Failed to load map style',
                 style: TextStyle(color: Colors.grey.shade700),
               ),
+              _retryButton(_loadVectorStyle),
             ],
           ),
         ),
       );
+    }
+    if (widget.loadingBuilder != null) {
+      return widget.loadingBuilder!(context, state);
     }
     return const ColoredBox(
       color: Color(0xFFF5F5F5),
@@ -1213,6 +1316,32 @@ class _MapViewState extends State<MapView>
       ),
     );
   }
+
+  Widget _retryButton(VoidCallback retry) => Material(
+        type: MaterialType.transparency,
+        child: TextButton(onPressed: retry, child: const Text('Retry')),
+      );
+
+  Widget _tileErrorOverlay(MapLoadState state, VoidCallback retry) => Align(
+        alignment: Alignment.topLeft,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Material(
+            color: Theme.of(context).colorScheme.surface,
+            elevation: 2,
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.cloud_off, size: 20),
+                const SizedBox(width: 8),
+                const Flexible(child: Text('Some map tiles could not load')),
+                _retryButton(retry),
+              ]),
+            ),
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -1228,6 +1357,7 @@ class _MapViewState extends State<MapView>
 
         // Rebuild the visible grid (cheap: integer math + cache hits).
         manager.calculate();
+        final loadState = manager.loadState;
 
         final runtime = _vectorRuntime;
 
@@ -1375,6 +1505,17 @@ class _MapViewState extends State<MapView>
                   ),
                 ),
               ],
+
+              if (loadState.isLoading && widget.loadingBuilder != null)
+                Positioned.fill(
+                    child: IgnorePointer(
+                        child: widget.loadingBuilder!(context, loadState))),
+              if (loadState.hasError)
+                Positioned.fill(
+                    child: widget.errorBuilder?.call(
+                            context, loadState, manager.retryVisibleTiles) ??
+                        _tileErrorOverlay(
+                            loadState, manager.retryVisibleTiles)),
 
               // ── Zoom controls (not affected by scale) ────────────
               if (widget.showZoomControls) ...[

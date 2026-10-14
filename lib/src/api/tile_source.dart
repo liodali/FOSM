@@ -1,7 +1,9 @@
 import 'dart:ui' as ui;
+import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+import 'map_load_state.dart';
 
 /// Fetches raw image bytes for a single map tile.
 ///
@@ -64,6 +66,29 @@ class TilePayloadException implements Exception {
       : 'TilePayloadException: $message';
 }
 
+/// Owns active Dio requests without letting one request's timeout cancel its
+/// siblings or later retries. Completed requests are removed immediately.
+class MapRequestSession {
+  final Set<CancelToken> _requests = {};
+  bool _cancelled = false;
+  void add(CancelToken token) {
+    if (_cancelled) {
+      token.cancel('Map disposed');
+    } else {
+      _requests.add(token);
+    }
+  }
+
+  void remove(CancelToken token) => _requests.remove(token);
+  void cancel([Object? reason]) {
+    _cancelled = true;
+    for (final token in _requests.toList()) {
+      token.cancel(reason);
+    }
+    _requests.clear();
+  }
+}
+
 // Shared Dio — reused within a single isolate. Inside [compute] a fresh
 // isolate is spawned per call, so the cache is per-request there, but on
 // Web (same isolate) it saves connection setup cost.
@@ -77,15 +102,53 @@ Dio get _dio => _sharedDio ??= Dio(BaseOptions(
       },
     ));
 
-/// Low-level download: fetches [url] as raw bytes. Throws [DioException] on
-/// any non-2xx status, so the caller can distinguish "tile not found" from
-/// "server error" instead of silently decoding garbage.
-Future<Uint8List> downloadTileBytes(String url) async {
-  final response = await _dio.get<List<int>>(
-    url,
-    options: Options(responseType: ResponseType.bytes),
-  );
-  return Uint8List.fromList(response.data!);
+/// Downloads bytes with a deadline covering connection, headers, and body.
+/// Throws [TileLoadException] rather than leaking transport-specific errors.
+Future<Uint8List> downloadTileBytes(
+  String url, {
+  Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+  MapRequestSession? requestSession,
+}) async {
+  validateRequestTimeout(requestTimeout);
+  final cancel = CancelToken();
+  requestSession?.add(cancel);
+  try {
+    final response = await _dio
+        .get<List<int>>(
+      url,
+      cancelToken: cancel,
+      options: Options(responseType: ResponseType.bytes),
+    )
+        .timeout(requestTimeout, onTimeout: () {
+      cancel.cancel('Map request deadline exceeded');
+      throw const TileLoadException(
+          TileFailureKind.timeout, 'Map request timed out');
+    });
+    return Uint8List.fromList(response.data!);
+  } on DioException catch (error) {
+    final kind = switch (error.type) {
+      DioExceptionType.connectionTimeout ||
+      DioExceptionType.sendTimeout ||
+      DioExceptionType.receiveTimeout =>
+        TileFailureKind.timeout,
+      DioExceptionType.badResponse => TileFailureKind.http,
+      DioExceptionType.cancel => TileFailureKind.cancelled,
+      _ => TileFailureKind.network,
+    };
+    throw TileLoadException(
+        kind,
+        switch (kind) {
+          TileFailureKind.timeout => 'Map request timed out',
+          TileFailureKind.http => 'Map server rejected the request',
+          TileFailureKind.cancelled => 'Map request cancelled',
+          _ => 'Unable to download map data',
+        },
+        statusCode: error.response?.statusCode);
+  } catch (error) {
+    throw TileLoadException.from(error);
+  } finally {
+    requestSession?.remove(cancel);
+  }
 }
 
 /// Builds the canonical OSM tile URL for ([z], [x], [y]).

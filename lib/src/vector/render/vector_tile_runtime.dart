@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 
 import 'package:fosm/src/api/tile.dart' show Tile;
+import 'package:fosm/src/api/map_load_state.dart';
 import 'package:fosm/src/api/tile_source.dart'
     show
         TileDecodeAborted,
@@ -12,7 +13,8 @@ import 'package:fosm/src/api/tile_source.dart'
         TileFetcher,
         TilePayloadException,
         TileResourceKeyBuilder,
-        downloadTileBytes;
+        downloadTileBytes,
+        MapRequestSession;
 import 'package:fosm/src/isolate/mvt_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/mvt_isolate_native.dart';
 import 'package:fosm/src/isolate/mvt_worker.dart';
@@ -45,12 +47,16 @@ class VectorTileRuntime {
   /// worker on native or cooperative chunking on web. Set to `false` in
   /// tests that require fully synchronous parsing.
   final bool parseOffThread;
+  Duration requestTimeout;
+  final MapRequestSession _networkCancel = MapRequestSession();
 
   VectorTileRuntime({
     required this.loaded,
     required this.namespace,
     this.parseOffThread = true,
+    this.requestTimeout = TileLoadException.defaultRequestTimeout,
   }) {
+    validateRequestTimeout(requestTimeout);
     _loadSprite();
     // Spawn the persistent MVT decode isolate on native so per-tile
     // `compute()` spawns are avoided. On web [MvtIsolate] is a stub
@@ -611,7 +617,9 @@ class VectorTileRuntime {
   Future<Uint8List> _fetchShared(String url) {
     final existing = _inFlightUrls[url];
     if (existing != null) return existing;
-    final future = downloadTileBytes(url).whenComplete(() {
+    final future = downloadTileBytes(url,
+            requestTimeout: requestTimeout, requestSession: _networkCancel)
+        .whenComplete(() {
       _inFlightUrls.remove(url);
     });
     _inFlightUrls[url] = future;
@@ -649,7 +657,9 @@ class VectorTileRuntime {
   Future<void> _loadSprite() async {
     final spriteUrl = loaded.style.sprite;
     if (spriteUrl == null) return;
-    _spriteLoading = SpriteAtlas.load(spriteUrl).then((atlas) {
+    _spriteLoading = SpriteAtlas.load(spriteUrl,
+            requestTimeout: requestTimeout, requestSession: _networkCancel)
+        .then((atlas) {
       if (_disposed) {
         atlas?.dispose();
         return;
@@ -670,6 +680,7 @@ class VectorTileRuntime {
   LabelOverlay createLabelOverlay() => labelOverlay;
 
   void dispose() {
+    _networkCancel.cancel('Map disposed');
     _disposed = true;
     _labelPumpTimer?.cancel();
     _labelPumpTimer = null;

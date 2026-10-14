@@ -1,8 +1,9 @@
 import 'dart:convert';
 import 'dart:ui' as ui;
 
-import '../../api/tile_source.dart' show downloadTileBytes;
+import '../../api/tile_source.dart' show downloadTileBytes, MapRequestSession;
 import '../../api/tile.dart' show Tile;
+import '../../api/map_load_state.dart';
 
 /// A loaded style sprite sheet: one PNG atlas plus the JSON metadata that
 /// names each icon's rectangle.
@@ -15,18 +16,27 @@ class SpriteAtlas {
   /// Loads `{baseUrl}.json` + `{baseUrl}.png` (with `@2x` variants on
   /// high-density screens). Returns `null` on any failure — missing icons
   /// simply don't render.
-  static Future<SpriteAtlas?> load(String baseUrl, {double pixelRatio = 1}) {
+  static Future<SpriteAtlas?> load(
+    String baseUrl, {
+    double pixelRatio = 1,
+    Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+    MapRequestSession? requestSession,
+  }) {
     final suffix = pixelRatio >= 2 ? '@2x' : '';
-    return _load('$baseUrl$suffix', pixelRatio >= 2 ? 2.0 : 1.0)
+    return _load('$baseUrl$suffix', pixelRatio >= 2 ? 2.0 : 1.0, requestTimeout,
+            requestSession)
         .catchError((_) => null);
   }
 
-  static Future<SpriteAtlas?> _load(String base, double scale) async {
-    final jsonBytes = await downloadTileBytes('$base.json');
+  static Future<SpriteAtlas?> _load(String base, double scale, Duration timeout,
+      MapRequestSession? cancel) async {
+    final jsonBytes = await downloadTileBytes('$base.json',
+        requestTimeout: timeout, requestSession: cancel);
     final metadata = jsonDecode(utf8.decode(jsonBytes));
     if (metadata is! Map) return null;
 
-    final imageBytes = await downloadTileBytes('$base.png');
+    final imageBytes = await downloadTileBytes('$base.png',
+        requestTimeout: timeout, requestSession: cancel);
     final image = await Tile.decodeImage(imageBytes);
 
     final icons = <String, ui.Rect>{};
