@@ -1,5 +1,9 @@
 ## Unreleased
 
+* Add friction-based fling panning with `MapView.enableFling`, bounds enforcement, immediate touch/command interruption, and cancellation-safe pan animation cleanup.
+* Add cursor-anchored mouse-wheel zoom with `MapView.enableScrollZoom`, accumulated small deltas, zoom limits, and nested scroll handling.
+* Preserve cumulative pinch scale with reversal damping; correct multi-level zoom animation scaling and preserve momentum when parents echo camera callbacks into widget properties.
+
 * Add geographic map tap/long-press callbacks and notifications, with feature selection that preserves marker and camera gesture priority.
 * Add `MapPolygon` fills, borders, holes, and selection below routes and markers.
 * Add polyline tap/long-press hit results with the nearest route point, segment index, pixel distance, and configurable hit tolerance.

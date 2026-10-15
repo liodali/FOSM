@@ -1121,12 +1121,41 @@ MapView(
 )
 ```
 
+### Camera gestures
+
+Single-pointer drags coast after release and slow with friction. Momentum obeys
+`cameraBounds` and world limits; a new touch, wheel input, or camera command
+stops it immediately. Pinches and cancelled gestures never start a fling.
+Camera callbacks continue during motion, with a camera notification when it
+settles. Parents can echo the current camera into `latLng`/`zoom` without
+interrupting motion.
+
+Vertical mouse-wheel input zooms around the cursor. Small deltas accumulate
+within a burst (100 scroll pixels per level); direction changes and a 200 ms
+pause reset the remainder. Wheel input uses Flutter's pointer-signal resolver,
+so nested scrollable content can consume it first. At a zoom limit, outward
+scrolling can pass to the parent. Pinch zoom and controller zoom remain integer
+based. Pinches use the original gesture scale (2× means one level), with a
+small reversal tolerance to prevent boundary flicker. Multi-level transitions
+scale through the complete zoom delta.
+
+Both options default to true and can be changed at runtime:
+
+```dart
+MapView(
+  latLng: center,
+  zoom: 7,
+  enableFling: true,
+  enableScrollZoom: true,
+)
+```
+
 ### Disable Animations
 
 ```dart
 MapView(
   animateZoom: false,
-  zoomAnimationDuration: Duration(milliseconds: 200),
+  enableFling: false,
   // ...
 )
 ```
