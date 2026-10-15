@@ -4,6 +4,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/physics.dart';
 
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/lat_lng_bounds.dart';
@@ -263,13 +265,15 @@ enum ZoomAnimationStyle {
 /// ### Gesture handling
 /// - **Pan / drag**: anchor-based — records the tile-space center at
 ///   [onScaleStart], then applies the pixel delta since the last zoom
-///   step on every update.
+///   step on every update. A single-pointer release coasts with friction
+///   when [enableFling] is enabled. Touching the map stops the motion.
 /// - **Pinch to zoom**: two-finger scale gesture changes the zoom level
 ///   in integer steps as the accumulated scale crosses each rounding
 ///   boundary. The geographic point under the current focal point stays
 ///   stationary, and each step plays a zoom animation when
 ///   [animateZoom] is enabled.
 /// - **Double-tap**: zoom in one level with a smooth zoom animation.
+/// - **Mouse wheel**: zoom around the cursor when [enableScrollZoom] is enabled.
 ///
 /// ### Markers
 /// Pass a [MarkerManager] to [markers] and mutate it at runtime — markers
@@ -417,6 +421,15 @@ class MapView extends StatefulWidget {
   final void Function(LatLng center, int zoom)? onCameraChanged;
 
   final Alignment zoomControlsAlignment;
+
+  /// Continue a single-pointer pan with decaying momentum after release.
+  /// New touches and camera commands stop the motion immediately.
+  final bool enableFling;
+
+  /// Zoom around the cursor on vertical wheel input (100 pixels per level).
+  /// Disable when the host should handle scrolling over the map.
+  final bool enableScrollZoom;
+
   final bool animateZoom;
   final Duration zoomAnimationDuration;
 
@@ -471,6 +484,8 @@ class MapView extends StatefulWidget {
     this.onZoomChanged,
     this.onCameraChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
+    this.enableFling = true,
+    this.enableScrollZoom = true,
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
     this.zoomAnimationStyle = ZoomAnimationStyle.scale,
@@ -502,8 +517,8 @@ class _MapViewState extends State<MapView>
   late AnimationController _animController;
   Animation<double>? _scaleAnimation;
 
-  /// Visual scale applied to the OLD grid overlay during animation.
-  /// Zoom in: 1.0→2.0, Zoom out: 1.0→0.5.
+  /// Visual scale applied to the OLD grid overlay during animation:
+  /// 1.0 → 2^(target zoom - snapshot zoom).
   double _visualScale = 1.0;
 
   /// Focal point for the scale transform (in local widget coords).
@@ -512,9 +527,6 @@ class _MapViewState extends State<MapView>
   /// Snapshot of the OLD grid (before zoom change) rendered as an overlay
   /// during the scale transition.
   _GridSnapshot? _animOldSnapshot;
-
-  /// Whether we're zooming in (true) or out (false).
-  bool _animIsZoomIn = true;
 
   /// True during phase 1: old tiles shown with blur, waiting for new
   /// tiles to load. Once new tiles are ready, phase 2 (scale) starts.
@@ -532,6 +544,12 @@ class _MapViewState extends State<MapView>
 
   // ── Pan animation ───────────────────────────────────────────────────
   AnimationController? _panController;
+  bool _flinging = false;
+  final Set<int> _pointers = {};
+  bool _gestureHadMultiplePointers = false;
+  bool _gestureCancelled = false;
+  double _scrollPixels = 0;
+  Duration? _lastScrollTime;
 
   // ── Controller ready notification ───────────────────────────────────
   bool _readyNotificationDispatched = false;
@@ -564,17 +582,16 @@ class _MapViewState extends State<MapView>
       _fitBounds(bounds, padding: padding, animate: animate);
 
   // ── Scale gesture state ─────────────────────────────────────────────
-  // Anchors captured at gesture start and re-baselined after every zoom
-  // step — tile coordinates only make sense in the zoom they were
-  // captured at, and a pinch may step through several zoom levels.
+  // Pan anchors are re-baselined after zoom steps because tile units change.
+  // The zoom baseline stays fixed for the entire gesture so 2x scale is one
+  // level regardless of how many intermediate updates were delivered.
   double? _scaleStartTileLng;
   double? _scaleStartTileLat;
   int? _scaleStartZoom;
   Offset? _scaleStartFocal;
 
-  /// Scale at the last (re-)baseline — the accumulated pinch scale is
-  /// measured relative to it.
-  double? _scaleStartScale;
+  /// Last zoom direction, used to damp reversals around a rounding boundary.
+  int _pinchZoomDirection = 0;
 
   /// True from gesture start to gesture end. Full-viewport blur is skipped
   /// during direct manipulation so a pinch/drag never pays for an
@@ -685,15 +702,30 @@ class _MapViewState extends State<MapView>
         retention: widget.renderedCacheRetention,
       );
     }
+    // Hosts often echo onCameraChanged back into latLng/zoom. Those rebuilds
+    // acknowledge our current camera rather than interrupting its motion.
+    final externalCenter = widget.latLng != oldWidget.latLng &&
+        widget.latLng != _tileManager?.centerLatLng;
+    final externalZoom =
+        widget.zoom != oldWidget.zoom && widget.zoom != _currentZoom;
+    if ((!widget.enableFling && _flinging) ||
+        widget.cameraBounds != oldWidget.cameraBounds ||
+        externalCenter ||
+        externalZoom ||
+        widget.minZoom != oldWidget.minZoom ||
+        widget.maxZoom != oldWidget.maxZoom) {
+      _stopPanAnimation();
+    }
+    if (!widget.enableScrollZoom) _scrollPixels = 0;
     if (widget.cameraBounds != oldWidget.cameraBounds) {
       _tileManager?.setCameraBounds(widget.cameraBounds);
       setState(() {});
     }
-    if (widget.latLng != oldWidget.latLng) {
+    if (externalCenter) {
       _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
     }
-    if (widget.zoom != oldWidget.zoom && widget.zoom != _currentZoom) {
+    if (externalZoom) {
       _tileManager?.setZoom(widget.zoom);
       _currentZoom = widget.zoom;
       setState(() {});
@@ -790,6 +822,7 @@ class _MapViewState extends State<MapView>
   void _zoomBy(int delta, {Offset? focalLocal, bool? animate}) {
     final manager = _tileManager;
     if (manager == null) return;
+    _stopPanAnimation();
     final newZoom =
         (manager.zoom + delta).clamp(widget.minZoom, widget.maxZoom);
     if (newZoom == manager.zoom) return;
@@ -805,6 +838,7 @@ class _MapViewState extends State<MapView>
   void _setZoom(int zoom, {bool? animate}) {
     final manager = _tileManager;
     if (manager == null) return;
+    _stopPanAnimation();
     final newZoom = zoom.clamp(widget.minZoom, widget.maxZoom);
     if (newZoom == manager.zoom) return;
 
@@ -842,6 +876,7 @@ class _MapViewState extends State<MapView>
     final manager = _tileManager;
     if (manager == null) return;
 
+    _stopPanAnimation();
     final target = LatLng(
       latitude: clampLatitude(latLng.latitude),
       longitude: clampLongitude(latLng.longitude),
@@ -855,8 +890,6 @@ class _MapViewState extends State<MapView>
       if (mounted) setState(() {});
       return;
     }
-
-    _stopPanAnimation();
 
     final startLng = manager.centerTileLng;
     final startLat = manager.centerTileLat;
@@ -872,37 +905,116 @@ class _MapViewState extends State<MapView>
     final animation = Tween<Offset>(
       begin: Offset(startLng, startLat),
       end: Offset(endLng, endLat),
-    ).animate(CurvedAnimation(
-      parent: controller,
-      curve: Curves.easeInOut,
-    ));
+    ).chain(CurveTween(curve: Curves.easeInOut)).animate(controller);
 
-    void onTick() {
+    controller.addListener(() {
       if (!mounted) return;
       final value = animation.value;
       manager.setCenterFromTileCoords(value.dx, value.dy);
       _notifyCamera(manager);
       setState(() {});
-    }
-
-    animation.addListener(onTick);
-    controller.forward().whenComplete(() {
-      animation.removeListener(onTick);
-      if (_panController == controller) {
-        _panController?.dispose();
-        _panController = null;
-      }
-      if (mounted) {
-        MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
-            .dispatch(context);
-      }
     });
+    _completePanAnimation(controller, manager, controller.forward());
+  }
+
+  Future<void> _completePanAnimation(AnimationController controller,
+      TileManager manager, TickerFuture motion) async {
+    try {
+      await motion.orCancel;
+    } on TickerCanceled {
+      return;
+    }
+    if (!mounted || _panController != controller) return;
+    _stopPanAnimation();
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+        .dispatch(context);
   }
 
   void _stopPanAnimation() {
-    _panController?.stop();
-    _panController?.dispose();
+    final controller = _panController;
     _panController = null;
+    _flinging = false;
+    controller?.dispose();
+  }
+
+  void _startFling(TileManager manager, Offset velocity) {
+    final speed = velocity.distance;
+    if (!widget.enableFling || !speed.isFinite || speed < 50) return;
+    _stopPanAnimation();
+    final direction = velocity / speed;
+    final start = Offset(manager.centerTileLng, manager.centerTileLat);
+    final controller = AnimationController.unbounded(vsync: this);
+    _panController = controller;
+    _flinging = true;
+    controller.addListener(() {
+      if (!mounted) return;
+      final previous = Offset(manager.centerTileLng, manager.centerTileLat);
+      final target = start - direction * (controller.value / tileWidth);
+      manager.setCenterFromTileCoords(target.dx, target.dy);
+      final current = Offset(manager.centerTileLng, manager.centerTileLat);
+      // Each axis clamps independently, allowing diagonal motion along an
+      // edge. Stop the ticker once both axes are blocked by bounds.
+      if (controller.value > 0 && (current - previous).distance < 1e-10) {
+        _stopPanAnimation();
+        MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+            .dispatch(context);
+        return;
+      }
+      _notifyCamera(manager);
+      setState(() {});
+    });
+    _completePanAnimation(
+        controller,
+        manager,
+        controller.animateWith(
+          FrictionSimulation(0.135, 0, speed.clamp(0, 8000),
+              tolerance: const Tolerance(velocity: 10, distance: 0.5)),
+        ));
+  }
+
+  void _onPointerDown(PointerDownEvent event) {
+    _stopPanAnimation();
+    _scrollPixels = 0;
+    if (_pointers.isEmpty) {
+      _gestureHadMultiplePointers = false;
+      _gestureCancelled = false;
+    }
+    _pointers.add(event.pointer);
+    if (_pointers.length > 1) _gestureHadMultiplePointers = true;
+  }
+
+  void _onPointerSignal(PointerSignalEvent event) {
+    final manager = _tileManager;
+    if (!widget.enableScrollZoom ||
+        manager == null ||
+        _pointers.isNotEmpty ||
+        _scaleStartZoom != null ||
+        event is! PointerScrollEvent ||
+        !event.scrollDelta.dy.isFinite ||
+        event.scrollDelta.dy == 0) {
+      return;
+    }
+    final dy = event.scrollDelta.dy;
+    if ((dy < 0 && manager.zoom >= widget.maxZoom) ||
+        (dy > 0 && manager.zoom <= widget.minZoom)) {
+      _scrollPixels = 0;
+      return;
+    }
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      _stopPanAnimation();
+      if (_lastScrollTime == null ||
+          event.timeStamp - _lastScrollTime! >
+              const Duration(milliseconds: 200) ||
+          _scrollPixels.sign != dy.sign) {
+        _scrollPixels = 0;
+      }
+      _lastScrollTime = event.timeStamp;
+      _scrollPixels += dy;
+      final levels = (_scrollPixels / 100).truncate();
+      if (levels == 0) return;
+      _scrollPixels -= levels * 100;
+      _zoomBy(-levels, focalLocal: event.localPosition);
+    });
   }
 
   /// Frames [bounds] in the viewport, leaving [padding] around it, then
@@ -1003,7 +1115,6 @@ class _MapViewState extends State<MapView>
     // 1. Ensure grid is up-to-date and snapshot the OLD grid.
     manager.calculate();
     _animOldSnapshot = _GridSnapshot.from(manager);
-    _animIsZoomIn = targetZoom > manager.zoom;
 
     // 2. Switch TileManager to the TARGET zoom immediately.
     //    The new grid will be rendered as the background layer.
@@ -1063,7 +1174,6 @@ class _MapViewState extends State<MapView>
     _clearZoomSnapshot();
     manager.calculate();
     _animOldSnapshot = _GridSnapshot.from(manager);
-    _animIsZoomIn = targetZoom > manager.zoom;
     _visualScaleFocal = focal;
     manager.setZoomWithFocalPoint(targetZoom, focal, manager.zoom);
     _currentZoom = targetZoom;
@@ -1098,9 +1208,11 @@ class _MapViewState extends State<MapView>
     _animWaitTimer = null;
 
     final settleScale = _visualScale;
+    final targetScale =
+        math.pow(2, _tileManager!.zoom - _animOldSnapshot!.zoom).toDouble();
     _scaleAnimation = Tween<double>(
       begin: _pinchTransitionActive ? settleScale : 1.0,
-      end: _pinchTransitionActive ? settleScale : (_animIsZoomIn ? 2.0 : 0.5),
+      end: _pinchTransitionActive ? settleScale : targetScale,
     ).animate(CurvedAnimation(
       parent: _animController,
       curve: Curves.easeInOut,
@@ -1160,7 +1272,7 @@ class _MapViewState extends State<MapView>
     _scaleStartTileLat = manager.centerTileLat;
     _scaleStartZoom = manager.zoom;
     _scaleStartFocal = details.localFocalPoint;
-    _scaleStartScale = 1.0;
+    _pinchZoomDirection = 0;
     _pinchTransitionActive = false;
   }
 
@@ -1169,28 +1281,34 @@ class _MapViewState extends State<MapView>
     // plain tap also raises scale-start, and that must not disable the
     // zoom transition's blur.
     _interacting = true;
+    if (details.pointerCount > 1) _gestureHadMultiplePointers = true;
     final startZoom = _scaleStartZoom;
     final startFocal = _scaleStartFocal;
-    final startScale = _scaleStartScale;
     if (startZoom == null ||
         startFocal == null ||
-        startScale == null ||
-        startScale <= 0) {
+        !details.scale.isFinite ||
+        details.scale <= 0) {
       return;
     }
 
     final focalLocal = details.localFocalPoint;
 
-    // The map renders integer zoom levels only, so a zoom step is applied
-    // when the pinch scale accumulated since the last baseline crosses a
-    // rounding boundary. The step anchors on the CURRENT focal point, so
-    // the content under the fingers stays put even when the focal drifts
-    // during the pinch.
-    final zoomDelta = math.log(details.scale / startScale) / math.log(2);
-    final newZoom =
-        (startZoom + zoomDelta).round().clamp(widget.minZoom, widget.maxZoom);
+    // Quantize against the original gesture scale, never against the last
+    // rounded zoom. A small reverse deadband prevents tiny span changes
+    // during a two-finger pan from toggling the previous zoom step.
+    final continuousZoom = startZoom + math.log(details.scale) / math.ln2;
+    var newZoom = continuousZoom.round().clamp(widget.minZoom, widget.maxZoom);
+    if ((_pinchZoomDirection > 0 &&
+            newZoom < manager.zoom &&
+            continuousZoom > manager.zoom - 0.65) ||
+        (_pinchZoomDirection < 0 &&
+            newZoom > manager.zoom &&
+            continuousZoom < manager.zoom + 0.65)) {
+      newZoom = manager.zoom;
+    }
 
     if (newZoom != manager.zoom) {
+      _pinchZoomDirection = (newZoom - manager.zoom).sign;
       if (widget.animateZoom && !_pinchTransitionActive) {
         // First zoom step of this pinch: build the snapshot/wait/scale
         // state exactly once. Later steps within the same gesture are
@@ -1218,8 +1336,6 @@ class _MapViewState extends State<MapView>
       // is now in the NEW zoom's units. Without this, the pan below
       // would mix units from different zoom levels and teleport the
       // camera — tile coordinates double with every zoom step.
-      _scaleStartZoom = newZoom;
-      _scaleStartScale = details.scale;
       _scaleStartTileLng = manager.centerTileLng;
       _scaleStartTileLat = manager.centerTileLat;
       _scaleStartFocal = focalLocal;
@@ -1256,8 +1372,14 @@ class _MapViewState extends State<MapView>
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
     _scaleStartFocal = null;
-    _scaleStartScale = null;
+    final wasPanning = _interacting &&
+        !_gestureHadMultiplePointers &&
+        !_gestureCancelled &&
+        details.pointerCount == 0;
     _interacting = false;
+    if (wasPanning && manager != null) {
+      _startFling(manager, details.velocity.pixelsPerSecond);
+    }
 
     if (_pinchTransitionActive && _animOldSnapshot != null) {
       if (_newTilesReady()) {
@@ -1445,197 +1567,209 @@ class _MapViewState extends State<MapView>
           alignmentY.clamp(-1.0, 1.0),
         );
 
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onScaleStart: _onScaleStart,
-          onScaleUpdate: (d) => _onScaleUpdate(manager, d),
-          onScaleEnd: _onScaleEnd,
-          // NOTE: bare-map tap is handled by the tile-layer detector below,
-          // not by this root detector. Putting it here made the map's tap
-          // recognizer compete in the gesture arena with marker taps, which
-          // caused marker taps to be dropped/intermittent.
-          onDoubleTapDown: (details) {
-            _doubleTapLocal = details.localPosition;
+        return Listener(
+          onPointerDown: _onPointerDown,
+          onPointerUp: (event) => _pointers.remove(event.pointer),
+          onPointerCancel: (event) {
+            _gestureCancelled = true;
+            _pointers.remove(event.pointer);
           },
-          onDoubleTap: () => _zoomInAt(_doubleTapLocal),
-          child: Stack(
-            children: [
-              // ── Map surface: tiles + bare-map tap handler ───────────
-              // Placed below markers so marker taps win unambiguously.
-              Positioned.fill(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.translucent,
-                  onTapUp: (details) => _onMapPress(details.localPosition),
-                  onLongPressStart: (details) =>
-                      _onMapPress(details.localPosition, longPress: true),
-                  child: Stack(
-                    children: [
-                      // ── NEW zoom tiles (background, always at 1.0×) ─
-                      Positioned.fill(
-                        child: CustomPaint(
-                          size: size,
-                          painter: RenderCanvasOSM(
-                            horizontalTileCount: manager.horizontalTileCount,
-                            verticalTileCount: manager.verticalTileCount,
-                            leftColumnTilesLngIndex:
-                                manager.leftColumnTilesLngIndex,
-                            topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                            leftColumnTilesCanvasX:
-                                manager.leftColumnTilesCanvasX,
-                            topRowTilesCanvasY: manager.topRowTilesCanvasY,
-                            tiles: manager.renderTiles,
-                            revision: manager.revision,
+          onPointerSignal: _onPointerSignal,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onScaleStart: _onScaleStart,
+            onScaleUpdate: (d) => _onScaleUpdate(manager, d),
+            onScaleEnd: _onScaleEnd,
+            // NOTE: bare-map tap is handled by the tile-layer detector below,
+            // not by this root detector. Putting it here made the map's tap
+            // recognizer compete in the gesture arena with marker taps, which
+            // caused marker taps to be dropped/intermittent.
+            onDoubleTapDown: (details) {
+              _doubleTapLocal = details.localPosition;
+            },
+            onDoubleTap: () => _zoomInAt(_doubleTapLocal),
+            child: Stack(
+              children: [
+                // ── Map surface: tiles + bare-map tap handler ───────────
+                // Placed below markers so marker taps win unambiguously.
+                Positioned.fill(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onTapUp: (details) => _onMapPress(details.localPosition),
+                    onLongPressStart: (details) =>
+                        _onMapPress(details.localPosition, longPress: true),
+                    child: Stack(
+                      children: [
+                        // ── NEW zoom tiles (background, always at 1.0×) ─
+                        Positioned.fill(
+                          child: CustomPaint(
+                            size: size,
+                            painter: RenderCanvasOSM(
+                              horizontalTileCount: manager.horizontalTileCount,
+                              verticalTileCount: manager.verticalTileCount,
+                              leftColumnTilesLngIndex:
+                                  manager.leftColumnTilesLngIndex,
+                              topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                              leftColumnTilesCanvasX:
+                                  manager.leftColumnTilesCanvasX,
+                              topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                              tiles: manager.renderTiles,
+                              revision: manager.revision,
+                            ),
+                          ),
+                        ),
+
+                        // ── OLD zoom tiles (overlay, animated out) ─────
+                        // Keyed: this child inserts/removes mid-animation,
+                        // and an unkeyed insertion reshuffles — recreating
+                        // the state of — every Stack child after it (marker
+                        // layer included).
+                        if (isAnimatingZoom) ...[
+                          _OldGridOverlay(
+                            manager: manager,
+                            size: size,
+                            scaleAlignment: scaleAlignment,
+                            snapshot: _animOldSnapshot!,
+                            animation: _animController,
+                            waiting: _animWaitingTiles,
+                            visualScale: _visualScale,
+                            blurSigma: _blurSigma,
+                            interactionSnapshot: _pinchTransitionActive,
+                            blurEnabled: !kIsWeb && !_interacting,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+
+                if (widget.polygons.isNotEmpty)
+                  Positioned.fill(
+                      child: PolygonLayer(
+                          polygons: widget.polygons, manager: manager)),
+
+                // ── Polylines (above tiles, below markers and labels) ──
+                if (widget.polylines.isNotEmpty) ...[
+                  Positioned.fill(
+                    child: PolylineLayer(
+                      polylines: widget.polylines,
+                      manager: manager,
+                    ),
+                  ),
+                ],
+
+                // ── Markers (above tiles + scale overlay, below labels) ─
+                if (widget.markers != null) ...[
+                  Positioned.fill(
+                    child: MarkerLayer(
+                      markers: widget.markers!,
+                      manager: manager,
+                      clusterOptions: widget.markerClusterOptions,
+                      onMarkerTap: (marker) {
+                        MapMarkerTapNotification(marker).dispatch(context);
+                      },
+                      onMarkerLongPress: (marker) {
+                        MapMarkerLongPressNotification(marker)
+                            .dispatch(context);
+                      },
+                      onClusterTap: (cluster) {
+                        _onClusterTapped(cluster);
+                      },
+                      onOverlayShown: (marker) {
+                        MapOverlayShownNotification(marker).dispatch(context);
+                      },
+                      onOverlayHidden: (marker) {
+                        MapOverlayHiddenNotification(marker).dispatch(context);
+                      },
+                    ),
+                  ),
+                ],
+
+                // ── Vector labels (above markers; need viewport-level ──
+                // ── collision, not per-tile rendering). Ignored for  ───
+                // ── hit testing so markers stay tappable.             ───
+                if (runtime != null) ...[
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: CustomPaint(
+                        size: size,
+                        painter: VectorLabelPainter(
+                          // Labels prepare after their base image is published
+                          // and notify this notifier; only the label surface
+                          // repaints, leaving tiles, markers, controls alone.
+                          repaint: runtime.labelsNotifier,
+                          horizontalTileCount: manager.horizontalTileCount,
+                          verticalTileCount: manager.verticalTileCount,
+                          leftColumnTilesLngIndex:
+                              manager.leftColumnTilesLngIndex,
+                          topRowTilesLatIndex: manager.topRowTilesLatIndex,
+                          leftColumnTilesCanvasX:
+                              manager.leftColumnTilesCanvasX,
+                          topRowTilesCanvasY: manager.topRowTilesCanvasY,
+                          tiles: manager.renderTiles,
+                          revision: manager.revision,
+                          zoom: manager.zoom,
+                          overlay: runtime.labelOverlay,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+
+                if (loadState.isLoading && widget.loadingBuilder != null)
+                  Positioned.fill(
+                      child: IgnorePointer(
+                          child: widget.loadingBuilder!(context, loadState))),
+                if (loadState.hasError)
+                  Positioned.fill(
+                      child: widget.errorBuilder?.call(
+                              context, loadState, manager.retryVisibleTiles) ??
+                          _tileErrorOverlay(
+                              loadState, manager.retryVisibleTiles)),
+
+                // ── Zoom controls (not affected by scale) ────────────
+                if (widget.showZoomControls) ...[
+                  Positioned.fill(
+                    child: MapZoomControls(
+                      zoom: _currentZoom,
+                      minZoom: widget.minZoom,
+                      maxZoom: widget.maxZoom,
+                      alignment: widget.zoomControlsAlignment,
+                      onZoomIn: _zoomIn,
+                      onZoomOut: _zoomOut,
+                    ),
+                  ),
+                ],
+
+                // ── Attribution (required by vector tile providers) ───
+                if (runtime != null &&
+                    runtime.loaded.attribution.isNotEmpty) ...[
+                  Positioned(
+                    left: 4,
+                    bottom: 4,
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.7),
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                        child: Text(
+                          runtime.loaded.attribution,
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: Colors.black.withValues(alpha: 0.6),
                           ),
                         ),
                       ),
-
-                      // ── OLD zoom tiles (overlay, animated out) ─────
-                      // Keyed: this child inserts/removes mid-animation,
-                      // and an unkeyed insertion reshuffles — recreating
-                      // the state of — every Stack child after it (marker
-                      // layer included).
-                      if (isAnimatingZoom) ...[
-                        _OldGridOverlay(
-                          manager: manager,
-                          size: size,
-                          scaleAlignment: scaleAlignment,
-                          snapshot: _animOldSnapshot!,
-                          animation: _animController,
-                          waiting: _animWaitingTiles,
-                          visualScale: _visualScale,
-                          blurSigma: _blurSigma,
-                          interactionSnapshot: _pinchTransitionActive,
-                          blurEnabled: !kIsWeb && !_interacting,
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-
-              if (widget.polygons.isNotEmpty)
-                Positioned.fill(
-                    child: PolygonLayer(
-                        polygons: widget.polygons, manager: manager)),
-
-              // ── Polylines (above tiles, below markers and labels) ──
-              if (widget.polylines.isNotEmpty) ...[
-                Positioned.fill(
-                  child: PolylineLayer(
-                    polylines: widget.polylines,
-                    manager: manager,
-                  ),
-                ),
-              ],
-
-              // ── Markers (above tiles + scale overlay, below labels) ─
-              if (widget.markers != null) ...[
-                Positioned.fill(
-                  child: MarkerLayer(
-                    markers: widget.markers!,
-                    manager: manager,
-                    clusterOptions: widget.markerClusterOptions,
-                    onMarkerTap: (marker) {
-                      MapMarkerTapNotification(marker).dispatch(context);
-                    },
-                    onMarkerLongPress: (marker) {
-                      MapMarkerLongPressNotification(marker).dispatch(context);
-                    },
-                    onClusterTap: (cluster) {
-                      _onClusterTapped(cluster);
-                    },
-                    onOverlayShown: (marker) {
-                      MapOverlayShownNotification(marker).dispatch(context);
-                    },
-                    onOverlayHidden: (marker) {
-                      MapOverlayHiddenNotification(marker).dispatch(context);
-                    },
-                  ),
-                ),
-              ],
-
-              // ── Vector labels (above markers; need viewport-level ──
-              // ── collision, not per-tile rendering). Ignored for  ───
-              // ── hit testing so markers stay tappable.             ───
-              if (runtime != null) ...[
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: CustomPaint(
-                      size: size,
-                      painter: VectorLabelPainter(
-                        // Labels prepare after their base image is published
-                        // and notify this notifier; only the label surface
-                        // repaints, leaving tiles, markers, controls alone.
-                        repaint: runtime.labelsNotifier,
-                        horizontalTileCount: manager.horizontalTileCount,
-                        verticalTileCount: manager.verticalTileCount,
-                        leftColumnTilesLngIndex:
-                            manager.leftColumnTilesLngIndex,
-                        topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                        leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
-                        topRowTilesCanvasY: manager.topRowTilesCanvasY,
-                        tiles: manager.renderTiles,
-                        revision: manager.revision,
-                        zoom: manager.zoom,
-                        overlay: runtime.labelOverlay,
-                      ),
                     ),
                   ),
-                ),
+                ],
               ],
-
-              if (loadState.isLoading && widget.loadingBuilder != null)
-                Positioned.fill(
-                    child: IgnorePointer(
-                        child: widget.loadingBuilder!(context, loadState))),
-              if (loadState.hasError)
-                Positioned.fill(
-                    child: widget.errorBuilder?.call(
-                            context, loadState, manager.retryVisibleTiles) ??
-                        _tileErrorOverlay(
-                            loadState, manager.retryVisibleTiles)),
-
-              // ── Zoom controls (not affected by scale) ────────────
-              if (widget.showZoomControls) ...[
-                Positioned.fill(
-                  child: MapZoomControls(
-                    zoom: _currentZoom,
-                    minZoom: widget.minZoom,
-                    maxZoom: widget.maxZoom,
-                    alignment: widget.zoomControlsAlignment,
-                    onZoomIn: _zoomIn,
-                    onZoomOut: _zoomOut,
-                  ),
-                ),
-              ],
-
-              // ── Attribution (required by vector tile providers) ───
-              if (runtime != null && runtime.loaded.attribution.isNotEmpty) ...[
-                Positioned(
-                  left: 4,
-                  bottom: 4,
-                  child: IgnorePointer(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.7),
-                        borderRadius: BorderRadius.circular(2),
-                      ),
-                      child: Text(
-                        runtime.loaded.attribution,
-                        style: TextStyle(
-                          fontSize: 9,
-                          color: Colors.black.withValues(alpha: 0.6),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ],
+            ),
           ),
         );
       },

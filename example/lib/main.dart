@@ -78,6 +78,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   int _zoom = 7;
 
   bool _animateZoom = true;
+  bool _enableFling = true;
+  bool _enableScrollZoom = true;
   ZoomAnimationStyle _zoomStyle = ZoomAnimationStyle.scale;
 
   /// Demo hard camera constraint — toggled by the bounds button. `null`
@@ -437,6 +439,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
                 showZoomControls: true,
                 animateZoom: _animateZoom,
+                enableFling: _enableFling,
+                enableScrollZoom: _enableScrollZoom,
                 zoomAnimationStyle: _zoomStyle,
                 zoomAnimationDuration: const Duration(milliseconds: 300),
                 onZoomChanged: (zoom) => setState(() => _zoom = zoom),
@@ -697,7 +701,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
       builder: (context) => StatefulBuilder(
         builder: (context, setModalState) {
           setSheetState = setModalState;
-          return _buildSourceControls(update);
+          return SingleChildScrollView(child: _buildSourceControls(update));
         },
       ),
     ).whenComplete(() => setSheetState = null);
@@ -752,6 +756,18 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
               ],
             ),
             const SizedBox(height: 12),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Momentum panning'),
+              value: _enableFling,
+              onChanged: (value) => update(() => _enableFling = value),
+            ),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Mouse-wheel zoom'),
+              value: _enableScrollZoom,
+              onChanged: (value) => update(() => _enableScrollZoom = value),
+            ),
             Row(
               children: [
                 const Icon(Icons.group_work, size: 18, color: Colors.black87),
