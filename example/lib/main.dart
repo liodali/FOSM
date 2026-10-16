@@ -78,6 +78,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   int _zoom = 7;
 
   bool _animateZoom = true;
+  bool _showScaleBar = true;
   bool _enableFling = true;
   bool _enableScrollZoom = true;
   ZoomAnimationStyle _zoomStyle = ZoomAnimationStyle.scale;
@@ -438,6 +439,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 cameraBounds: _cameraBounds,
                 vectorStyle: _mode == _MapMode.vector ? _vectorStyle : null,
                 showZoomControls: true,
+                showScaleBar: _showScaleBar,
                 animateZoom: _animateZoom,
                 enableFling: _enableFling,
                 enableScrollZoom: _enableScrollZoom,
@@ -756,6 +758,12 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
               ],
             ),
             const SizedBox(height: 12),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Scale bar'),
+              value: _showScaleBar,
+              onChanged: (value) => update(() => _showScaleBar = value),
+            ),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
               title: const Text('Momentum panning'),

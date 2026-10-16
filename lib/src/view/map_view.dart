@@ -30,6 +30,7 @@ import 'package:fosm/src/view/polygon_layer.dart';
 import 'package:fosm/src/view/shape_geometry.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
+import 'scale_bar.dart';
 
 typedef MapLoadingBuilder = Widget Function(
     BuildContext context, MapLoadState state);
@@ -413,6 +414,15 @@ class MapView extends StatefulWidget {
   final VectorMapStyle? vectorStyle;
 
   final bool showZoomControls;
+
+  /// Show an approximate distance ruler at the camera center's latitude.
+  /// Off by default to preserve existing overlay layouts.
+  final bool showScaleBar;
+  final ScaleBarUnit scaleBarUnit;
+  final Alignment scaleBarAlignment;
+
+  /// Maximum ruler length in logical pixels, excluding background padding.
+  final double scaleBarMaxWidth;
   final ValueChanged<int>? onZoomChanged;
 
   /// Called after the user pans or zooms the map. Lets the host track the
@@ -481,6 +491,10 @@ class MapView extends StatefulWidget {
     this.onPolygonLongPress,
     this.vectorStyle,
     this.showZoomControls = true,
+    this.showScaleBar = false,
+    this.scaleBarUnit = ScaleBarUnit.metric,
+    this.scaleBarAlignment = Alignment.bottomLeft,
+    this.scaleBarMaxWidth = 120,
     this.onZoomChanged,
     this.onCameraChanged,
     this.zoomControlsAlignment = Alignment.bottomRight,
@@ -495,7 +509,8 @@ class MapView extends StatefulWidget {
     this.loadingBuilder,
     this.errorBuilder,
     this.onTileError,
-  }) : assert(maxRenderedCacheBytes >= 0);
+  })  : assert(maxRenderedCacheBytes >= 0),
+        assert(scaleBarMaxWidth > 0 && scaleBarMaxWidth < double.infinity);
 
   @override
   State<MapView> createState() => _MapViewState();
@@ -1740,6 +1755,17 @@ class _MapViewState extends State<MapView>
                     ),
                   ),
                 ],
+
+                if (widget.showScaleBar)
+                  Positioned.fill(
+                    child: MapScaleBar(
+                      latitude: manager.centerLatLng.latitude,
+                      zoom: manager.zoom,
+                      unit: widget.scaleBarUnit,
+                      alignment: widget.scaleBarAlignment,
+                      maxWidth: widget.scaleBarMaxWidth,
+                    ),
+                  ),
 
                 // ── Attribution (required by vector tile providers) ───
                 if (runtime != null &&

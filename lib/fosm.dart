@@ -1,5 +1,6 @@
 export 'src/view/map_view.dart';
 export 'src/view/zoom_controls.dart';
+export 'src/view/scale_bar.dart' show MapScaleBar, ScaleBarUnit;
 export 'src/api/geo_point.dart';
 export 'src/api/lat_lng_bounds.dart';
 export 'src/api/map_controller.dart' show MapController;
