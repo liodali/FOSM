@@ -1121,6 +1121,34 @@ MapView(
 )
 ```
 
+### Distance scale bar
+
+Enable a distance ruler that updates with zoom and the camera center's latitude:
+
+```dart
+MapView(
+  latLng: center,
+  zoom: 7,
+  showScaleBar: true,
+  scaleBarUnit: ScaleBarUnit.metric, // or ScaleBarUnit.imperial
+  scaleBarAlignment: Alignment.bottomLeft,
+  scaleBarMaxWidth: 120, // maximum ruler length in logical pixels
+)
+```
+
+The scale bar is hidden by default. It selects readable 1/2/5 distances in
+meters/kilometers or feet/miles, using approximate ground resolution at the
+camera center. Its line length is independent of display density and tile image
+resolution. It updates with pans, zooms, controller moves, and bounds changes.
+It stays fixed on screen during zoom transitions and reflects the target camera.
+
+The ruler ignores pointers, provides an accessibility label, and adapts to narrow
+viewports. It hides when the viewport is too small to display it. Its default
+bottom gap leaves space for provider attribution; choose a different alignment
+if your app places other controls in that corner. For custom padding, use the
+exported `MapScaleBar` widget in a bounded overlay and supply its `latitude`,
+`zoom`, `unit`, `maxWidth`, `alignment`, and `padding`.
+
 ### Camera gestures
 
 Single-pointer drags coast after release and slow with friction. Momentum obeys

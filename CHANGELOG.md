@@ -1,5 +1,9 @@
 ## Unreleased
 
+* Add optional metric/imperial distance rulers via `MapView.showScaleBar`, `scaleBarUnit`, `scaleBarAlignment`, and `scaleBarMaxWidth`.
+* Export `MapScaleBar` with latitude-aware ground resolution, readable 1/2/5 distances, accessibility labels, responsive layout, and pointer-transparent painting.
+* Enable the scale bar in the example and add a visibility switch.
+
 * Add friction-based fling panning with `MapView.enableFling`, bounds enforcement, immediate touch/command interruption, and cancellation-safe pan animation cleanup.
 * Add cursor-anchored mouse-wheel zoom with `MapView.enableScrollZoom`, accumulated small deltas, zoom limits, and nested scroll handling.
 * Preserve cumulative pinch scale with reversal damping; correct multi-level zoom animation scaling and preserve momentum when parents echo camera callbacks into widget properties.
