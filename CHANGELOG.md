@@ -1,5 +1,14 @@
 ## Unreleased
 
+* Add host-supplied location streams, validated/timestamp-ordered fixes, smooth camera following, gesture pause and recenter, and follow-state callbacks/notifications.
+* Add position, bearing, and geographic accuracy overlays plus a configurable location control; retain last-known fixes on recoverable stream errors.
+* Add a simulated-location example and coverage for stream lifecycle, fractional zoom, camera bounds, gestures, and follow animation retargeting.
+
+* Add opt-in continuous display zoom via `enableFractionalZoom`, controlled `fractionalZoom`, `onFractionalZoomChanged`, and `MapController.setFractionalZoom`/`fractionalZoom`, preserving integer APIs and tile keys.
+* Scale tile geometry, marker/shape/label projection, bounds and the distance ruler consistently; keep widget/stroke/text sizes fixed and retain bounded fallback images while new grids load.
+* Animate fractional wheel/button/controller/fit-bounds zoom, preserve focal points during pinches, and expose precise values on camera notifications and listener hooks.
+* Add a repeatable native profile benchmark, recorded physical-iPhone results, and 10,000-marker/50,000-route-point workload regressions. Enable fractional zoom in the example with a runtime switch.
+
 * Add optional metric/imperial distance rulers via `MapView.showScaleBar`, `scaleBarUnit`, `scaleBarAlignment`, and `scaleBarMaxWidth`.
 * Export `MapScaleBar` with latitude-aware ground resolution, readable 1/2/5 distances, accessibility labels, responsive layout, and pointer-transparent painting.
 * Enable the scale bar in the example and add a visibility switch.

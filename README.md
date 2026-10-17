@@ -1140,7 +1140,8 @@ The scale bar is hidden by default. It selects readable 1/2/5 distances in
 meters/kilometers or feet/miles, using approximate ground resolution at the
 camera center. Its line length is independent of display density and tile image
 resolution. It updates with pans, zooms, controller moves, and bounds changes.
-It stays fixed on screen during zoom transitions and reflects the target camera.
+It stays fixed on screen. It follows the live camera in fractional mode and the
+target camera during legacy integer zoom transitions.
 
 The ruler ignores pointers, provides an accessibility label, and adapts to narrow
 viewports. It hides when the viewport is too small to display it. Its default
@@ -1162,10 +1163,10 @@ Vertical mouse-wheel input zooms around the cursor. Small deltas accumulate
 within a burst (100 scroll pixels per level); direction changes and a 200 ms
 pause reset the remainder. Wheel input uses Flutter's pointer-signal resolver,
 so nested scrollable content can consume it first. At a zoom limit, outward
-scrolling can pass to the parent. Pinch zoom and controller zoom remain integer
-based. Pinches use the original gesture scale (2× means one level), with a
-small reversal tolerance to prevent boundary flicker. Multi-level transitions
-scale through the complete zoom delta.
+scrolling can pass to the parent. With fractional zoom disabled (the default),
+small deltas accumulate into integer steps. Integer pinches use the original
+gesture scale (2× means one level), with a small reversal tolerance to prevent
+boundary flicker. Multi-level transitions scale through the complete zoom delta.
 
 Both options default to true and can be changed at runtime:
 
@@ -1177,6 +1178,50 @@ MapView(
   enableScrollZoom: true,
 )
 ```
+
+### Fractional zoom
+
+Enable a camera that can stop between integer tile levels:
+
+```dart
+MapView(
+  latLng: center,
+  zoom: 7,
+  enableFractionalZoom: true,
+  // Optional controlled value; also enables fractional gestures when supplied.
+  fractionalZoom: 7.35,
+  onFractionalZoomChanged: (zoom) => print('Display zoom: $zoom'),
+  controller: mapController,
+)
+
+mapController.setFractionalZoom(8.5); // animates the displayed camera
+print(mapController.fractionalZoom);
+```
+
+Pinches follow the complete gesture scale continuously (2× is one level),
+including focal-point movement. Every 100 vertical wheel pixels changes zoom by
+one level, including small deltas. Buttons, double taps, controller commands and
+`fitBounds` animate through intermediate camera values. `animateZoom: false`
+makes discrete commands instant while pinches still follow the fingers.
+New touches and camera commands cancel an active animation.
+
+The backing tile zoom is the nearest integer. HTTP/cache/decode keys remain
+integer, while tile extents, projections, hit testing, camera bounds and the
+scale bar use the precise display zoom. Marker widgets, route stroke widths,
+label text and controls keep their screen size. A pinned old grid fills missing
+cells across tile-level changes until replacement tiles arrive, with a bounded
+settle timeout. Vector styles and cluster membership still evaluate at the
+backing integer zoom; their anchors follow the continuous camera.
+
+For compatibility, `MapController.zoom`, `onZoomChanged`, `onCameraChanged`
+and `MapCameraChangeNotification.zoom` retain integer tile zoom values. Use
+`MapController.fractionalZoom`, `onFractionalZoomChanged`, or
+`MapCameraChangeNotification.fractionalZoom` for exact values. The listener mixin
+also exposes `onMapFractionalZoomChanged`. Parents can echo precise values into
+`fractionalZoom` without restarting animations. Calling `setFractionalZoom`
+explicitly enables continuous camera behavior for that map instance. Removing
+the controlled value and disabling the flag restores integer display zoom.
+Fractional display zoom supports levels 0–30 within configured min/max limits.
 
 ### Disable Animations
 
@@ -1199,6 +1244,78 @@ MapView(
 )
 ```
 
+## Location following
+
+Supply fixes from your app's location provider using a host-owned controller:
+
+```dart
+final locations = MapLocationController(follow: true);
+
+MapView(
+  latLng: const LatLng(latitude: 47.4, longitude: 8.5),
+  zoom: 16,
+  locationController: locations,
+);
+
+// Call from your provider's position listener, or pass a Stream<MapLocation>
+// to the controller's `locations:` constructor argument.
+locations.updateLocation(MapLocation(
+  point: const LatLng(latitude: 47.4001, longitude: 8.5002),
+  accuracyMeters: 12,
+  bearing: 90, // Optional degrees clockwise from north, in [0, 360).
+  timestamp: DateTime.now(),
+));
+
+locations.pause(); // Keep updating the dot while browsing the map.
+locations.follow(); // Recenter on the latest fix and resume following.
+locations.stop(); // Turn follow intent off.
+// Dispose in the owning State's dispose(): locations.dispose();
+```
+
+The map draws a fixed-size position dot, optional bearing indicator, and an
+accuracy radius that scales with fractional zoom. New fixes smoothly retarget
+the camera from its current position while preserving zoom and respecting camera
+bounds. Fixes arriving within one frame are coalesced. Accuracy/bearing-only
+updates repaint without restarting the camera animation.
+
+Dragging, pinching, focal wheel/double-tap zoom, `MapController.moveTo`, and
+`fitBounds` pause following. The recenter button resumes it. Plain taps and
+centered zoom buttons preserve follow intent; fixes arriving during a zoom
+animation are applied after it completes. Set
+`locationFollowAnimationDuration: Duration.zero` for instant updates. The map
+also respects the platform's reduced-animation preference.
+
+`MapLocationController.state` reports `off`, `waiting`, `following`, or `paused`.
+Observe `MapView.onLocationFollowChanged`, `MapLocationFollowChangeNotification`,
+or `MapEventListenerMixin.onMapLocationFollowChanged`. `MapController` also
+exposes `followLocation()`, `pauseLocationFollowing()`, `stopLocationFollowing()`,
+and `locationFollowState` when the map has a location controller.
+
+Use `showUserLocation`, `showLocationControl`, and `locationControlAlignment` to
+configure the overlays. For custom positioning, disable the built-in control and
+place `MapLocationControl(controller: locations, padding: ...)` in your stack.
+
+Your app handles GPS permissions, service availability, and provider lifecycle;
+FOSM adds no location plugin or native permission requirements. The controller
+owns subscriptions passed to its constructor or `setStream`, cancels replaced
+streams, and ignores their late events. Timestamped fixes older than the last
+accepted timestamp are ignored. Stream errors retain a gray last-known dot and
+stop camera updates; a valid fix clears the error and resumes existing follow
+intent. Use `clearLocation()` when a fix must no longer appear, such as after
+permission is revoked. MapView detaches its listener on disposal and leaves the
+host's controller alive.
+
+The example's settings include **Simulate location (Zurich)** for trying follow,
+pause, and recenter without a GPS provider.
+
+## Performance validation
+
+The offline profile benchmark covers 10,000 markers, 1,000 densely visible
+markers, a 50,000-point route, 10,000 clustered markers and mixed camera motion.
+See [benchmark instructions and measured reports](docs/performance/README.md).
+Widget workload tests guard viewport culling and long-route selection; profile
+runs on physical hardware provide UI/raster timing and RSS observations.
+
 ## 🧪 Testing
 
 ```bash
@@ -1212,7 +1329,7 @@ flutter test --coverage
 flutter test test/vector/vector_tile_test.dart
 ```
 
-**Test Coverage:** 86 tests passing
+**Regression coverage:**
 - Vector tile parsing
 - Style expression evaluation
 - Tile manager logic
