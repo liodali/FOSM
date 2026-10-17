@@ -43,6 +43,46 @@ Future<void> _ready(WidgetTester tester) async {
 }
 
 void main() {
+  for (final blocked in [false, true]) {
+    testWidgets(
+        'fractional zoom releases pinned fallback on ${blocked ? 'movement timeout' : 'replacement readiness'}',
+        (tester) async {
+      final png = await _png(tester);
+      final controller = MapController();
+      await tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+              body: MapView(
+        latLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        enableFractionalZoom: true,
+        controller: controller,
+        tileFetcher: (z, x, y) => blocked && z != 5
+            ? Future<Uint8List>.delayed(const Duration(seconds: 10), () => png)
+            : Future.value(png),
+        maxRenderedCacheBytes: 0,
+      ))));
+      await _ready(tester);
+      final oldImages =
+          _grids(tester).single.tiles.map((tile) => tile.sourceTile!).toList();
+      controller.setFractionalZoom(6.25, animate: false);
+      await tester.pump();
+      expect(oldImages.every((image) => !image.debugDisposed), isTrue);
+      if (blocked) {
+        controller.moveTo(const LatLng(latitude: 0.1, longitude: 0),
+            animate: false);
+        await tester.pump(const Duration(milliseconds: 650));
+      } else {
+        await _ready(tester);
+        await tester.pump();
+      }
+      expect(oldImages.every((image) => image.debugDisposed), isTrue);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      // Let only the caller-owned fake fetch settle; MapView has already
+      // cancelled its own deadlines and released every image.
+      if (blocked) await tester.pump(const Duration(seconds: 10));
+    });
+  }
   for (final interrupt in [false, true]) {
     testWidgets(
         'zero-budget zoom releases snapshot on '
