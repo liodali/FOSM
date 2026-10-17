@@ -70,6 +70,7 @@ class LabelOverlay {
     ui.Canvas canvas,
     ui.Size size, {
     required int zoom,
+    double tileScale = 1,
     required double leftColumnTilesCanvasX,
     required double topRowTilesCanvasY,
     required int leftColumnTilesLngIndex,
@@ -93,14 +94,14 @@ class LabelOverlay {
       if (parsed == null) continue;
 
       final originX = leftColumnTilesCanvasX +
-          (tile.lngIndex - leftColumnTilesLngIndex) * 256.0;
-      final originY =
-          topRowTilesCanvasY + (tile.latIndex - topRowTilesLatIndex) * 256.0;
+          (tile.lngIndex - leftColumnTilesLngIndex) * 256.0 * tileScale;
+      final originY = topRowTilesCanvasY +
+          (tile.latIndex - topRowTilesLatIndex) * 256.0 * tileScale;
       // Skip tiles fully off-canvas (padding ring included).
-      if (originX <= -256 ||
-          originY <= -256 ||
-          originX >= size.width + 256 ||
-          originY >= size.height + 256) {
+      if (originX <= -256 * tileScale ||
+          originY <= -256 * tileScale ||
+          originX >= size.width + 256 * tileScale ||
+          originY >= size.height + 256 * tileScale) {
         continue;
       }
 
@@ -110,8 +111,8 @@ class LabelOverlay {
         if (!seenSymbols.add(label.dedupeKey)) continue;
 
         final anchor = ui.Offset(
-          originX + label.localX,
-          originY + label.localY,
+          originX + label.localX * tileScale,
+          originY + label.localY * tileScale,
         );
         // Cull before paying for text layout.
         if (anchor.dx < -80 ||

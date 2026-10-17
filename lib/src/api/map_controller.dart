@@ -5,6 +5,7 @@ import 'geo_point.dart';
 import 'lat_lng_bounds.dart';
 import 'marker.dart';
 import 'marker_manager.dart';
+import 'map_location_controller.dart';
 
 /// Delegate implemented by [MapView] state.
 ///
@@ -36,6 +37,17 @@ abstract class MapControllerDelegate {
 
   /// The marker manager attached to the map, if any.
   MarkerManager? get markerManager;
+}
+
+/// Optional continuous-zoom capability implemented by MapView.
+abstract class FractionalMapControllerDelegate {
+  double get fractionalZoom;
+  void setFractionalZoom(double zoom, {bool animate = true});
+}
+
+/// Optional location-following capability; existing delegates stay compatible.
+abstract class LocationMapControllerDelegate {
+  MapLocationController? get locationController;
 }
 
 /// Programmatic control surface for a [MapView].
@@ -74,6 +86,43 @@ class MapController extends ChangeNotifier {
 
   /// The current zoom level, or `null` when not attached.
   int? get zoom => _delegate?.zoom;
+
+  /// Display zoom, including its fractional component; null when detached.
+  double? get fractionalZoom {
+    final delegate = _delegate;
+    return delegate is FractionalMapControllerDelegate
+        ? (delegate as FractionalMapControllerDelegate).fractionalZoom
+        : delegate?.zoom.toDouble();
+  }
+
+  /// Sets a continuous zoom. MapView clamps to its min/max zoom limits.
+  /// Legacy delegates receive the nearest integer zoom instead.
+  void setFractionalZoom(double zoom, {bool animate = true}) {
+    if (!zoom.isFinite) {
+      throw ArgumentError.value(zoom, 'zoom', 'must be finite');
+    }
+    final delegate = _delegate;
+    if (delegate is FractionalMapControllerDelegate) {
+      (delegate as FractionalMapControllerDelegate)
+          .setFractionalZoom(zoom, animate: animate);
+    } else {
+      delegate?.setZoom(zoom.round(), animate: animate);
+    }
+  }
+
+  MapLocationController? get _locations {
+    final delegate = _delegate;
+    return delegate is LocationMapControllerDelegate
+        ? (delegate as LocationMapControllerDelegate).locationController
+        : null;
+  }
+
+  /// Follow/recenter on the latest supplied location; waits if no fix exists.
+  void followLocation() => _locations?.follow();
+
+  void pauseLocationFollowing() => _locations?.pause();
+  void stopLocationFollowing() => _locations?.stop();
+  MapLocationFollowState? get locationFollowState => _locations?.state;
 
   /// Attaches the controller to a map state.
   ///
@@ -134,10 +183,10 @@ class MapController extends ChangeNotifier {
   /// Frames [bounds] in the viewport (minus [padding]).
   ///
   /// Unlike [MapView.cameraBounds], this only navigates the camera —
-  /// afterwards the user can pan away freely. The resulting zoom is an
-  /// integer clamped to the map's min/max zoom, so the box is fully
-  /// visible subject to the configured minZoom: if the bounds cannot fit
-  /// at minZoom, the view centers on them but their edges may be clipped.
+  /// afterwards the user can pan away freely. Continuous cameras choose
+  /// a fractional display zoom; legacy cameras choose an integer zoom.
+  /// Both respect min/max zoom: if the bounds cannot fit at minZoom,
+  /// the view centers on them but their edges may be clipped.
   /// A no-op when the controller is detached.
   void fitBounds(
     LatLngBounds bounds, {

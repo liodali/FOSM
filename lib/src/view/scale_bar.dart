@@ -23,7 +23,7 @@ class MapScaleBar extends StatelessWidget {
   }) : assert(maxWidth > 0 && maxWidth < double.infinity);
 
   final double latitude;
-  final int zoom;
+  final num zoom;
   final ScaleBarUnit unit;
 
   /// Maximum ruler length, excluding its background's 12 pixels of padding.

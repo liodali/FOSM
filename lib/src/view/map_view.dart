@@ -31,6 +31,9 @@ import 'package:fosm/src/view/shape_geometry.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
 import 'scale_bar.dart';
+import 'location_control.dart';
+import 'user_location_layer.dart';
+import '../api/map_location_controller.dart';
 
 typedef MapLoadingBuilder = Widget Function(
     BuildContext context, MapLoadState state);
@@ -49,6 +52,8 @@ class _GridSnapshot {
   final List<Tile> tiles;
   final int revision;
   final VoidCallback releaseImages;
+  final double cameraZoom;
+  final double tileScale;
 
   /// Zoom and camera center of the snapshotted grid.
   final int zoom;
@@ -74,6 +79,8 @@ class _GridSnapshot {
     required this.tiles,
     required this.revision,
     required this.releaseImages,
+    required this.cameraZoom,
+    required this.tileScale,
     required this.zoom,
     required this.sourceCenterTileLng,
     required this.sourceCenterTileLat,
@@ -93,6 +100,8 @@ class _GridSnapshot {
         tiles: List<Tile>.from(m.renderTiles),
         revision: m.revision,
         releaseImages: m.retainSnapshot(m.renderTiles),
+        cameraZoom: m.cameraZoom,
+        tileScale: m.zoomScale,
         zoom: m.zoom,
         sourceCenterTileLng: m.centerTileLng,
         sourceCenterTileLat: m.centerTileLat,
@@ -158,6 +167,7 @@ class _OldGridOverlay extends StatelessWidget {
         topRowTilesCanvasY: snapshot.topRowTilesCanvasY,
         tiles: snapshot.tiles,
         revision: snapshot.revision,
+        tileScale: snapshot.tileScale,
       ),
     );
 
@@ -232,6 +242,51 @@ class _OldGridOverlay extends StatelessWidget {
   }
 }
 
+/// Last loaded grid behind missing cells during continuous zoom. No blur or
+/// extra image decode: the old images remain pinned until replacement/timeout.
+class _FractionalFallbackPainter extends CustomPainter {
+  _FractionalFallbackPainter(this.snapshot, this.manager);
+  final _GridSnapshot snapshot;
+  final TileManager manager;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final scale =
+        math.pow(2, manager.cameraZoom - snapshot.cameraZoom).toDouble();
+    final ratio = math.pow(2, manager.zoom - snapshot.zoom).toDouble();
+    final dx = manager.centerCanvasX -
+        snapshot.sourceCenterCanvasX * scale +
+        (snapshot.sourceCenterTileLng * ratio - manager.centerTileLng) *
+            manager.renderedTileWidth;
+    final dy = manager.centerCanvasY -
+        snapshot.sourceCenterCanvasY * scale +
+        (snapshot.sourceCenterTileLat * ratio - manager.centerTileLat) *
+            manager.renderedTileHeight;
+    canvas.save();
+    canvas.clipRect(Offset.zero & size);
+    canvas.translate(dx, dy);
+    canvas.scale(scale);
+    RenderCanvasOSM(
+      horizontalTileCount: snapshot.horizontalTileCount,
+      verticalTileCount: snapshot.verticalTileCount,
+      leftColumnTilesLngIndex: snapshot.leftColumnTilesLngIndex,
+      topRowTilesLatIndex: snapshot.topRowTilesLatIndex,
+      leftColumnTilesCanvasX: snapshot.leftColumnTilesCanvasX,
+      topRowTilesCanvasY: snapshot.topRowTilesCanvasY,
+      tiles: snapshot.tiles,
+      revision: snapshot.revision,
+      tileScale: snapshot.tileScale,
+    ).paint(
+        canvas,
+        Size(snapshot.sourceCenterCanvasX * 2,
+            snapshot.sourceCenterCanvasY * 2));
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_FractionalFallbackPainter oldDelegate) => true;
+}
+
 /// How the old tile grid animates out during a zoom transition
 /// ([MapView.zoomAnimationStyle]).
 ///
@@ -268,8 +323,9 @@ enum ZoomAnimationStyle {
 ///   [onScaleStart], then applies the pixel delta since the last zoom
 ///   step on every update. A single-pointer release coasts with friction
 ///   when [enableFling] is enabled. Touching the map stops the motion.
-/// - **Pinch to zoom**: two-finger scale gesture changes the zoom level
-///   in integer steps as the accumulated scale crosses each rounding
+/// - **Pinch to zoom**: with [enableFractionalZoom], display zoom follows
+///   the fingers continuously. Otherwise, zoom changes in integer steps
+///   as the accumulated scale crosses each rounding
 ///   boundary. The geographic point under the current focal point stays
 ///   stationary, and each step plays a zoom animation when
 ///   [animateZoom] is enabled.
@@ -367,6 +423,16 @@ class MapView extends StatefulWidget {
 
   final LatLng latLng;
   final int zoom;
+
+  /// Enables continuous pinch, wheel and animated button/controller zoom.
+  /// False by default preserves integer gesture behavior for existing hosts.
+  final bool enableFractionalZoom;
+
+  /// Optional controlled display zoom. Supplying it also enables continuous
+  /// gestures; [zoom] remains the integer-compatible initial/fallback value.
+  final double? fractionalZoom;
+  final ValueChanged<double>? onFractionalZoomChanged;
+
   final int minZoom;
   final int maxZoom;
 
@@ -380,6 +446,16 @@ class MapView extends StatefulWidget {
 
   /// Controller for programmatic camera and marker control.
   final MapController? controller;
+
+  /// Host-owned location source and follow intent. MapView never disposes it.
+  final MapLocationController? locationController;
+  final bool showUserLocation;
+  final bool showLocationControl;
+  final Alignment locationControlAlignment;
+  final ValueChanged<MapLocationFollowState>? onLocationFollowChanged;
+
+  /// Retargets from the current camera on new fixes. Zero applies instantly.
+  final Duration locationFollowAnimationDuration;
 
   /// Markers rendered above the tile grid (and below the vector label
   /// overlay). Mutating the manager at runtime updates the map — pass it
@@ -474,11 +550,20 @@ class MapView extends StatefulWidget {
     super.key,
     required this.latLng,
     required this.zoom,
+    this.enableFractionalZoom = false,
+    this.fractionalZoom,
+    this.onFractionalZoomChanged,
     this.minZoom = 1,
     this.maxZoom = 19,
     this.cameraBounds,
     this.tileFetcher,
     this.controller,
+    this.locationController,
+    this.showUserLocation = true,
+    this.showLocationControl = true,
+    this.locationControlAlignment = Alignment.bottomRight,
+    this.onLocationFollowChanged,
+    this.locationFollowAnimationDuration = const Duration(milliseconds: 300),
     this.markers,
     this.markerClusterOptions,
     this.polylines = const [],
@@ -510,7 +595,11 @@ class MapView extends StatefulWidget {
     this.errorBuilder,
     this.onTileError,
   })  : assert(maxRenderedCacheBytes >= 0),
-        assert(scaleBarMaxWidth > 0 && scaleBarMaxWidth < double.infinity);
+        assert(scaleBarMaxWidth > 0 && scaleBarMaxWidth < double.infinity),
+        assert(fractionalZoom == null ||
+            (fractionalZoom >= 0 && fractionalZoom <= 30)),
+        assert(!(enableFractionalZoom || fractionalZoom != null) ||
+            (minZoom >= 0 && maxZoom <= 30));
 
   @override
   State<MapView> createState() => _MapViewState();
@@ -518,9 +607,113 @@ class MapView extends StatefulWidget {
 
 class _MapViewState extends State<MapView>
     with TickerProviderStateMixin
-    implements MapControllerDelegate {
+    implements
+        MapControllerDelegate,
+        FractionalMapControllerDelegate,
+        LocationMapControllerDelegate {
+  @override
+  MapLocationController? get locationController => widget.locationController;
+
+  bool _followQueued = false;
+  bool _locationOwnsPan = false;
+  int? _lastFollowRevision;
+  MapLocationFollowState? _lastFollowState;
+
+  void _bindLocationController(MapLocationController? previous) {
+    previous?.removeListener(_onLocationChanged);
+    if (_locationOwnsPan) _stopPanAnimation();
+    _lastFollowRevision = null;
+    _lastFollowState = widget.locationController?.state;
+    widget.locationController?.addListener(_onLocationChanged);
+    _scheduleLocationFollow();
+  }
+
+  void _onLocationChanged() {
+    if (!mounted) return;
+    final locations = widget.locationController;
+    if (_locationOwnsPan &&
+        (locations == null ||
+            !locations.isFollowing ||
+            locations.location == null ||
+            locations.error != null)) {
+      _stopPanAnimation();
+    }
+    final state = locations?.state;
+    if (state != null && state != _lastFollowState) {
+      _lastFollowState = state;
+      widget.onLocationFollowChanged?.call(state);
+      MapLocationFollowChangeNotification(state).dispatch(context);
+    }
+    setState(() {});
+    _scheduleLocationFollow();
+  }
+
+  void _scheduleLocationFollow({bool force = false}) {
+    if (force) _lastFollowRevision = null;
+    final locations = widget.locationController;
+    if (!mounted ||
+        locations == null ||
+        !locations.isFollowing ||
+        locations.location == null ||
+        locations.error != null ||
+        _lastFollowRevision == locations.followRevision ||
+        _followQueued) {
+      return;
+    }
+    _followQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _followQueued = false;
+      if (!mounted) return;
+      final current = widget.locationController;
+      if (current == null ||
+          !current.isFollowing ||
+          current.location == null ||
+          current.error != null ||
+          _tileManager == null ||
+          _interacting ||
+          _pointers.isNotEmpty ||
+          _isAnimating ||
+          (_fractionalController?.isAnimating ?? false) ||
+          _lastFollowRevision == current.followRevision) {
+        return;
+      }
+      _lastFollowRevision = current.followRevision;
+      _moveTo(current.location!.point,
+          animate: widget.locationFollowAnimationDuration > Duration.zero &&
+              !MediaQuery.disableAnimationsOf(context),
+          duration: widget.locationFollowAnimationDuration,
+          curve: Curves.easeOut,
+          preserveLocationFollow: true);
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  void _pauseLocationFollowing() => widget.locationController?.pause();
+
   TileManager? _tileManager;
   int _currentZoom = 0;
+  bool _explicitFractional = false;
+  bool get _usesFractionalZoom =>
+      _explicitFractional ||
+      widget.enableFractionalZoom ||
+      widget.fractionalZoom != null;
+  AnimationController? _fractionalController;
+  _GridSnapshot? _fractionalSnapshot;
+  Timer? _fractionalSnapshotTimer;
+  double? _scaleStartCameraZoom;
+  Offset? _lastFractionalFocal;
+
+  @override
+  double get fractionalZoom =>
+      _tileManager?.cameraZoom ??
+      widget.fractionalZoom ??
+      widget.zoom.toDouble();
+
+  @override
+  void setFractionalZoom(double zoom, {bool animate = true}) {
+    _explicitFractional = true;
+    _setContinuousZoom(zoom, animate: animate);
+  }
 
   // ── Vector style session ────────────────────────────────────────────
   VectorTileRuntime? _vectorRuntime;
@@ -626,7 +819,11 @@ class _MapViewState extends State<MapView>
   void initState() {
     super.initState();
     validateRequestTimeout(widget.requestTimeout);
-    _currentZoom = widget.zoom;
+    if (widget.locationFollowAnimationDuration.isNegative) {
+      throw ArgumentError.value(widget.locationFollowAnimationDuration,
+          'locationFollowAnimationDuration', 'must not be negative');
+    }
+    _currentZoom = (widget.fractionalZoom ?? widget.zoom).round();
     if (widget.vectorStyle != null) {
       _loadVectorStyle();
     }
@@ -638,6 +835,7 @@ class _MapViewState extends State<MapView>
     _animController.addListener(_onAnimTick);
     _animController.addStatusListener(_onAnimStatus);
 
+    _bindLocationController(null);
     widget.controller?.attach(this);
   }
 
@@ -678,6 +876,17 @@ class _MapViewState extends State<MapView>
   void didUpdateWidget(MapView oldWidget) {
     super.didUpdateWidget(oldWidget);
     validateRequestTimeout(widget.requestTimeout);
+    if (widget.locationFollowAnimationDuration.isNegative) {
+      throw ArgumentError.value(widget.locationFollowAnimationDuration,
+          'locationFollowAnimationDuration', 'must not be negative');
+    }
+    if (widget.locationController != oldWidget.locationController) {
+      _bindLocationController(oldWidget.locationController);
+    }
+    if (widget.locationFollowAnimationDuration !=
+        oldWidget.locationFollowAnimationDuration) {
+      _scheduleLocationFollow(force: true);
+    }
     _tileManager?.requestTimeout = widget.requestTimeout;
     _vectorRuntime?.requestTimeout = widget.requestTimeout;
     if (widget.controller != oldWidget.controller) {
@@ -689,6 +898,8 @@ class _MapViewState extends State<MapView>
     }
     if (widget.vectorStyle != oldWidget.vectorStyle) {
       _styleCancel?.cancel('Style changed');
+      _stopFractionalAnimation();
+      _clearFractionalSnapshot();
       // Style switch: tear everything down and reload.
       _animController.stop();
       _stopPanAnimation();
@@ -721,15 +932,30 @@ class _MapViewState extends State<MapView>
     // acknowledge our current camera rather than interrupting its motion.
     final externalCenter = widget.latLng != oldWidget.latLng &&
         widget.latLng != _tileManager?.centerLatLng;
+    final externalFractional =
+        widget.fractionalZoom != oldWidget.fractionalZoom &&
+            widget.fractionalZoom != _tileManager?.cameraZoom;
     final externalZoom =
         widget.zoom != oldWidget.zoom && widget.zoom != _currentZoom;
     if ((!widget.enableFling && _flinging) ||
         widget.cameraBounds != oldWidget.cameraBounds ||
         externalCenter ||
         externalZoom ||
+        externalFractional ||
         widget.minZoom != oldWidget.minZoom ||
         widget.maxZoom != oldWidget.maxZoom) {
       _stopPanAnimation();
+      _stopFractionalAnimation();
+      _clearFractionalSnapshot();
+    }
+    if (_usesFractionalZoom &&
+        _tileManager != null &&
+        (widget.minZoom != oldWidget.minZoom ||
+            widget.maxZoom != oldWidget.maxZoom)) {
+      final manager = _tileManager!;
+      manager.setCameraZoom(manager.cameraZoom
+          .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()));
+      _currentZoom = manager.zoom;
     }
     if (!widget.enableScrollZoom) _scrollPixels = 0;
     if (widget.cameraBounds != oldWidget.cameraBounds) {
@@ -740,15 +966,40 @@ class _MapViewState extends State<MapView>
       _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
     }
-    if (externalZoom) {
-      _tileManager?.setZoom(widget.zoom);
+    if (externalFractional && widget.fractionalZoom != null) {
+      _tileManager?.setCameraZoom(widget.fractionalZoom!
+          .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()));
+      _currentZoom = _tileManager?.zoom ?? _currentZoom;
+    } else if (externalZoom) {
+      if (_usesFractionalZoom) {
+        _tileManager?.setCameraZoom(widget.zoom.toDouble());
+      } else {
+        _tileManager?.setZoom(widget.zoom);
+      }
       _currentZoom = widget.zoom;
       setState(() {});
+    }
+    if (externalCenter ||
+        externalZoom ||
+        externalFractional ||
+        widget.cameraBounds != oldWidget.cameraBounds) {
+      _scheduleLocationFollow(force: true);
+    }
+    if ((oldWidget.enableFractionalZoom || oldWidget.fractionalZoom != null) &&
+        !widget.enableFractionalZoom &&
+        widget.fractionalZoom == null) {
+      _explicitFractional = false;
+      _stopFractionalAnimation();
+      _clearFractionalSnapshot();
+      _tileManager?.setZoom(_tileManager!.zoom);
     }
   }
 
   @override
   void dispose() {
+    widget.locationController?.removeListener(_onLocationChanged);
+    _stopFractionalAnimation();
+    _clearFractionalSnapshot();
     _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
     _animController.removeListener(_onAnimTick);
@@ -763,6 +1014,12 @@ class _MapViewState extends State<MapView>
   }
 
   void _notify() {
+    if (_fractionalSnapshot != null &&
+        !_interacting &&
+        !(_fractionalController?.isAnimating ?? false) &&
+        _newTilesReady()) {
+      _clearFractionalSnapshot();
+    }
     // If we're in the wait phase and new tiles are now ready, kick off
     // the scale animation before setState to avoid a wasted frame.
     if (_animWaitingTiles && !_interacting && _newTilesReady()) {
@@ -789,6 +1046,8 @@ class _MapViewState extends State<MapView>
       height: size.height,
       centerLatLng: widget.latLng,
       zoom: widget.zoom,
+      cameraZoom: widget.fractionalZoom
+          ?.clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()),
       fetcher: runtime?.fetcher ?? widget.tileFetcher,
       decoder: runtime?.decoder,
       urlBuilder: runtime?.urlBuilder,
@@ -812,6 +1071,8 @@ class _MapViewState extends State<MapView>
     runtime?.isTileRelevant = manager.isTileRelevant;
     runtime?.tilePriority = manager.tileDecodePriority;
     _tileManager = manager;
+    _currentZoom = manager.zoom;
+    _scheduleLocationFollow(force: true);
 
     if (!_readyNotificationDispatched) {
       _readyNotificationDispatched = true;
@@ -828,19 +1089,172 @@ class _MapViewState extends State<MapView>
     return manager;
   }
 
+  double? _fractionalTarget;
+
+  void _stopFractionalAnimation() {
+    final controller = _fractionalController;
+    _fractionalController = null;
+    _fractionalTarget = null;
+    controller?.dispose();
+  }
+
+  void _clearFractionalSnapshot() {
+    _fractionalSnapshotTimer?.cancel();
+    _fractionalSnapshotTimer = null;
+    _fractionalSnapshot?.releaseImages();
+    _fractionalSnapshot = null;
+  }
+
+  void _settleFractionalSnapshot() {
+    if (_fractionalSnapshot == null ||
+        _interacting ||
+        (_fractionalController?.isAnimating ?? false)) {
+      return;
+    }
+    if (_newTilesReady()) {
+      _clearFractionalSnapshot();
+      if (mounted) setState(() {});
+    } else {
+      _fractionalSnapshotTimer?.cancel();
+      _fractionalSnapshotTimer = Timer(_animWaitTimeout, () {
+        if (!mounted || _interacting) return;
+        _clearFractionalSnapshot();
+        setState(() {});
+      });
+    }
+  }
+
+  void _applyContinuousZoom(TileManager manager, double value, Offset focal,
+      {bool notify = true}) {
+    if (value == manager.cameraZoom) return;
+    final oldZoom = manager.zoom;
+    if (value.round() != oldZoom &&
+        _fractionalSnapshot == null &&
+        manager.renderTiles.any((tile) => tile.sourceTile != null)) {
+      manager.calculate();
+      _fractionalSnapshot = _GridSnapshot.from(manager);
+    }
+    manager.setCameraZoom(value, focalPoint: focal);
+    _currentZoom = manager.zoom;
+    if (oldZoom != manager.zoom) {
+      widget.onZoomChanged?.call(manager.zoom);
+      MapZoomChangeNotification(manager.zoom).dispatch(context);
+    }
+    widget.onFractionalZoomChanged?.call(value);
+    if (notify) {
+      _notifyCamera(manager);
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+              fractionalZoom: manager.cameraZoom)
+          .dispatch(context);
+      setState(() {});
+    }
+  }
+
+  void _setContinuousZoom(double value,
+      {Offset? focal, LatLng? centerTarget, required bool animate}) {
+    if (!value.isFinite) {
+      throw ArgumentError.value(value, 'zoom', 'must be finite');
+    }
+    final manager = _tileManager;
+    if (manager == null) return;
+    final target = value.clamp(math.max(0, widget.minZoom).toDouble(),
+        math.min(30, widget.maxZoom).toDouble());
+    _stopPanAnimation();
+    _stopFractionalAnimation();
+    _animController.stop();
+    _animWaitTimer?.cancel();
+    _clearZoomSnapshot();
+    _animWaitingTiles = false;
+    _pinchTransitionActive = false;
+    _fractionalSnapshotTimer?.cancel();
+    final origin =
+        focal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
+    if (!animate ||
+        widget.zoomAnimationDuration == Duration.zero ||
+        (target == manager.cameraZoom && centerTarget == null)) {
+      _applyContinuousZoom(manager, target, origin,
+          notify: centerTarget == null);
+      if (centerTarget != null) {
+        manager.setCenterTile(latLng: centerTarget);
+        _notifyCamera(manager);
+        MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+                fractionalZoom: manager.cameraZoom)
+            .dispatch(context);
+        setState(() {});
+      }
+      _settleFractionalSnapshot();
+      _scheduleLocationFollow(force: true);
+      return;
+    }
+    final start = manager.cameraZoom;
+    final centerStart = Offset(lon2TileX(manager.centerLatLng.longitude, 0),
+        lat2TileY(manager.centerLatLng.latitude, 0));
+    final centerEnd = centerTarget == null
+        ? null
+        : Offset(lon2TileX(centerTarget.longitude, 0),
+            lat2TileY(centerTarget.latitude, 0));
+    final controller = AnimationController(
+        vsync: this, duration: widget.zoomAnimationDuration);
+    _fractionalController = controller;
+    _fractionalTarget = target;
+    controller.addListener(() {
+      if (!mounted) return;
+      final value = start +
+          (target - start) * Curves.easeInOut.transform(controller.value);
+      _applyContinuousZoom(manager, value, origin,
+          notify: centerTarget == null);
+      if (centerEnd != null) {
+        final t = Curves.easeInOut.transform(controller.value);
+        final center = Offset.lerp(centerStart, centerEnd, t)!;
+        final factor = math.pow(2, manager.zoom).toDouble();
+        manager.setCenterFromTileCoords(center.dx * factor, center.dy * factor);
+        _notifyCamera(manager);
+        MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+                fractionalZoom: manager.cameraZoom)
+            .dispatch(context);
+        setState(() {});
+      }
+    });
+    _completeContinuousZoom(controller, controller.forward());
+  }
+
+  Future<void> _completeContinuousZoom(
+      AnimationController controller, TickerFuture motion) async {
+    try {
+      await motion.orCancel;
+    } on TickerCanceled {
+      return;
+    }
+    if (!mounted || _fractionalController != controller) return;
+    _stopFractionalAnimation();
+    _settleFractionalSnapshot();
+    _scheduleLocationFollow(force: true);
+  }
+
   // ── Zoom trigger methods ────────────────────────────────────────────
 
   void _zoomIn() => _zoomBy(1, focalLocal: null);
   void _zoomOut() => _zoomBy(-1, focalLocal: null);
-  void _zoomInAt(Offset localPosition) => _zoomBy(1, focalLocal: localPosition);
+  void _zoomInAt(Offset localPosition) {
+    _pauseLocationFollowing();
+    _zoomBy(1, focalLocal: localPosition);
+  }
 
   void _zoomBy(int delta, {Offset? focalLocal, bool? animate}) {
+    if (_usesFractionalZoom) {
+      _setContinuousZoom(fractionalZoom + delta,
+          focal: focalLocal, animate: animate ?? widget.animateZoom);
+      return;
+    }
     final manager = _tileManager;
     if (manager == null) return;
     _stopPanAnimation();
     final newZoom =
         (manager.zoom + delta).clamp(widget.minZoom, widget.maxZoom);
-    if (newZoom == manager.zoom) return;
+    if (newZoom == manager.zoom) {
+      _scheduleLocationFollow(force: true);
+      return;
+    }
 
     if (!(animate ?? widget.animateZoom)) {
       _applyZoomInstantly(manager, newZoom, focalLocal);
@@ -851,11 +1265,19 @@ class _MapViewState extends State<MapView>
   }
 
   void _setZoom(int zoom, {bool? animate}) {
+    if (_usesFractionalZoom) {
+      _setContinuousZoom(zoom.toDouble(),
+          animate: animate ?? widget.animateZoom);
+      return;
+    }
     final manager = _tileManager;
     if (manager == null) return;
     _stopPanAnimation();
     final newZoom = zoom.clamp(widget.minZoom, widget.maxZoom);
-    if (newZoom == manager.zoom) return;
+    if (newZoom == manager.zoom) {
+      _scheduleLocationFollow(force: true);
+      return;
+    }
 
     if (!(animate ?? widget.animateZoom)) {
       _applyZoomInstantly(manager, newZoom, null);
@@ -882,25 +1304,35 @@ class _MapViewState extends State<MapView>
     widget.onZoomChanged?.call(newZoom);
     MapZoomChangeNotification(newZoom).dispatch(context);
     _notifyCamera(manager);
-    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+            fractionalZoom: manager.cameraZoom)
         .dispatch(context);
     setState(() {});
+    _scheduleLocationFollow(force: true);
   }
 
-  void _moveTo(LatLng latLng, {bool? animate}) {
+  void _moveTo(LatLng latLng,
+      {bool? animate,
+      Duration? duration,
+      Curve curve = Curves.easeInOut,
+      bool preserveLocationFollow = false}) {
+    if (!preserveLocationFollow) _pauseLocationFollowing();
     final manager = _tileManager;
     if (manager == null) return;
 
     _stopPanAnimation();
+    _stopFractionalAnimation();
+    _settleFractionalSnapshot();
     final target = LatLng(
       latitude: clampLatitude(latLng.latitude),
       longitude: clampLongitude(latLng.longitude),
     );
 
-    if (!(animate ?? widget.animateZoom)) {
+    if (!(animate ?? widget.animateZoom) || duration == Duration.zero) {
       manager.setCenterTile(latLng: target);
       _notifyCamera(manager);
-      MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+              fractionalZoom: manager.cameraZoom)
           .dispatch(context);
       if (mounted) setState(() {});
       return;
@@ -912,15 +1344,16 @@ class _MapViewState extends State<MapView>
     final endLat = lat2TileY(target.latitude, manager.zoom);
 
     final controller = AnimationController(
-      duration: widget.zoomAnimationDuration,
+      duration: duration ?? widget.zoomAnimationDuration,
       vsync: this,
     );
     _panController = controller;
+    _locationOwnsPan = preserveLocationFollow;
 
     final animation = Tween<Offset>(
       begin: Offset(startLng, startLat),
       end: Offset(endLng, endLat),
-    ).chain(CurveTween(curve: Curves.easeInOut)).animate(controller);
+    ).chain(CurveTween(curve: curve)).animate(controller);
 
     controller.addListener(() {
       if (!mounted) return;
@@ -941,13 +1374,15 @@ class _MapViewState extends State<MapView>
     }
     if (!mounted || _panController != controller) return;
     _stopPanAnimation();
-    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+            fractionalZoom: manager.cameraZoom)
         .dispatch(context);
   }
 
   void _stopPanAnimation() {
     final controller = _panController;
     _panController = null;
+    _locationOwnsPan = false;
     _flinging = false;
     controller?.dispose();
   }
@@ -964,14 +1399,16 @@ class _MapViewState extends State<MapView>
     controller.addListener(() {
       if (!mounted) return;
       final previous = Offset(manager.centerTileLng, manager.centerTileLat);
-      final target = start - direction * (controller.value / tileWidth);
+      final target =
+          start - direction * (controller.value / manager.renderedTileWidth);
       manager.setCenterFromTileCoords(target.dx, target.dy);
       final current = Offset(manager.centerTileLng, manager.centerTileLat);
       // Each axis clamps independently, allowing diagonal motion along an
       // edge. Stop the ticker once both axes are blocked by bounds.
       if (controller.value > 0 && (current - previous).distance < 1e-10) {
         _stopPanAnimation();
-        MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+        MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+                fractionalZoom: manager.cameraZoom)
             .dispatch(context);
         return;
       }
@@ -988,7 +1425,12 @@ class _MapViewState extends State<MapView>
   }
 
   void _onPointerDown(PointerDownEvent event) {
+    if (widget.locationController?.isFollowing ?? false) {
+      _lastFollowRevision = null;
+    }
     _stopPanAnimation();
+    _stopFractionalAnimation();
+    _settleFractionalSnapshot();
     _scrollPixels = 0;
     if (_pointers.isEmpty) {
       _gestureHadMultiplePointers = false;
@@ -996,6 +1438,11 @@ class _MapViewState extends State<MapView>
     }
     _pointers.add(event.pointer);
     if (_pointers.length > 1) _gestureHadMultiplePointers = true;
+  }
+
+  void _onPointerUp(PointerEvent event) {
+    _pointers.remove(event.pointer);
+    _scheduleLocationFollow();
   }
 
   void _onPointerSignal(PointerSignalEvent event) {
@@ -1010,13 +1457,22 @@ class _MapViewState extends State<MapView>
       return;
     }
     final dy = event.scrollDelta.dy;
-    if ((dy < 0 && manager.zoom >= widget.maxZoom) ||
-        (dy > 0 && manager.zoom <= widget.minZoom)) {
+    if ((dy < 0 && manager.cameraZoom >= widget.maxZoom) ||
+        (dy > 0 && manager.cameraZoom <= widget.minZoom)) {
       _scrollPixels = 0;
       return;
     }
     GestureBinding.instance.pointerSignalResolver.register(event, (_) {
       _stopPanAnimation();
+      if (_usesFractionalZoom) {
+        _pauseLocationFollowing();
+        // Accumulate against the active target so quick wheel events do not
+        // lose distance while the preceding transition is still animating.
+        final target = _fractionalTarget ?? manager.cameraZoom;
+        _setContinuousZoom(target - dy / 100,
+            focal: event.localPosition, animate: widget.animateZoom);
+        return;
+      }
       if (_lastScrollTime == null ||
           event.timeStamp - _lastScrollTime! >
               const Duration(milliseconds: 200) ||
@@ -1028,14 +1484,15 @@ class _MapViewState extends State<MapView>
       final levels = (_scrollPixels / 100).truncate();
       if (levels == 0) return;
       _scrollPixels -= levels * 100;
+      _pauseLocationFollowing();
       _zoomBy(-levels, focalLocal: event.localPosition);
     });
   }
 
   /// Frames [bounds] in the viewport, leaving [padding] around it, then
   /// restores free camera movement (unlike [cameraBounds], nothing stays
-  /// constrained afterwards). Zoom is integer-only: the computed zoom is
-  /// floored and clamped to [MapView.minZoom]/[MapView.maxZoom]. If the bounds
+  /// constrained afterwards). The computed zoom is continuous in fractional
+  /// mode and floored in legacy mode, within min/max zoom. If the bounds
   /// cannot fit at [MapView.minZoom], their edges may be clipped.
   void _fitBounds(
     LatLngBounds bounds, {
@@ -1045,6 +1502,7 @@ class _MapViewState extends State<MapView>
     final manager = _tileManager;
     if (manager == null) return;
 
+    _pauseLocationFollowing();
     final animateFit = animate ?? widget.animateZoom;
     final availW = manager.width - padding.left - padding.right;
     final availH = manager.height - padding.top - padding.bottom;
@@ -1061,11 +1519,14 @@ class _MapViewState extends State<MapView>
     if (spanY > 0) scales.add(availH / (spanY * tileHeight));
 
     int targetZoom;
+    double? continuousTarget;
     if (scales.isEmpty) {
       // Degenerate box (single point) → frame it as close as allowed.
       targetZoom = widget.maxZoom;
     } else {
       final scale = scales.reduce(math.min);
+      continuousTarget = (math.log(scale) / math.ln2)
+          .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble());
       targetZoom = math.max(0, math.log(scale) / math.ln2).floor();
       targetZoom = targetZoom.clamp(widget.minZoom, widget.maxZoom);
     }
@@ -1077,10 +1538,14 @@ class _MapViewState extends State<MapView>
     final projectedCenterY = (lat2TileY(bounds.north, targetZoom) +
             lat2TileY(bounds.south, targetZoom)) /
         2;
-    final centerTileX =
-        projectedCenterX - (padding.left - padding.right) / (2 * tileWidth);
-    final centerTileY =
-        projectedCenterY - (padding.top - padding.bottom) / (2 * tileHeight);
+    final fitZoom = _usesFractionalZoom
+        ? (continuousTarget ?? widget.maxZoom.toDouble())
+        : targetZoom.toDouble();
+    final fitScale = math.pow(2, fitZoom - targetZoom).toDouble();
+    final centerTileX = projectedCenterX -
+        (padding.left - padding.right) / (2 * tileWidth * fitScale);
+    final centerTileY = projectedCenterY -
+        (padding.top - padding.bottom) / (2 * tileHeight * fitScale);
     final targetCenter = LatLng(
       latitude: tileY2Lat(centerTileY, targetZoom),
       longitude: tileX2Lng(centerTileX, targetZoom),
@@ -1089,7 +1554,11 @@ class _MapViewState extends State<MapView>
     // Zoom first: the manager zoom switches immediately even in the
     // animated two-phase path, so the pan tween below runs at the target
     // zoom. Then pan to the (padding-shifted) center.
-    if (targetZoom != manager.zoom) {
+    if (_usesFractionalZoom) {
+      _setContinuousZoom(fitZoom,
+          centerTarget: targetCenter, animate: animateFit);
+      return;
+    } else if (targetZoom != manager.zoom) {
       if (animateFit) {
         _startZoomAnimation(manager, targetZoom, null);
       } else {
@@ -1141,7 +1610,8 @@ class _MapViewState extends State<MapView>
     widget.onZoomChanged?.call(targetZoom);
     MapZoomChangeNotification(targetZoom).dispatch(context);
     _notifyCamera(manager);
-    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+            fractionalZoom: manager.cameraZoom)
         .dispatch(context);
 
     // Re-anchor the snapshot to the POST-step camera so pans from here
@@ -1195,7 +1665,8 @@ class _MapViewState extends State<MapView>
     widget.onZoomChanged?.call(targetZoom);
     MapZoomChangeNotification(targetZoom).dispatch(context);
     _notifyCamera(manager);
-    MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+    MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+            fractionalZoom: manager.cameraZoom)
         .dispatch(context);
 
     _animWaitingTiles = true;
@@ -1257,6 +1728,7 @@ class _MapViewState extends State<MapView>
     _pinchTransitionActive = false;
     _visualScale = 1.0;
     setState(() {});
+    _scheduleLocationFollow(force: true);
   }
 
   void _clearZoomSnapshot() {
@@ -1281,7 +1753,11 @@ class _MapViewState extends State<MapView>
       _visualScale = 1.0;
     }
     _stopPanAnimation();
+    _stopFractionalAnimation();
+    _fractionalSnapshotTimer?.cancel();
     _interacting = false;
+    _scaleStartCameraZoom = manager.cameraZoom;
+    _lastFractionalFocal = details.localFocalPoint;
 
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
@@ -1306,7 +1782,25 @@ class _MapViewState extends State<MapView>
       return;
     }
 
+    _pauseLocationFollowing();
     final focalLocal = details.localFocalPoint;
+    if (_usesFractionalZoom) {
+      final delta = focalLocal - (_lastFractionalFocal ?? focalLocal);
+      manager.setCenterFromTileCoords(
+          manager.centerTileLng - delta.dx / manager.renderedTileWidth,
+          manager.centerTileLat - delta.dy / manager.renderedTileHeight);
+      _lastFractionalFocal = focalLocal;
+      final target =
+          (_scaleStartCameraZoom! + math.log(details.scale) / math.ln2)
+              .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble());
+      _applyContinuousZoom(manager, target, focalLocal, notify: false);
+      _notifyCamera(manager);
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+              fractionalZoom: manager.cameraZoom)
+          .dispatch(context);
+      setState(() {});
+      return;
+    }
 
     // Quantize against the original gesture scale, never against the last
     // rounded zoom. A small reverse deadband prevents tiny span changes
@@ -1380,12 +1874,15 @@ class _MapViewState extends State<MapView>
   void _onScaleEnd(ScaleEndDetails details) {
     final manager = _tileManager;
     if (manager != null) {
-      MapCameraChangeNotification(manager.centerLatLng, manager.zoom)
+      MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
+              fractionalZoom: manager.cameraZoom)
           .dispatch(context);
     }
     _scaleStartTileLng = null;
     _scaleStartTileLat = null;
     _scaleStartZoom = null;
+    _scaleStartCameraZoom = null;
+    _lastFractionalFocal = null;
     _scaleStartFocal = null;
     final wasPanning = _interacting &&
         !_gestureHadMultiplePointers &&
@@ -1396,6 +1893,7 @@ class _MapViewState extends State<MapView>
       _startFling(manager, details.velocity.pixelsPerSecond);
     }
 
+    _settleFractionalSnapshot();
     if (_pinchTransitionActive && _animOldSnapshot != null) {
       if (_newTilesReady()) {
         _beginScalePhase();
@@ -1584,10 +2082,10 @@ class _MapViewState extends State<MapView>
 
         return Listener(
           onPointerDown: _onPointerDown,
-          onPointerUp: (event) => _pointers.remove(event.pointer),
+          onPointerUp: _onPointerUp,
           onPointerCancel: (event) {
             _gestureCancelled = true;
-            _pointers.remove(event.pointer);
+            _onPointerUp(event);
           },
           onPointerSignal: _onPointerSignal,
           child: GestureDetector(
@@ -1615,7 +2113,13 @@ class _MapViewState extends State<MapView>
                         _onMapPress(details.localPosition, longPress: true),
                     child: Stack(
                       children: [
-                        // ── NEW zoom tiles (background, always at 1.0×) ─
+                        if (_fractionalSnapshot != null)
+                          Positioned.fill(
+                              child: CustomPaint(
+                                  size: size,
+                                  painter: _FractionalFallbackPainter(
+                                      _fractionalSnapshot!, manager))),
+                        // ── Current tile grid ─
                         Positioned.fill(
                           child: CustomPaint(
                             size: size,
@@ -1630,6 +2134,9 @@ class _MapViewState extends State<MapView>
                               topRowTilesCanvasY: manager.topRowTilesCanvasY,
                               tiles: manager.renderTiles,
                               revision: manager.revision,
+                              tileScale: manager.zoomScale,
+                              paintBackground: _fractionalSnapshot == null,
+                              paintPlaceholders: _fractionalSnapshot == null,
                             ),
                           ),
                         ),
@@ -1723,6 +2230,7 @@ class _MapViewState extends State<MapView>
                           topRowTilesCanvasY: manager.topRowTilesCanvasY,
                           tiles: manager.renderTiles,
                           revision: manager.revision,
+                          tileScale: manager.zoomScale,
                           zoom: manager.zoom,
                           overlay: runtime.labelOverlay,
                         ),
@@ -1730,6 +2238,14 @@ class _MapViewState extends State<MapView>
                     ),
                   ),
                 ],
+
+                if (widget.showUserLocation &&
+                    widget.locationController?.location != null)
+                  Positioned.fill(
+                      child: UserLocationLayer(
+                          location: widget.locationController!.location!,
+                          manager: manager,
+                          stale: widget.locationController!.error != null)),
 
                 if (loadState.isLoading && widget.loadingBuilder != null)
                   Positioned.fill(
@@ -1746,7 +2262,9 @@ class _MapViewState extends State<MapView>
                 if (widget.showZoomControls) ...[
                   Positioned.fill(
                     child: MapZoomControls(
-                      zoom: _currentZoom,
+                      zoom: _usesFractionalZoom
+                          ? manager.cameraZoom
+                          : _currentZoom,
                       minZoom: widget.minZoom,
                       maxZoom: widget.maxZoom,
                       alignment: widget.zoomControlsAlignment,
@@ -1756,11 +2274,18 @@ class _MapViewState extends State<MapView>
                   ),
                 ],
 
+                if (widget.showLocationControl &&
+                    widget.locationController != null)
+                  Positioned.fill(
+                      child: MapLocationControl(
+                          controller: widget.locationController!,
+                          alignment: widget.locationControlAlignment)),
+
                 if (widget.showScaleBar)
                   Positioned.fill(
                     child: MapScaleBar(
                       latitude: manager.centerLatLng.latitude,
-                      zoom: manager.zoom,
+                      zoom: manager.cameraZoom,
                       unit: widget.scaleBarUnit,
                       alignment: widget.scaleBarAlignment,
                       maxWidth: widget.scaleBarMaxWidth,

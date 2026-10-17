@@ -6,6 +6,7 @@ import 'marker.dart';
 import 'marker_cluster.dart';
 import 'map_polyline.dart';
 import 'map_polygon.dart';
+import 'map_location_controller.dart';
 
 /// Base class for notifications dispatched by [MapView].
 ///
@@ -13,6 +14,12 @@ import 'map_polygon.dart';
 /// listen with [NotificationListener] or via [MapEventListenerMixin].
 sealed class MapNotification extends Notification {
   const MapNotification();
+}
+
+/// Follow-state transitions after a location controller is attached.
+class MapLocationFollowChangeNotification extends MapNotification {
+  const MapLocationFollowChangeNotification(this.state);
+  final MapLocationFollowState state;
 }
 
 class MapTapNotification extends MapNotification {
@@ -64,7 +71,14 @@ class MapCameraChangeNotification extends MapNotification {
   /// The new integer zoom level.
   final int zoom;
 
-  const MapCameraChangeNotification(this.center, this.zoom);
+  final double? _fractionalZoom;
+
+  /// Exact displayed zoom, or the integer zoom for legacy notifications.
+  double get fractionalZoom => _fractionalZoom ?? zoom.toDouble();
+
+  const MapCameraChangeNotification(this.center, this.zoom,
+      {double? fractionalZoom})
+      : _fractionalZoom = fractionalZoom;
 }
 
 /// Dispatched when the zoom level changes.

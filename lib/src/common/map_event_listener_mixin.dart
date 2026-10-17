@@ -7,6 +7,7 @@ import '../api/marker.dart';
 import '../api/marker_cluster.dart';
 import '../api/map_polyline.dart';
 import '../api/map_polygon.dart';
+import '../api/map_location_controller.dart';
 
 /// Mixin for parent [State]s that want to react to map events.
 ///
@@ -46,6 +47,8 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
 
   bool _handleMapNotification(MapNotification notification) {
     switch (notification) {
+      case MapLocationFollowChangeNotification(:final state):
+        onMapLocationFollowChanged(state);
       case MapTapNotification(:final point):
         onMapTapped(point);
       case MapLongPressNotification(:final point):
@@ -60,8 +63,13 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
         onMapPolygonLongPressed(hit);
       case MapReadyNotification(:final controller):
         onMapReady(controller);
-      case MapCameraChangeNotification(:final center, :final zoom):
+      case MapCameraChangeNotification(
+          :final center,
+          :final zoom,
+          :final fractionalZoom
+        ):
         onMapCameraChanged(center, zoom);
+        onMapFractionalZoomChanged(fractionalZoom);
       case MapZoomChangeNotification(:final zoom):
         onMapZoomChanged(zoom);
       case MapMarkerTapNotification(:final marker):
@@ -81,6 +89,11 @@ mixin MapEventListenerMixin<T extends StatefulWidget> on State<T> {
   /// Called once after the map grid is laid out and the controller is
   /// attached.
   void onMapReady(MapController controller) {}
+
+  /// Exact display zoom from camera notifications, including pan updates.
+  void onMapFractionalZoomChanged(double zoom) {}
+
+  void onMapLocationFollowChanged(MapLocationFollowState state) {}
 
   void onMapTapped(LatLng point) {}
   void onMapLongPressed(LatLng point) {}

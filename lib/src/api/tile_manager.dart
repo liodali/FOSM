@@ -84,6 +84,14 @@ class TileManager with CacheTiles {
   double height;
   LatLng centerLatLng;
   int zoom;
+  double? _cameraZoom;
+  double _zoomScale = 1;
+
+  /// Displayed zoom; network and decode keys continue to use integer [zoom].
+  double get cameraZoom => _cameraZoom ?? zoom.toDouble();
+  double get zoomScale => _zoomScale;
+  double get renderedTileWidth => tileWidth * zoomScale;
+  double get renderedTileHeight => tileHeight * zoomScale;
 
   // ── Visible slots ───────────────────────────────────────────────────
   final List<Tile> _renderTiles = [];
@@ -206,6 +214,7 @@ class TileManager with CacheTiles {
   double _calcCenterLng = double.nan;
   double _calcCenterLat = double.nan;
   int _calcZoom = -1;
+  double _calcCameraZoom = -1;
   double _calcWidth = double.nan;
   double _calcHeight = double.nan;
 
@@ -399,6 +408,7 @@ class TileManager with CacheTiles {
     required this.height,
     required this.centerLatLng,
     required this.zoom,
+    double? cameraZoom,
     TileFetcher? fetcher,
     TileDecoder? decoder,
     String Function(int z, int x, int y)? urlBuilder,
@@ -421,6 +431,12 @@ class TileManager with CacheTiles {
         _urlBuilder = urlBuilder,
         _resourceKeyBuilder = resourceKeyBuilder {
     validateRequestTimeout(requestTimeout);
+    if (cameraZoom != null) {
+      _validateCameraZoom(cameraZoom);
+      _cameraZoom = cameraZoom;
+      zoom = cameraZoom.round();
+      _zoomScale = math.pow(2, cameraZoom - zoom).toDouble();
+    }
     centerCanvasX = width / 2;
     centerCanvasY = height / 2;
     setCenterTile();
@@ -528,8 +544,8 @@ class TileManager with CacheTiles {
     final maxX = lon2TileX(bounds.east, zoom);
     final minY = lat2TileY(bounds.north, zoom); // north = smaller tile Y
     final maxY = lat2TileY(bounds.south, zoom);
-    final halfW = width / (2 * tileWidth);
-    final halfH = height / (2 * tileHeight);
+    final halfW = width / (2 * renderedTileWidth);
+    final halfH = height / (2 * renderedTileHeight);
     // Bounds smaller than viewport → pin to their center; else clamp.
     centerTileLng = (maxX - minX <= halfW * 2)
         ? (minX + maxX) / 2
@@ -558,8 +574,8 @@ class TileManager with CacheTiles {
     final tileX = lon2TileX(point.longitude, zoom);
     final tileY = lat2TileY(point.latitude, zoom);
     return Offset(
-      (tileX - centerTileLng) * tileWidth + centerCanvasX,
-      (tileY - centerTileLat) * tileHeight + centerCanvasY,
+      (tileX - centerTileLng) * renderedTileWidth + centerCanvasX,
+      (tileY - centerTileLat) * renderedTileHeight + centerCanvasY,
     );
   }
 
@@ -569,8 +585,9 @@ class TileManager with CacheTiles {
     if (!position.dx.isFinite || !position.dy.isFinite) {
       throw ArgumentError.value(position, 'position', 'must be finite');
     }
-    final x = centerTileLng + (position.dx - centerCanvasX) / tileWidth;
-    final y = centerTileLat + (position.dy - centerCanvasY) / tileHeight;
+    final x = centerTileLng + (position.dx - centerCanvasX) / renderedTileWidth;
+    final y =
+        centerTileLat + (position.dy - centerCanvasY) / renderedTileHeight;
     return LatLng(
       latitude: tileY2Lat(y.clamp(0.0, (1 << zoom).toDouble()), zoom),
       longitude: (tileX2Lng(x, zoom) + 180) % 360 - 180,
@@ -594,32 +611,66 @@ class TileManager with CacheTiles {
   }
 
   void setZoom(int newZoom) {
-    if (newZoom == zoom) return;
+    if (newZoom == zoom && _cameraZoom == null) return;
+    _cameraZoom = null;
+    _zoomScale = 1;
     zoom = newZoom;
     setCenterTile();
     calculate();
   }
 
   void setZoomWithFocalPoint(int newZoom, Offset focalLocal, int oldZoom) {
-    if (newZoom == zoom || newZoom == oldZoom) return;
+    if (newZoom == zoom && cameraZoom == newZoom) return;
 
     final focalTileLng =
-        centerTileLng + (focalLocal.dx - centerCanvasX) / tileWidth;
+        centerTileLng + (focalLocal.dx - centerCanvasX) / renderedTileWidth;
     final focalTileLat =
-        centerTileLat + (focalLocal.dy - centerCanvasY) / tileHeight;
+        centerTileLat + (focalLocal.dy - centerCanvasY) / renderedTileHeight;
     final focalLng = tileX2Lng(focalTileLng, oldZoom);
     final focalLat = tileY2Lat(focalTileLat, oldZoom);
 
     final newFocalTileLng = lon2TileX(focalLng, newZoom);
     final newFocalTileLat = lat2TileY(focalLat, newZoom);
 
+    _cameraZoom = null;
+    _zoomScale = 1;
     final newCenterTileLng =
-        newFocalTileLng - (focalLocal.dx - centerCanvasX) / tileWidth;
+        newFocalTileLng - (focalLocal.dx - centerCanvasX) / renderedTileWidth;
     final newCenterTileLat =
-        newFocalTileLat - (focalLocal.dy - centerCanvasY) / tileHeight;
+        newFocalTileLat - (focalLocal.dy - centerCanvasY) / renderedTileHeight;
 
     zoom = newZoom;
     setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+    calculate();
+  }
+
+  static void _validateCameraZoom(double value) {
+    if (!value.isFinite || value < 0 || value > 30) {
+      throw ArgumentError.value(
+          value, 'cameraZoom', 'must be finite and between 0 and 30');
+    }
+  }
+
+  /// Changes the display scale while selecting the nearest integer tile grid.
+  /// The geographic point under [focalPoint] remains stationary unless bounds
+  /// clamp the camera. Calling with the same value is a true no-op.
+  void setCameraZoom(double value, {Offset? focalPoint}) {
+    _validateCameraZoom(value);
+    if (value == cameraZoom) return;
+    final focal = focalPoint ?? Offset(centerCanvasX, centerCanvasY);
+    final focalX =
+        centerTileLng + (focal.dx - centerCanvasX) / renderedTileWidth;
+    final focalY =
+        centerTileLat + (focal.dy - centerCanvasY) / renderedTileHeight;
+    final oldZoom = zoom;
+    zoom = value.round();
+    _cameraZoom = value;
+    _zoomScale = math.pow(2, value - zoom).toDouble();
+    final ratio = math.pow(2, zoom - oldZoom).toDouble();
+    setCenterFromTileCoords(
+      focalX * ratio - (focal.dx - centerCanvasX) / renderedTileWidth,
+      focalY * ratio - (focal.dy - centerCanvasY) / renderedTileHeight,
+    );
     calculate();
   }
 
@@ -643,29 +694,33 @@ class TileManager with CacheTiles {
     final gridChanged = _calcCenterLng != centerTileLng ||
         _calcCenterLat != centerTileLat ||
         _calcZoom != zoom ||
+        _calcCameraZoom != cameraZoom ||
         _calcWidth != width ||
         _calcHeight != height;
     _calcCenterLng = centerTileLng;
     _calcCenterLat = centerTileLat;
     _calcZoom = zoom;
+    _calcCameraZoom = cameraZoom;
     _calcWidth = width;
     _calcHeight = height;
     if (!gridChanged) return;
     _generation++;
 
-    final centerPointTileX = (centerTileLng % 1) * tileWidth;
-    final centerPointTileY = (centerTileLat % 1) * tileHeight;
+    final centerPointTileX = (centerTileLng % 1) * renderedTileWidth;
+    final centerPointTileY = (centerTileLat % 1) * renderedTileHeight;
 
     final centerCanvasTileX = centerCanvasX - centerPointTileX;
     final centerCanvasTileY = centerCanvasY - centerPointTileY;
 
-    final leftColumnsBeforeCenterCount = (centerCanvasTileX / tileWidth).ceil();
+    final leftColumnsBeforeCenterCount =
+        (centerCanvasTileX / renderedTileWidth).ceil();
     leftColumnTilesCanvasX =
-        centerCanvasTileX - leftColumnsBeforeCenterCount * tileWidth;
+        centerCanvasTileX - leftColumnsBeforeCenterCount * renderedTileWidth;
 
-    final topRowsBeforeCenterCount = (centerCanvasTileY / tileHeight).ceil();
+    final topRowsBeforeCenterCount =
+        (centerCanvasTileY / renderedTileHeight).ceil();
     topRowTilesCanvasY =
-        centerCanvasTileY - topRowsBeforeCenterCount * tileHeight;
+        centerCanvasTileY - topRowsBeforeCenterCount * renderedTileHeight;
 
     final centerTileLngIndex = centerTileLng.floor();
     leftColumnTilesLngIndex = centerTileLngIndex - leftColumnsBeforeCenterCount;
@@ -674,8 +729,9 @@ class TileManager with CacheTiles {
     topRowTilesLatIndex = centerTileLatIndex - topRowsBeforeCenterCount;
 
     horizontalTileCount =
-        ((width + -leftColumnTilesCanvasX) / tileWidth).ceil();
-    verticalTileCount = ((height + -topRowTilesCanvasY) / tileHeight).ceil();
+        ((width + -leftColumnTilesCanvasX) / renderedTileWidth).ceil();
+    verticalTileCount =
+        ((height + -topRowTilesCanvasY) / renderedTileHeight).ceil();
 
     // Capture the strict (un-padded) viewport ranges before expansion so
     // readiness checks and the scheduler can tell visible slots from the
@@ -691,8 +747,10 @@ class TileManager with CacheTiles {
     final paddedVCount = verticalTileCount + 2 * tilePadding;
     final paddedLeftLng = leftColumnTilesLngIndex - tilePadding;
     final paddedTopLat = topRowTilesLatIndex - tilePadding;
-    final paddedLeftCanvasX = leftColumnTilesCanvasX - tilePadding * tileWidth;
-    final paddedTopCanvasY = topRowTilesCanvasY - tilePadding * tileHeight;
+    final paddedLeftCanvasX =
+        leftColumnTilesCanvasX - tilePadding * renderedTileWidth;
+    final paddedTopCanvasY =
+        topRowTilesCanvasY - tilePadding * renderedTileHeight;
 
     horizontalTileCount = paddedHCount;
     verticalTileCount = paddedVCount;

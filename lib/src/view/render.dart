@@ -24,6 +24,9 @@ class RenderCanvasOSM extends CustomPainter {
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
   final int revision;
+  final double tileScale;
+  final bool paintBackground;
+  final bool paintPlaceholders;
 
   RenderCanvasOSM({
     required this.horizontalTileCount,
@@ -34,6 +37,9 @@ class RenderCanvasOSM extends CustomPainter {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
+    this.tileScale = 1,
+    this.paintBackground = true,
+    this.paintPlaceholders = true,
   });
 
   static const Color _checkerLight = Color(0xFFF5F5F5);
@@ -83,14 +89,18 @@ class RenderCanvasOSM extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     // Background fill so any sub-pixel gaps between tiles aren't black.
-    canvas.drawRect(Offset.zero & size, _checkerLightPaint);
+    if (paintBackground) {
+      canvas.drawRect(Offset.zero & size, _checkerLightPaint);
+    }
 
     for (var hIndex = 0; hIndex < horizontalTileCount; hIndex++) {
-      final tileCanvasX = leftColumnTilesCanvasX + hIndex * tileWidth;
+      final tileCanvasX =
+          leftColumnTilesCanvasX + hIndex * tileWidth * tileScale;
       final tileLngIndex = leftColumnTilesLngIndex + hIndex;
 
       for (var vIndex = 0; vIndex < verticalTileCount; vIndex++) {
-        final tileCanvasY = topRowTilesCanvasY + vIndex * tileHeight;
+        final tileCanvasY =
+            topRowTilesCanvasY + vIndex * tileHeight * tileScale;
         final tileLatIndex = topRowTilesLatIndex + vIndex;
 
         // tiles is row-major: h outer, v inner → index = h * verticalTileCount + v
@@ -99,9 +109,17 @@ class RenderCanvasOSM extends CustomPainter {
         final image = tile?.sourceTile;
 
         if (image != null) {
-          canvas.drawImage(
-              image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
-        } else {
+          if (tileScale == 1) {
+            canvas.drawImage(
+                image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
+          } else {
+            canvas.save();
+            canvas.translate(tileCanvasX, tileCanvasY);
+            canvas.scale(tileScale);
+            canvas.drawImage(image, Offset.zero, _imagePaint);
+            canvas.restore();
+          }
+        } else if (paintPlaceholders) {
           // Reusable checkerboard placeholder — a single picture replay
           // per missing tile instead of hundreds of rect draws. The
           // picture is recorded at (0,0), so translate to the tile origin.
@@ -112,6 +130,7 @@ class RenderCanvasOSM extends CustomPainter {
           canvas
             ..save()
             ..translate(tileCanvasX, tileCanvasY)
+            ..scale(tileScale)
             ..drawPicture(picture)
             ..restore();
         }
@@ -121,7 +140,10 @@ class RenderCanvasOSM extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) =>
-      oldDelegate.revision != revision;
+      oldDelegate.revision != revision ||
+      oldDelegate.tileScale != tileScale ||
+      oldDelegate.paintBackground != paintBackground ||
+      oldDelegate.paintPlaceholders != paintPlaceholders;
 }
 
 /// Paints the vector label overlay (place names, road shields, POI icons)
@@ -139,6 +161,7 @@ class VectorLabelPainter extends CustomPainter {
   final double topRowTilesCanvasY;
   final List<Tile> tiles;
   final int revision;
+  final double tileScale;
 
   /// Current zoom — styles evaluate paint properties per zoom.
   final int zoom;
@@ -156,6 +179,7 @@ class VectorLabelPainter extends CustomPainter {
     required this.topRowTilesCanvasY,
     required this.tiles,
     required this.revision,
+    this.tileScale = 1,
     required this.zoom,
     required this.overlay,
     super.repaint,
@@ -167,6 +191,7 @@ class VectorLabelPainter extends CustomPainter {
       canvas,
       size,
       zoom: zoom,
+      tileScale: tileScale,
       leftColumnTilesCanvasX: leftColumnTilesCanvasX,
       topRowTilesCanvasY: topRowTilesCanvasY,
       leftColumnTilesLngIndex: leftColumnTilesLngIndex,
@@ -179,6 +204,7 @@ class VectorLabelPainter extends CustomPainter {
   bool shouldRepaint(covariant VectorLabelPainter oldDelegate) =>
       oldDelegate.revision != revision ||
       oldDelegate.zoom != zoom ||
+      oldDelegate.tileScale != tileScale ||
       oldDelegate.overlay != overlay ||
       oldDelegate.leftColumnTilesLngIndex != leftColumnTilesLngIndex ||
       oldDelegate.topRowTilesLatIndex != topRowTilesLatIndex ||

@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:fosm/fosm.dart';
 import 'package:routing_client_dart/routing_client_dart.dart' as routing;
@@ -52,6 +55,39 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   /// Programmatic control surface for the map.
   final MapController _mapController = MapController();
 
+  final MapLocationController _locations = MapLocationController();
+  Timer? _locationTimer;
+  bool _simulateLocation = false;
+
+  void _setLocationDemo(bool enabled) {
+    _locationTimer?.cancel();
+    _simulateLocation = enabled;
+    if (!enabled) {
+      _locations.stop();
+      _locations.clearLocation();
+      return;
+    }
+    var step = 0;
+    void emit() {
+      final angle = step++ * math.pi / 90;
+      _locations.updateLocation(MapLocation(
+        point: LatLng(
+          latitude: initialCenter.latitude + 0.001 * math.sin(angle),
+          longitude: initialCenter.longitude + 0.0015 * (1 - math.cos(angle)),
+        ),
+        accuracyMeters: 12,
+        bearing: (angle * 180 / math.pi) % 360,
+        timestamp: DateTime.now(),
+      ));
+    }
+
+    emit();
+    _locations.follow();
+    _zoom = 16;
+    _displayZoom = 16;
+    _locationTimer = Timer.periodic(const Duration(seconds: 1), (_) => emit());
+  }
+
   // Tile source selection
   _MapMode _mode = _MapMode.raster;
 
@@ -76,6 +112,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
   // tile sources rebuilds the map at the same place.
   LatLng _center = initialCenter;
   int _zoom = 7;
+  double _displayZoom = 7;
+  bool _fractionalZoom = true;
 
   bool _animateZoom = true;
   bool _showScaleBar = true;
@@ -354,6 +392,8 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
 
   @override
   void dispose() {
+    _locationTimer?.cancel();
+    _locations.dispose();
     _mapController.dispose();
     _markers.removeListener(_onMarkersChanged);
     _styleUrlController.dispose();
@@ -432,8 +472,14 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
             child: listenToMap(
               MapView(
                 controller: _mapController,
+                locationController: _simulateLocation ? _locations : null,
+                locationControlAlignment: Alignment.bottomLeft,
                 latLng: _center,
                 zoom: _zoom,
+                enableFractionalZoom: _fractionalZoom,
+                fractionalZoom: _fractionalZoom ? _displayZoom : null,
+                onFractionalZoomChanged: (zoom) =>
+                    setState(() => _displayZoom = zoom),
                 minZoom: 1,
                 maxZoom: 19,
                 cameraBounds: _cameraBounds,
@@ -532,7 +578,7 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
                 ],
               ),
               child: Text(
-                'Zoom: $_zoom · ${_markers.length} markers'
+                'Zoom: ${_fractionalZoom ? _displayZoom.toStringAsFixed(2) : _zoom} · ${_markers.length} markers'
                 '${_markers.overlayMarker != null ? ' · overlay' : ''}',
                 style: const TextStyle(
                   fontSize: 14,
@@ -758,6 +804,23 @@ class _MyHomePageState extends State<MyHomePage> with MapEventListenerMixin {
               ],
             ),
             const SizedBox(height: 12),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Fractional zoom'),
+              value: _fractionalZoom,
+              onChanged: (value) => update(() {
+                _fractionalZoom = value;
+                _displayZoom = _zoom.toDouble();
+              }),
+            ),
+            SwitchListTile.adaptive(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Simulate location (Zurich)'),
+              subtitle: const Text(
+                  'Drag to pause following; tap recenter to resume.'),
+              value: _simulateLocation,
+              onChanged: (value) => update(() => _setLocationDemo(value)),
+            ),
             SwitchListTile.adaptive(
               contentPadding: EdgeInsets.zero,
               title: const Text('Scale bar'),

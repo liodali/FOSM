@@ -25,7 +25,7 @@ import 'package:flutter/material.dart';
 /// everything automatically.
 class MapZoomControls extends StatelessWidget {
   /// Current zoom level.
-  final int zoom;
+  final num zoom;
 
   /// Minimum allowed zoom.
   final int minZoom;

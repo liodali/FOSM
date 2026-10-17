@@ -80,7 +80,7 @@ class _MarkerLayerState extends State<MarkerLayer>
   Marker? _lastOverlayMarker;
 
   /// Camera snapshot used to detect movement between parent rebuilds.
-  ({double lng, double lat, int zoom})? _lastCamera;
+  ({double lng, double lat, double zoom})? _lastCamera;
 
   /// Measured sizes of overlay-capable markers, keyed by identity. The
   /// overlay anchors to the marker widget's edge, which requires its size.
@@ -132,7 +132,7 @@ class _MarkerLayerState extends State<MarkerLayer>
     _lastCamera = (
       lng: manager.centerTileLng,
       lat: manager.centerTileLat,
-      zoom: manager.zoom,
+      zoom: manager.cameraZoom,
     );
   }
 
@@ -144,7 +144,7 @@ class _MarkerLayerState extends State<MarkerLayer>
     final camera = (
       lng: manager.centerTileLng,
       lat: manager.centerTileLat,
-      zoom: manager.zoom,
+      zoom: manager.cameraZoom,
     );
     if (camera == _lastCamera) return;
     _lastCamera = camera;

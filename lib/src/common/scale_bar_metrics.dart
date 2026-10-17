@@ -18,7 +18,7 @@ class ScaleBarMetrics {
 /// Approximate ground resolution at the camera center on spherical Web
 /// Mercator, in meters per logical map pixel (not decoded image pixels).
 /// See https://docs.maptiler.com/google-maps-coordinates-tile-bounds-projection/
-double mapMetersPerPixel(double latitude, int zoom) =>
+double mapMetersPerPixel(double latitude, num zoom) =>
     2 *
     math.pi *
     6378137 *
@@ -27,11 +27,12 @@ double mapMetersPerPixel(double latitude, int zoom) =>
 
 ScaleBarMetrics? calculateScaleBar({
   required double latitude,
-  required int zoom,
+  required num zoom,
   required double maxWidth,
   required ScaleBarUnit unit,
 }) {
   if (!latitude.isFinite ||
+      !zoom.isFinite ||
       zoom < 0 ||
       zoom > 30 ||
       !maxWidth.isFinite ||

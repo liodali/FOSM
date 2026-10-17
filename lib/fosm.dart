@@ -1,3 +1,6 @@
+export 'src/api/map_location.dart';
+export 'src/api/map_location_controller.dart';
+export 'src/view/location_control.dart';
 export 'src/view/map_view.dart';
 export 'src/view/zoom_controls.dart';
 export 'src/view/scale_bar.dart' show MapScaleBar, ScaleBarUnit;
