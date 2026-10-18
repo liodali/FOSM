@@ -85,7 +85,8 @@ class VectorTileRenderer {
   /// yield instead of finishing picture recording.
   ///
   /// [yieldBudget] and [yieldControl] are exposed for deterministic tests;
-  /// production callers should use their defaults.
+  /// standalone callers can use the defaults. MapView supplies a shared
+  /// scheduler through [yieldControl] with a zero local budget.
   Future<ui.Picture> renderAsync({
     required DecodedVectorTile decoded,
     required int srcZ,

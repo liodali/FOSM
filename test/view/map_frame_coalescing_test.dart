@@ -78,7 +78,7 @@ final Uint8List _tinyPng = Uint8List.fromList([
 ]);
 
 void main() {
-  testWidgets('several tile arrivals in one frame rebuild the map once',
+  testWidgets('paced tile arrivals rebuild the map at most once per frame',
       (tester) async {
     final completers = <String, Completer<Uint8List>>{};
     Future<Uint8List> fetcher(int z, int x, int y) {
@@ -112,29 +112,39 @@ void main() {
       if (!completer.isCompleted) completer.complete(_tinyPng);
     }
 
-    // Wait for actual decoding without pumping another frame, so the assertion
-    // measures one batch of arrivals even when the test machine is busy.
-    await tester.runAsync(() async {
-      final watch = Stopwatch()..start();
-      bool decoded() =>
-          tester
-              .widgetList<CustomPaint>(find.byType(CustomPaint))
-              .map((paint) => paint.painter)
-              .whereType<RenderCanvasOSM>()
-              .single
-              .tiles
-              .where((tile) => tile.sourceTile != null)
-              .length >=
-          batch.length;
-      while (!decoded() && watch.elapsed < const Duration(seconds: 5)) {
-        await Future<void>.delayed(Duration.zero);
-      }
-      expect(decoded(), isTrue, reason: 'the complete first batch must decode');
-    });
+    int decodedCount() => tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((paint) => paint.painter)
+        .whereType<RenderCanvasOSM>()
+        .single
+        .tiles
+        .where((tile) => tile.sourceTile != null)
+        .length;
 
+    // Image creation now spans multiple frames. Keep presenting frames while
+    // checking that each batch still coalesces into at most one map rebuild.
+    final watch = Stopwatch()..start();
+    while (decodedCount() < batch.length &&
+        watch.elapsed < const Duration(seconds: 5)) {
+      final builds = MapView.debugBuildCount;
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(MapView.debugBuildCount - builds, lessThanOrEqualTo(1),
+          reason: 'tile work must not produce multiple builds in one frame');
+      final previous = decodedCount();
+      await tester.runAsync(() async {
+        final turn = Stopwatch()..start();
+        while (decodedCount() == previous &&
+            turn.elapsed < const Duration(milliseconds: 20)) {
+          await Future<void>.delayed(Duration.zero);
+        }
+      });
+    }
+    expect(decodedCount(), batch.length,
+        reason: 'paced loading must eventually publish the complete batch');
+    final builds = MapView.debugBuildCount;
     await tester.pump();
-    expect(MapView.debugBuildCount, before + 1,
-        reason: 'a frame of tile arrivals must produce one map rebuild');
+    expect(MapView.debugBuildCount - builds, lessThanOrEqualTo(1));
+    expect(MapView.debugBuildCount, greaterThan(before));
 
     // Drain the adjacent-zoom preload debounce so no timer is left pending.
     await tester.pumpAndSettle(const Duration(seconds: 1));

@@ -10,6 +10,7 @@ import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
+import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/api/geo_point.dart';
@@ -54,7 +55,7 @@ class TileManager with CacheTiles {
 
   /// Maximum number of background preload jobs executing at once. Background
   /// work is bytes-only vector padding and adjacent-zoom preloading; it only
-  /// starts when no foreground work is queued or active.
+  /// starts when no foreground download or presentation is queued or active.
   static const int maxConcurrentBackgroundLoads = 2;
 
   final TileFetcher _fetcher;
@@ -62,6 +63,24 @@ class TileManager with CacheTiles {
   /// Turns fetched bytes into a [ui.Image] — the raster codec by default,
   /// the vector parse+render pipeline in vector mode.
   final TileDecoder _decoder;
+
+  /// Optional map-owned frame pacing; vector image creation uses the same
+  /// scheduler in VectorTileRuntime instead of gating its entire pipeline.
+  final TileWorkScheduler? workScheduler;
+
+  /// Whether the supplied decoder already schedules its own heavy stages
+  /// through [workScheduler] — `VectorTileRuntime` submits `Picture.toImage`
+  /// through the shared image lane itself.
+  ///
+  /// When true, this manager calls the decoder directly and leaves image
+  /// pacing to it. Wrapping such a decoder in the scheduler's image lane
+  /// would nest one lane reservation inside another: every active slot
+  /// would be held by a decode waiting for a slot itself, stalling the
+  /// lane until relevance checks or disposal break the wait.
+  ///
+  /// This is scheduling ownership, deliberately independent of
+  /// [byteOnlyPadding] (which only decides whether padding tiles decode).
+  final bool decoderOwnsImageScheduling;
 
   /// Prefix for all cache keys (memory, byte and Hive). Vector styles set
   /// this to the style id so their entries never collide with raster ones.
@@ -411,12 +430,14 @@ class TileManager with CacheTiles {
     double? cameraZoom,
     TileFetcher? fetcher,
     TileDecoder? decoder,
+    this.workScheduler,
     String Function(int z, int x, int y)? urlBuilder,
     TileResourceKeyBuilder? resourceKeyBuilder,
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
     this.byteOnlyPadding = false,
+    this.decoderOwnsImageScheduling = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
     this.cameraBounds,
     int maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
@@ -963,14 +984,18 @@ class TileManager with CacheTiles {
   /// Foreground jobs are bounded by [maxConcurrentVisibleLoads]; the rest
   /// stay queued so a newer generation can take the next freed slot instead
   /// of sitting behind dozens of older requests. Background preloads only
-  /// run when no foreground work is queued or active, and are bounded by
+  /// run when no foreground download/presentation is queued or active, and are bounded by
   /// [maxConcurrentBackgroundLoads].
   void _pumpLoadQueue() {
     if (_disposed || _loadQueue.isEmpty) return;
     _loadQueue.sort(_compareJobs);
 
     final foregroundPending = _loadQueue.any(_isForeground);
-    final backgroundBlocked = foregroundPending || _activeForegroundLoads > 0;
+    final presentationPending =
+        _presentQueue.any((entry) => _isForeground(entry.job)) ||
+            _activePresentEntries.any((entry) => _isForeground(entry.job));
+    final backgroundBlocked =
+        foregroundPending || _activeForegroundLoads > 0 || presentationPending;
     var foregroundSlots = maxConcurrentVisibleLoads - _activeForegroundLoads;
 
     final keep = <_LoadJob>[];
@@ -1477,7 +1502,19 @@ class TileManager with CacheTiles {
       return _DecodeOutcome.aborted;
     }
     try {
-      final image = await _decoder(bytes, job.z, job.x, job.y);
+      final scheduler = workScheduler;
+      // Only pace decodes that do not schedule themselves: a decoder that
+      // submits its own image work through the same scheduler (vector
+      // runtimes) must not be nested inside another image-lane reservation,
+      // or every slot ends up held by a decode waiting for a slot.
+      final image = scheduler != null && !decoderOwnsImageScheduling
+          ? await scheduler.image(
+              () => _decoder(bytes, job.z, job.x, job.y),
+              priority: () => tileDecodePriority(job.z, job.x, job.y),
+              isRelevant: () =>
+                  !_disposed && isTileRelevant(job.z, job.x, job.y),
+            )
+          : await _decoder(bytes, job.z, job.x, job.y);
       if (_disposed) {
         image.dispose();
         return _DecodeOutcome.aborted;

@@ -548,7 +548,7 @@ void main() {
       // The label lane runs after the base image resolves.
       await tester.runAsync(() async {
         final stopwatch = Stopwatch()..start();
-        while (runtime.labelOverlay.preparedTileCount == 0 &&
+        while (notifications == 0 &&
             stopwatch.elapsed < const Duration(seconds: 2)) {
           await Future<void>.delayed(const Duration(milliseconds: 10));
         }

@@ -21,6 +21,7 @@ import 'package:fosm/src/api/tile_source.dart';
 import 'package:fosm/src/api/map_load_state.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
@@ -690,6 +691,7 @@ class _MapViewState extends State<MapView>
 
   void _pauseLocationFollowing() => widget.locationController?.pause();
 
+  final TileWorkScheduler _tileWorkScheduler = TileWorkScheduler();
   TileManager? _tileManager;
   int _currentZoom = 0;
   bool _explicitFractional = false;
@@ -858,6 +860,7 @@ class _MapViewState extends State<MapView>
       _vectorRuntime = VectorTileRuntime(
         loaded: loaded,
         namespace: style.id,
+        workScheduler: _tileWorkScheduler,
         requestTimeout: widget.requestTimeout,
       );
     } catch (error) {
@@ -998,6 +1001,7 @@ class _MapViewState extends State<MapView>
   @override
   void dispose() {
     widget.locationController?.removeListener(_onLocationChanged);
+    _tileWorkScheduler.dispose();
     _stopFractionalAnimation();
     _clearFractionalSnapshot();
     _styleCancel?.cancel('Map disposed');
@@ -1050,6 +1054,7 @@ class _MapViewState extends State<MapView>
           ?.clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()),
       fetcher: runtime?.fetcher ?? widget.tileFetcher,
       decoder: runtime?.decoder,
+      workScheduler: _tileWorkScheduler,
       urlBuilder: runtime?.urlBuilder,
       resourceKeyBuilder: runtime?.resourceKeyBuilder,
       cacheNamespace: runtime?.namespace ?? '',
@@ -1058,6 +1063,11 @@ class _MapViewState extends State<MapView>
       // on demand when it scrolls into view. Raster decodes are cheap and
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
+      // The vector runtime already routes its `Picture.toImage` through
+      // the shared scheduler; the manager must not wrap the same decoder
+      // in another image-lane reservation. This is scheduling ownership,
+      // independent of the padding policy above.
+      decoderOwnsImageScheduling: runtime != null,
       cameraBounds: widget.cameraBounds,
       maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
       renderedCacheRetention: widget.renderedCacheRetention,

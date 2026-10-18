@@ -12,6 +12,7 @@ import 'package:fosm/src/api/tile_source.dart'
     show TileDecodeAborted, TilePayloadException, tileUrl;
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:hive_ce/hive.dart';
 
@@ -1222,6 +1223,46 @@ void main() {
       manager.dispose();
     });
 
+    testWidgets('preloads wait for visible images after downloads finish',
+        (tester) async {
+      final fetchedZooms = <int>[];
+      final release = Completer<void>();
+      final decoding = <String>[];
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: (z, x, y) async {
+          fetchedZooms.add(z);
+          return fakeTilePng;
+        },
+        decoder: (bytes, z, x, y) async {
+          decoding.add('$z/$x/$y');
+          await release.future;
+          return Tile.decodeImage(bytes);
+        },
+        tilePadding: 0,
+        preloadAdjacentZoom: true,
+        preloadDebounce: Duration.zero,
+      );
+      addTearDown(manager.dispose);
+      manager.calculate();
+      await _flushAsync(tester);
+      expect(decoding, isNotEmpty);
+      expect(manager.visibleTilesReady, isFalse);
+      expect(fetchedZooms.every((zoom) => zoom == 5), isTrue,
+          reason:
+              'download completion must not start preloads during presentation');
+      release.complete();
+      await _runUntil(
+          tester,
+          () =>
+              manager.visibleTilesReady &&
+              fetchedZooms.contains(4) &&
+              fetchedZooms.contains(6));
+    });
+
     testWidgets('a padding tile promoted to visible decodes without re-fetch',
         (tester) async {
       final fetchCounts = <String, int>{};
@@ -1570,6 +1611,53 @@ void main() {
       await _runUntil(
           tester, () => backgroundStarted.length > backgroundBefore);
       manager.dispose();
+    });
+
+    testWidgets(
+        'a decoder that shares the image lane does not stall the manager',
+        (tester) async {
+      // Regression: VectorTileRuntime's decoder submits `Picture.toImage`
+      // through the same scheduler the manager paces decodes with. If the
+      // manager also wrapped such decoders in the image lane, every active
+      // slot would be held by a decode waiting for a slot itself.
+      var frames = 0;
+      final scheduler = TileWorkScheduler(
+        now: () => Duration.zero,
+        nextFrame: () async => frames++,
+      );
+      addTearDown(scheduler.dispose);
+
+      Future<ui.Image> nestedDecoder(bytes, z, x, y) =>
+          scheduler.image(() => Tile.decodeImage(bytes));
+
+      final manager = TileManager.init(
+        width: 512,
+        height: 512,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 4,
+        fetcher: (_, __, ___) async => fakeTilePng,
+        decoder: nestedDecoder,
+        workScheduler: scheduler,
+        // Padding decodes too: with scheduling ownership tied to this flag
+        // (the old coupling) this configuration deadlocks the image lane.
+        byteOnlyPadding: false,
+        decoderOwnsImageScheduling: true,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        final timeout = Stopwatch()..start();
+        while (!manager.visibleTilesReady &&
+            timeout.elapsed < const Duration(seconds: 5)) {
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
+      });
+      expect(manager.visibleTilesReady, isTrue,
+          reason: 'nested image scheduling must not deadlock the lane');
+      expect(manager.loadState.failures, isEmpty);
     });
   });
 

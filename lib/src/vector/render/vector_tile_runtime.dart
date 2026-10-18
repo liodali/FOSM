@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 
+import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/api/tile.dart' show Tile;
 import 'package:fosm/src/api/map_load_state.dart';
 import 'package:fosm/src/api/tile_source.dart'
@@ -48,12 +49,16 @@ class VectorTileRuntime {
   /// tests that require fully synchronous parsing.
   final bool parseOffThread;
   Duration requestTimeout;
+
+  /// Shared with the map's raster/image work; owned by MapView.
+  final TileWorkScheduler? workScheduler;
   final MapRequestSession _networkCancel = MapRequestSession();
 
   VectorTileRuntime({
     required this.loaded,
     required this.namespace,
     this.parseOffThread = true,
+    this.workScheduler,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
   }) {
     validateRequestTimeout(requestTimeout);
@@ -354,11 +359,20 @@ class VectorTileRuntime {
 
   Future<void> _runLabelPrep(_LabelJob job) async {
     try {
+      await workScheduler?.checkpoint(
+          isRelevant: () => _isRelevant(job.z, job.x, job.y));
       await labelOverlay.prepare(
         job.z,
         job.x,
         job.y,
         isRelevant: () => _isRelevant(job.z, job.x, job.y),
+        yieldBudget: workScheduler == null
+            ? const Duration(milliseconds: 4)
+            : Duration.zero,
+        yieldControl: workScheduler == null
+            ? null
+            : () => workScheduler!
+                .checkpoint(isRelevant: () => _isRelevant(job.z, job.x, job.y)),
       );
       if (_isRelevant(job.z, job.x, job.y)) {
         _labelsNotifier.notifyLabelsUpdated();
@@ -456,6 +470,8 @@ class VectorTileRuntime {
       // Yield before the heavy Canvas path-building step.
       if (kIsWeb) await Future<void>.delayed(Duration.zero);
 
+      await workScheduler?.checkpoint(isRelevant: () => _isRelevant(z, x, y));
+
       // Use the time-budgeted renderer. It cooperatively yields between
       // layers, features, and large geometry batches on every platform.
       final picture = await VectorTileRenderer(loaded).renderAsync(
@@ -467,6 +483,13 @@ class VectorTileRuntime {
         rasterTiles: rasterImages,
         rasterCoords: rasterCoords,
         isRelevant: () => _isRelevant(z, x, y),
+        yieldBudget: workScheduler == null
+            ? VectorTileRenderer.defaultYieldBudget
+            : Duration.zero,
+        yieldControl: workScheduler == null
+            ? null
+            : () => workScheduler!
+                .checkpoint(isRelevant: () => _isRelevant(z, x, y)),
       );
       try {
         // Skip the `toImage` snapshot too if the tile went stale while
@@ -479,7 +502,14 @@ class VectorTileRuntime {
         // The tile may have gone stale during the delay; never enter
         // `toImage` (the single most expensive stage) for a stale tile.
         _checkRelevant(z, x, y);
-        final image = await picture.toImage(256, 256);
+        final scheduler = workScheduler;
+        final image = scheduler == null
+            ? await picture.toImage(256, 256)
+            : await scheduler.image(
+                () => picture.toImage(256, 256),
+                priority: () => tilePriority?.call(z, x, y) ?? 0,
+                isRelevant: () => _isRelevant(z, x, y),
+              );
         // Publish the base image immediately. Label preparation runs on a
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness
