@@ -813,6 +813,16 @@ class _MapViewState extends State<MapView>
   bool _scaleFlushScheduled = false;
   bool _scaleAppliedSinceFrame = false;
 
+  /// Focal point and cumulative scale of the last gesture update that was
+  /// actually applied. Camera commands rebase the active gesture onto the
+  /// new camera using the freshest of this and [_pendingScaleUpdate].
+  Offset? _lastAppliedGestureFocal;
+  double? _lastAppliedGestureScale;
+
+  /// Set by camera commands: the active gesture's anchors must refresh
+  /// from the live camera before the gesture applies again.
+  bool _gestureNeedsRebase = false;
+
   /// True from gesture start to gesture end. Full-viewport blur is skipped
   /// during direct manipulation so a pinch/drag never pays for an
   /// `ImageFiltered` pass while the camera is moving.
@@ -976,14 +986,17 @@ class _MapViewState extends State<MapView>
       setState(() {});
     }
     if (externalCenter) {
+      _rebaseGestureOntoCamera();
       _tileManager?.setCenterTile(latLng: widget.latLng);
       setState(() {});
     }
     if (externalFractional && widget.fractionalZoom != null) {
+      _rebaseGestureOntoCamera();
       _tileManager?.setCameraZoom(widget.fractionalZoom!
           .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()));
       _currentZoom = _tileManager?.zoom ?? _currentZoom;
     } else if (externalZoom) {
+      _rebaseGestureOntoCamera();
       if (_usesFractionalZoom) {
         _tileManager?.setCameraZoom(widget.zoom.toDouble());
       } else {
@@ -1177,6 +1190,7 @@ class _MapViewState extends State<MapView>
     }
     final manager = _tileManager;
     if (manager == null) return;
+    _rebaseGestureOntoCamera();
     final target = value.clamp(math.max(0, widget.minZoom).toDouble(),
         math.min(30, widget.maxZoom).toDouble());
     _stopPanAnimation();
@@ -1309,6 +1323,7 @@ class _MapViewState extends State<MapView>
 
   void _applyZoomInstantly(
       TileManager manager, int newZoom, Offset? focalLocal) {
+    _rebaseGestureOntoCamera();
     _animController.stop();
     _animWaitTimer?.cancel();
     _animWaitTimer = null;
@@ -1339,6 +1354,7 @@ class _MapViewState extends State<MapView>
     if (!preserveLocationFollow) _pauseLocationFollowing();
     final manager = _tileManager;
     if (manager == null) return;
+    _rebaseGestureOntoCamera();
 
     _stopPanAnimation();
     _stopFractionalAnimation();
@@ -1608,6 +1624,7 @@ class _MapViewState extends State<MapView>
       TileManager manager, int targetZoom, Offset? focalLocal) {
     MapView.debugZoomTransitionCount++;
     _pinchTransitionActive = false;
+    _rebaseGestureOntoCamera();
     // Cancel any in-progress animation.
     _animController.stop();
     _stopPanAnimation();
@@ -1780,6 +1797,9 @@ class _MapViewState extends State<MapView>
     // update applies immediately.
     _pendingScaleUpdate = null;
     _scaleAppliedSinceFrame = false;
+    _lastAppliedGestureFocal = null;
+    _lastAppliedGestureScale = null;
+    _gestureNeedsRebase = false;
     _scaleStartCameraZoom = manager.cameraZoom;
     _lastFractionalFocal = details.localFocalPoint;
 
@@ -1807,6 +1827,9 @@ class _MapViewState extends State<MapView>
     }
 
     _pauseLocationFollowing();
+    // A camera command may have re-flagged the gesture: consume the
+    // rebase before deciding whether this update steps a zoom level.
+    _consumeGestureRebase();
     // Zoom steps are discrete, user-visible transitions (snapshot capture,
     // focal anchoring, re-baselining): they must run at their own event so
     // the step timing and anchors stay identical with and without
@@ -1823,6 +1846,11 @@ class _MapViewState extends State<MapView>
       // First update of this frame — or a zoom step: apply immediately.
       _scaleAppliedSinceFrame = true;
       _applyScaleUpdate(manager, details);
+      // Re-arm the per-frame slot at the next real frame boundary even
+      // when nothing was deferred: otherwise the slot stays occupied
+      // until some later flush runs, and the first input of a later
+      // frame would be delayed for no reason.
+      _scheduleScaleFlush();
     } else {
       // Bursts within one frame coalesce to their latest event; the
       // cumulative scale and latest focal point are preserved because
@@ -1830,6 +1858,54 @@ class _MapViewState extends State<MapView>
       _pendingScaleUpdate = details;
       _scheduleScaleFlush();
     }
+  }
+
+  /// A camera command (controller move/zoom, wheel, host echo, follow
+  /// retarget) owns the camera: drop any still-queued gesture update and
+  /// mark the active gesture for rebasing onto whatever the camera is
+  /// when the gesture next applies. Without the rebase, the next applied
+  /// update pans/zooms from the gesture's pre-command baseline and jumps
+  /// the camera back to its trajectory.
+  void _rebaseGestureOntoCamera() {
+    final pending = _pendingScaleUpdate;
+    _pendingScaleUpdate = null;
+    if (_scaleStartZoom == null || _scaleStartFocal == null) return;
+    // The dropped update is the freshest gesture state known.
+    if (pending != null) {
+      _lastAppliedGestureFocal = pending.localFocalPoint;
+      _lastAppliedGestureScale = pending.scale;
+    }
+    _gestureNeedsRebase = true;
+  }
+
+  /// Refreshes the active gesture's anchors from the current camera.
+  /// Runs lazily — right before the gesture applies again — so animated
+  /// commands and follow retargets land however the camera ended up.
+  void _consumeGestureRebase() {
+    if (!_gestureNeedsRebase) return;
+    _gestureNeedsRebase = false;
+    final manager = _tileManager;
+    if (manager == null) return;
+    _scaleStartTileLng = manager.centerTileLng;
+    _scaleStartTileLat = manager.centerTileLat;
+    final focal = _lastAppliedGestureFocal;
+    if (focal != null) {
+      _scaleStartFocal = focal;
+      _lastFractionalFocal = focal;
+    }
+    final scale = _lastAppliedGestureScale ?? 1;
+    if (scale.isFinite && scale > 0) {
+      // Map the recognizer's cumulative scale onto the current zoom so
+      // quantization continues around the camera the command set: at
+      // [scale], the next update must land exactly on [manager.zoom].
+      _scaleStartZoom = (manager.zoom - math.log(scale) / math.ln2).round();
+      final startCameraZoom = _scaleStartCameraZoom;
+      if (startCameraZoom != null) {
+        _scaleStartCameraZoom =
+            manager.cameraZoom - math.log(scale) / math.ln2;
+      }
+    }
+    _pinchZoomDirection = 0;
   }
 
   /// Whether applying [details] on the integer-zoom path would cross a
@@ -1873,6 +1949,7 @@ class _MapViewState extends State<MapView>
   }
 
   void _applyScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
+    _consumeGestureRebase();
     final startZoom = _scaleStartZoom;
     final startFocal = _scaleStartFocal;
     if (startZoom == null ||
@@ -1882,6 +1959,8 @@ class _MapViewState extends State<MapView>
       return;
     }
     final focalLocal = details.localFocalPoint;
+    _lastAppliedGestureFocal = focalLocal;
+    _lastAppliedGestureScale = details.scale;
     if (_usesFractionalZoom) {
       final delta = focalLocal - (_lastFractionalFocal ?? focalLocal);
       manager.setCenterFromTileCoords(
@@ -1990,6 +2069,9 @@ class _MapViewState extends State<MapView>
     _scaleStartCameraZoom = null;
     _lastFractionalFocal = null;
     _scaleStartFocal = null;
+    _lastAppliedGestureFocal = null;
+    _lastAppliedGestureScale = null;
+    _gestureNeedsRebase = false;
     final wasPanning = _interacting &&
         !_gestureHadMultiplePointers &&
         !_gestureCancelled &&

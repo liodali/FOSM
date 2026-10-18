@@ -406,6 +406,79 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('camera commands cancel queued gesture updates and rebase',
+      (tester) async {
+    final controller = MapController();
+    await _mount(tester, controller);
+    final gestures = tester.widget<GestureDetector>(find.descendant(
+        of: find.byType(MapView),
+        matching: find.byWidgetPredicate((widget) =>
+            widget is GestureDetector && widget.onScaleStart != null)));
+    const start = Offset(400, 300);
+
+    gestures
+        .onScaleStart!(ScaleStartDetails(focalPoint: start, pointerCount: 1));
+    // Two updates in one frame: the first applies, the second queues.
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(10, 0), scale: 1, pointerCount: 1));
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(20, 0), scale: 1, pointerCount: 1));
+
+    // A newer camera command must win over the still-queued update: the
+    // next frame may not jump back to the gesture's trajectory.
+    controller.moveTo(const LatLng(latitude: 0.05, longitude: 0.05),
+        animate: false);
+    await tester.pump();
+    final after = controller.center!;
+    expect(after.latitude, closeTo(0.05, 1e-9));
+    expect(after.longitude, closeTo(0.05, 1e-9));
+
+    // The still-active gesture continues from the commanded camera: the
+    // next update pans by the 10px since the re-based anchor, not by the
+    // 30px a stale pre-command baseline would apply.
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(30, 0), scale: 1, pointerCount: 1));
+    await tester.pump();
+    final continued = controller.center!;
+    expect(continued.longitude, lessThan(after.longitude),
+        reason: 'the drag must still pan west');
+    expect(after.longitude - continued.longitude, lessThan(0.45),
+        reason: 'a stale gesture baseline would jump back by ~1.3 degrees');
+    expect(continued.latitude, closeTo(after.latitude, 1e-9));
+    gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('sparse input on a later frame applies immediately',
+      (tester) async {
+    final controller = MapController();
+    await _mount(tester, controller);
+    final gestures = tester.widget<GestureDetector>(find.descendant(
+        of: find.byType(MapView),
+        matching: find.byWidgetPredicate((widget) =>
+            widget is GestureDetector && widget.onScaleStart != null)));
+    const start = Offset(400, 300);
+
+    gestures
+        .onScaleStart!(ScaleStartDetails(focalPoint: start, pointerCount: 1));
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(10, 0), scale: 1, pointerCount: 1));
+    // A frame boundary passes with nothing queued.
+    await tester.pump();
+
+    // The first input of a later frame must apply immediately — not wait
+    // for a flush that has nothing to do.
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(30, 0), scale: 1, pointerCount: 1));
+    final center = controller.center!;
+    expect(center.longitude, lessThan(-1.0),
+        reason: 'the full 30px drag must already be applied synchronously');
+    gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('multi-level zoom animation scales by the full zoom delta',
       (tester) async {
     final controller = MapController();
