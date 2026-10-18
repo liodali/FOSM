@@ -3,8 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter_test/flutter_test.dart';
-import 'package:fosm/src/api/geo_point.dart';
+import 'package:flutter_test/flutter_test.dart';import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -1103,6 +1102,84 @@ void main() {
       expect(manager.revision, greaterThan(revision));
 
       manager.dispose();
+    });
+  });
+
+  group('camera-only grid updates', () {
+    test('sub-tile motion refreshes anchors without rebuilding slots', () {
+      final manager = TileManager.init(
+        width: 800,
+        height: 600,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 4,
+        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      final tilesBefore = manager.renderTiles.toList();
+      final revision = manager.revision;
+      final generation = manager.generation;
+      final anchorBefore = manager.leftColumnTilesCanvasX;
+      expect(tilesBefore, isNotEmpty);
+
+      // Sub-tile pan: the same window still covers the viewport, so this
+      // must stay a camera-only update — no slot, job or cache churn.
+      manager.setCenterFromTileCoords(
+          manager.centerTileLng + 0.25, manager.centerTileLat);
+      manager.calculate();
+
+      expect(manager.generation, generation,
+          reason: 'demand priority must not be invalidated by sub-tile motion');
+      expect(manager.revision, revision);
+      expect(manager.renderTiles.length, tilesBefore.length);
+      for (var i = 0; i < tilesBefore.length; i++) {
+        expect(identical(manager.renderTiles[i], tilesBefore[i]), isTrue,
+            reason: 'slot ${tilesBefore[i].index} must keep its descriptor');
+      }
+      // Paint anchors still track the camera for the painter.
+      expect(manager.leftColumnTilesCanvasX, lessThan(anchorBefore),
+          reason: 'anchors must follow the pan');
+
+      // Crossing into a new column reconciles: fresh descriptors and a
+      // generation/revision bump for the new demand.
+      manager.setCenterFromTileCoords(
+          manager.centerTileLng + 1, manager.centerTileLat);
+      manager.calculate();
+
+      expect(manager.generation, greaterThan(generation));
+      expect(manager.revision, greaterThan(revision));
+      expect(
+        manager.renderTiles.every((tile) =>
+            !tilesBefore.any((old) => identical(old, tile))),
+        isTrue,
+        reason: 'a membership change rebuilds every slot descriptor',
+      );
+    });
+
+    test('viewport growth reconciles the wider window', () {
+      final manager = TileManager.init(
+        width: 512,
+        height: 512,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 3,
+        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      final countBefore = manager.renderTiles.length;
+      final generation = manager.generation;
+
+      manager.resize(const ui.Size(1024, 512));
+      manager.calculate();
+
+      expect(manager.renderTiles.length, greaterThan(countBefore));
+      expect(manager.generation, greaterThan(generation));
     });
   });
 

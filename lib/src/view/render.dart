@@ -12,9 +12,11 @@ import 'package:fosm/src/vector/render/label_overlay.dart';
 /// drawn as a subtle checkerboard placeholder (matching the original JS
 /// implementation).
 ///
-/// The [revision] counter (bumped by [TileManager] on every visible
-/// change) drives [shouldRepaint] — much cheaper than comparing image
-/// references one by one.
+/// The [revision] counter (bumped by [TileManager] on content/membership
+/// changes) plus the canvas anchors and [tileScale] drive
+/// [shouldRepaint] — much cheaper than comparing image references one by
+/// one, while camera-only motion (no revision bump) still repaints at its
+/// new position.
 class RenderCanvasOSM extends CustomPainter {
   final int horizontalTileCount;
   final int verticalTileCount;
@@ -142,6 +144,8 @@ class RenderCanvasOSM extends CustomPainter {
   bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) =>
       oldDelegate.revision != revision ||
       oldDelegate.tileScale != tileScale ||
+      oldDelegate.leftColumnTilesCanvasX != leftColumnTilesCanvasX ||
+      oldDelegate.topRowTilesCanvasY != topRowTilesCanvasY ||
       oldDelegate.paintBackground != paintBackground ||
       oldDelegate.paintPlaceholders != paintPlaceholders;
 }

@@ -228,14 +228,14 @@ class TileManager with CacheTiles {
   /// Keys of currently visible, valid-world slots.
   final Set<String> _visibleKeys = {};
 
-  /// Grid signature used to bump [revision]/[generation] only when the
-  /// camera or viewport geometry really changed.
-  double _calcCenterLng = double.nan;
-  double _calcCenterLat = double.nan;
+  /// Membership signature of the last reconciled grid. Sub-tile camera
+  /// motion that keeps this signature unchanged only refreshes paint
+  /// anchors instead of rebuilding slots, jobs and cache keys.
   int _calcZoom = -1;
-  double _calcCameraZoom = -1;
-  double _calcWidth = double.nan;
-  double _calcHeight = double.nan;
+  int _calcLeftLng = 0;
+  int _calcTopLat = 0;
+  int _calcHCount = -1;
+  int _calcVCount = -1;
 
   // ── Generation-aware scheduler (Phase 2) ────────────────────────────
   //
@@ -697,35 +697,31 @@ class TileManager with CacheTiles {
 
   // ── Grid computation ────────────────────────────────────────────────
 
-  /// Rebuilds the visible tile grid. Cheap and synchronous — call on
-  /// every pan frame.
+  /// Reconciles the camera with the tile grid. Cheap and synchronous —
+  /// call on every pan frame.
   ///
-  /// Recalculation is idempotent and has a real unchanged-grid fast path:
-  /// when the camera/zoom/viewport geometry has not moved it returns
-  /// immediately without clearing the grid, recreating jobs, sorting, or
+  /// Two tiers keep motion affordable:
+  ///
+  /// * Camera/paint anchors (`leftColumnTilesCanvasX`,
+  ///   `topRowTilesCanvasY`, …) recompute from the live camera on every
+  ///   call — a handful of arithmetic operations.
+  /// * Slot membership — which source tiles cover the viewport at this
+  ///   zoom, viewport size and padding — reconciles only when it actually
+  ///   changes. While the same window covers the viewport, sub-tile
+  ///   motion keeps the existing descriptors, queued jobs, cache keys,
+  ///   [generation] and [revision] untouched, so panning neither
+  ///   reallocates the grid nor reprioritises in-flight work.
+  ///
+  /// Recalculation stays idempotent: an unchanged camera returns after the
+  /// anchor refresh without clearing the grid, recreating jobs, sorting, or
   /// pumping the scheduler. Tile completions update the existing grid in
   /// place, and failure/backoff retries are driven by timers, so neither
   /// needs a recalculation to make progress.
   ///
-  /// Only an actual geometry change bumps [revision]/[generation] and
+  /// Only an actual membership change bumps [revision]/[generation] and
   /// rebuilds.
   void calculate() {
     if (_disposed) return;
-
-    final gridChanged = _calcCenterLng != centerTileLng ||
-        _calcCenterLat != centerTileLat ||
-        _calcZoom != zoom ||
-        _calcCameraZoom != cameraZoom ||
-        _calcWidth != width ||
-        _calcHeight != height;
-    _calcCenterLng = centerTileLng;
-    _calcCenterLat = centerTileLat;
-    _calcZoom = zoom;
-    _calcCameraZoom = cameraZoom;
-    _calcWidth = width;
-    _calcHeight = height;
-    if (!gridChanged) return;
-    _generation++;
 
     final centerPointTileX = (centerTileLng % 1) * renderedTileWidth;
     final centerPointTileY = (centerTileLat % 1) * renderedTileHeight;
@@ -779,6 +775,22 @@ class TileManager with CacheTiles {
     topRowTilesLatIndex = paddedTopLat;
     leftColumnTilesCanvasX = paddedLeftCanvasX;
     topRowTilesCanvasY = paddedTopCanvasY;
+
+    // Camera-only update: the same window still covers the viewport, so
+    // the anchors refreshed above are all that changed. Keep the existing
+    // descriptors, jobs, cache keys, generation and revision.
+    final membershipChanged = _calcZoom != zoom ||
+        _calcLeftLng != leftColumnTilesLngIndex ||
+        _calcTopLat != topRowTilesLatIndex ||
+        _calcHCount != horizontalTileCount ||
+        _calcVCount != verticalTileCount;
+    if (!membershipChanged) return;
+    _calcZoom = zoom;
+    _calcLeftLng = leftColumnTilesLngIndex;
+    _calcTopLat = topRowTilesLatIndex;
+    _calcHCount = horizontalTileCount;
+    _calcVCount = verticalTileCount;
+    _generation++;
 
     _memoryCache.setActiveKeys({
       for (var h = 0; h < horizontalTileCount; h++)
