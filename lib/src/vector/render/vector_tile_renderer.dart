@@ -403,7 +403,9 @@ class VectorTileRenderer {
         : 0.0;
 
     // Batch key → (color, opacity, path). Static layers collapse to one.
-    final groups = <int, _FillBatch>{};
+    // A record key avoids `(argb << 8)` packing, which overflows 32 bits on
+    // dart2js and could merge distinct colors into one batch.
+    final groups = <(int, int), _FillBatch>{};
 
     for (final feature in data.features) {
       yield null;
@@ -427,7 +429,7 @@ class VectorTileRenderer {
         if (opacity <= 0) continue;
       }
 
-      final key = (color.toARGB32() << 8) | (opacity * 100).round();
+      final key = (color.toARGB32(), (opacity * 100).round());
       final batch = groups.putIfAbsent(key, () => _FillBatch(color, opacity));
       yield* _addPartsChunks(
         batch.path,

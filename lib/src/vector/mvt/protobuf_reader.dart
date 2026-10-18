@@ -22,18 +22,42 @@ class ProtobufReader {
   bool get hasMore => _pos < _end;
 
   /// Reads a base-128 varint (up to 64 bits).
+  ///
+  /// Bytes below bit 28 use shifts/OR like before; higher bytes are folded
+  /// in with exact power-of-two multiplication because dart2js truncates
+  /// `<<` to 32 bits and returns *unsigned* results for `|`, which would
+  /// silently corrupt every varint larger than four bytes on the web.
   int readVarint() {
     var result = 0;
     var shift = 0;
     while (true) {
       _requireBytes(1);
       final byte = _data[_pos++];
-      result |= (byte & 0x7F) << shift;
+      final bits = byte & 0x7F;
+      if (shift < 28) {
+        result |= bits << shift;
+      } else {
+        result += bits * _highByteScale(shift);
+      }
       if (byte & 0x80 == 0) return result;
       shift += 7;
       if (shift >= 64) throw const FormatException('varint too long');
     }
   }
+
+  /// Exact powers of two for the high varint bytes (shifts ≥ 28). All are
+  /// exactly representable as doubles, so web and native agree up to 2^53;
+  /// the final byte wraps like a 64-bit two's-complement overflow on the VM.
+  static int _highByteScale(int shift) => switch (shift) {
+        28 => 268435456,             // 2^28
+        35 => 34359738368,           // 2^35
+        42 => 4398046511104,         // 2^42
+        49 => 562949953421312,       // 2^49
+        56 => 72057594037927936,     // 2^56
+        // 2^63 via exact factors: wraps to min int64 on the VM (protobuf
+        // two's-complement wrap) and is exact as a double on the web.
+        _ => 8 * 268435456 * 268435456 * 268435456,
+      };
 
   /// Reads a 4-byte little-endian float (wire type 5).
   double readFloat32() {

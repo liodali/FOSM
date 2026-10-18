@@ -46,6 +46,58 @@ void main() {
       expect(ring[9], 0);
     });
 
+    test('decodes rings with negative deltas on both axes', () {
+      // Regression for dart2js: `(v >> 1) ^ -(v & 1)` returns unsigned
+      // 32-bit results on the web, turning every negative delta into
+      // `2^32 + delta` and mirroring/corrupting all vector geometry.
+      final builder = MvtBuilder()
+        ..addLayer(
+          name: 'water',
+          features: [
+            TestFeature(
+              id: 1,
+              type: TestGeomType.polygon,
+              geometryCommands: polygonRingCommands(
+                const [(2048, 2048), (512, 2048), (512, 3584), (2048, 3584)],
+              ),
+            ),
+          ],
+        );
+      final tile = decodeVectorTile(builder.build());
+      final ring = tile.layers.single.features.single.geometry.single;
+
+      expect(
+        ring,
+        Float32List.fromList(
+            [2048, 2048, 512, 2048, 512, 3584, 2048, 3584, 2048, 2048]),
+      );
+    });
+
+    test('decodes feature ids and int values above 2^31', () {
+      // Regression for dart2js: `<<` truncates to 32 bits, so five-byte
+      // varints (values ≥ 2^28) decoded incorrectly on the web.
+      const big = 2147483653; // 2^31 + 5, exactly representable as double.
+      final builder = MvtBuilder()
+        ..addLayer(
+          name: 'places',
+          keys: const ['population'],
+          values: const [big],
+          features: [
+            TestFeature(
+              id: big,
+              type: TestGeomType.point,
+              tags: const [0, 0],
+              geometryCommands: pointCommands(10, 20),
+            ),
+          ],
+        );
+      final tile = decodeVectorTile(builder.build());
+      final feature = tile.layers.single.features.single;
+
+      expect(feature.id, big);
+      expect(feature.properties, {'population': big});
+    });
+
     test('decodes point and linestring geometry', () {
       final tile = decodeVectorTile(buildTestTile());
       final features = tile.layers.single.features;

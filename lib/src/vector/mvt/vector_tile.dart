@@ -610,4 +610,11 @@ Future<List<Float32List>> _decodeGeometryAsync(
   return parts;
 }
 
-int _zigzag(int value) => (value >> 1) ^ -(value & 1);
+/// Decodes zigzag encoding. Deliberately avoids `^`: dart2js returns
+/// *unsigned* 32-bit results from bitwise operators, which turned every
+/// negative geometry delta into `2^32 + delta` and mirrored/corrupted all
+/// vector geometry on the web.
+int _zigzag(int value) {
+  final half = value ~/ 2;
+  return (value & 1) == 0 ? half : -half - 1;
+}
