@@ -30,7 +30,11 @@ Future<Uint8List> _png(WidgetTester tester) async {
 
 Future<void> _ready(WidgetTester tester) async {
   final watch = Stopwatch()..start();
-  while (watch.elapsed < const Duration(seconds: 5)) {
+  // Paced tile publication advances one scheduler frame per pump, so the
+  // budget must tolerate a loaded test machine (parallel suite files),
+  // not just an idle one. Ten seconds is still a hang detector: a healthy
+  // paced load finishes in well under two.
+  while (watch.elapsed < const Duration(seconds: 10)) {
     await tester.runAsync(() => Future<void>.delayed(Duration.zero));
     await tester.pump();
     final grids = _grids(tester);
@@ -42,11 +46,22 @@ Future<void> _ready(WidgetTester tester) async {
   fail('Tile grid did not load within five seconds');
 }
 
+/// Shrinks the surface so a full grid is a handful of tiles: paced
+/// publication starts at most two images per frame, and a default-sized
+/// grid (dozens of tiles) makes this wall-clock-bounded file flaky when
+/// the whole suite loads the machine in parallel.
+void _smallViewport(WidgetTester tester) {
+  tester.view.physicalSize = const ui.Size(360, 240);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+}
+
 void main() {
   for (final blocked in [false, true]) {
     testWidgets(
         'fractional zoom releases pinned fallback on ${blocked ? 'movement timeout' : 'replacement readiness'}',
         (tester) async {
+      _smallViewport(tester);
       final png = await _png(tester);
       final controller = MapController();
       await tester.pumpWidget(MaterialApp(
@@ -88,6 +103,7 @@ void main() {
         'zero-budget zoom releases snapshot on '
         '${interrupt ? 'instant interruption' : 'animation completion'}',
         (tester) async {
+      _smallViewport(tester);
       final png = await _png(tester);
       final controller = MapController();
       await tester.pumpWidget(MaterialApp(
