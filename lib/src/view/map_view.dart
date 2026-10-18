@@ -798,7 +798,11 @@ class _MapViewState extends State<MapView>
   // level regardless of how many intermediate updates were delivered.
   double? _scaleStartTileLng;
   double? _scaleStartTileLat;
-  int? _scaleStartZoom;
+  /// Zoom baseline for gesture quantization, as a continuous value: the
+  /// rebased baseline keeps its fractional offset (at scale √2 a command
+  /// zoom of 8 rebases to 7.5, so repeating the unchanged scale lands on
+  /// 8 exactly) and only the resulting zoom is quantized.
+  double? _scaleStartZoom;
   Offset? _scaleStartFocal;
 
   /// Last zoom direction, used to damp reversals around a rounding boundary.
@@ -1805,7 +1809,7 @@ class _MapViewState extends State<MapView>
 
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
-    _scaleStartZoom = manager.zoom;
+    _scaleStartZoom = manager.zoom.toDouble();
     _scaleStartFocal = details.localFocalPoint;
     _pinchZoomDirection = 0;
     _pinchTransitionActive = false;
@@ -1886,6 +1890,21 @@ class _MapViewState extends State<MapView>
     _gestureNeedsRebase = false;
     final manager = _tileManager;
     if (manager == null) return;
+    // Direct manipulation resumed after a command: it owns the camera now,
+    // so any animation the command started must stop before its next tick
+    // overwrites the drag. (Same teardown as a fresh gesture start.)
+    if (_isAnimating) {
+      _animController.stop();
+      _animWaitTimer?.cancel();
+      _animWaitTimer = null;
+      _clearZoomSnapshot();
+      _animWaitingTiles = false;
+      _pinchTransitionActive = false;
+      _visualScale = 1.0;
+    }
+    _stopPanAnimation();
+    _stopFractionalAnimation();
+    _fractionalSnapshotTimer?.cancel();
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
     final focal = _lastAppliedGestureFocal;
@@ -1898,7 +1917,7 @@ class _MapViewState extends State<MapView>
       // Map the recognizer's cumulative scale onto the current zoom so
       // quantization continues around the camera the command set: at
       // [scale], the next update must land exactly on [manager.zoom].
-      _scaleStartZoom = (manager.zoom - math.log(scale) / math.ln2).round();
+      _scaleStartZoom = manager.zoom - math.log(scale) / math.ln2;
       final startCameraZoom = _scaleStartCameraZoom;
       if (startCameraZoom != null) {
         _scaleStartCameraZoom =

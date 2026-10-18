@@ -479,6 +479,99 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('rebasing preserves the fractional pinch baseline',
+      (tester) async {
+    final controller = MapController();
+    // Default zoom limits: the potential extra step (zoom 9) must not be
+    // masked by clamping.
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: _origin,
+      zoom: 5,
+      controller: controller,
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    final gestures = tester.widget<GestureDetector>(find.descendant(
+        of: find.byType(MapView),
+        matching: find.byWidgetPredicate((widget) =>
+            widget is GestureDetector && widget.onScaleStart != null)));
+    const focal = Offset(400, 300);
+    // log₂ of this scale is 0.4999999999999992 — just under half a zoom
+    // level. Chosen at a several-ulp margin so platform log differences
+    // cannot flip it.
+    const unchangedScale = 1.4142135623730943;
+
+    // The pinch is already at this scale when a command sets zoom 8.
+    gestures
+        .onScaleStart!(ScaleStartDetails(focalPoint: focal, pointerCount: 2));
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: focal, scale: unchangedScale, pointerCount: 2));
+    await tester.pump();
+    expect(controller.zoom, 5, reason: 'the pinch itself must not step');
+
+    controller.setZoom(8, animate: false);
+
+    // Repeating the unchanged scale must land exactly on 8: a baseline
+    // rounded up to 8 would produce exactly 8.5 → zoom 9.
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: focal, scale: unchangedScale, pointerCount: 2));
+    await tester.pump();
+    expect(controller.zoom, 8,
+        reason: 'a rounded baseline would turn the unchanged scale into '
+            'an extra zoom step');
+
+    gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('resumed dragging cancels a command animation',
+      (tester) async {
+    final controller = MapController();
+    await _mount(tester, controller);
+    final gestures = tester.widget<GestureDetector>(find.descendant(
+        of: find.byType(MapView),
+        matching: find.byWidgetPredicate((widget) =>
+            widget is GestureDetector && widget.onScaleStart != null)));
+    const start = Offset(400, 300);
+
+    // Finger down and already dragging.
+    gestures
+        .onScaleStart!(ScaleStartDetails(focalPoint: start, pointerCount: 1));
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(10, 0), scale: 1, pointerCount: 1));
+    await tester.pump();
+
+    // An animated camera command starts while the finger stays down.
+    controller.moveTo(const LatLng(latitude: 0.2, longitude: 0.2),
+        animate: true);
+    await tester.pump(); // start the animation ticker
+    await tester.pump(const Duration(milliseconds: 175));
+    final mid = controller.center!;
+    expect(mid.latitude, greaterThan(0.01),
+        reason: 'the animation should be moving the camera meanwhile');
+
+    // The drag resumes: direct manipulation owns the camera, the
+    // animation must stop instead of overwriting the drag on later ticks.
+    gestures.onScaleUpdate!(ScaleUpdateDetails(
+        focalPoint: start + const Offset(20, 0), scale: 1, pointerCount: 1));
+    await tester.pump();
+    final resumed = controller.center!;
+    await tester.pump(const Duration(milliseconds: 350));
+    final settled = controller.center!;
+    expect(settled.latitude, closeTo(resumed.latitude, 1e-9),
+        reason: 'animation ticks must not keep overwriting the drag');
+    expect(settled.longitude, closeTo(resumed.longitude, 1e-9));
+    expect(settled.latitude, lessThan(0.15),
+        reason: 'the camera must not have reached the animation target');
+
+    gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pump();
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('multi-level zoom animation scales by the full zoom delta',
       (tester) async {
     final controller = MapController();
