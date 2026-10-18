@@ -25,6 +25,7 @@ import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/vector/render/label_overlay.dart';
 import 'package:fosm/src/vector/render/sprite_atlas.dart';
 import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
+import 'vector_trace.dart';
 
 /// A parsed source tile, shared by every logical tile that over-zooms from
 /// it (e.g. four z15 tiles reading one z14 source tile parse it once).
@@ -409,7 +410,8 @@ class VectorTileRuntime {
       final ParsedVectorTile parsed;
       try {
         parsed = _parsedTileFor(coord) ??
-            await _parseAndStoreDedup(bytes, coord, z, x, y);
+            await VectorTrace.async(
+                'parseWait', () => _parseAndStoreDedup(bytes, coord, z, x, y));
       } on TileDecodeAborted {
         rethrow;
       } on VectorTileCancelled {
@@ -474,23 +476,25 @@ class VectorTileRuntime {
 
       // Use the time-budgeted renderer. It cooperatively yields between
       // layers, features, and large geometry batches on every platform.
-      final picture = await VectorTileRenderer(loaded).renderAsync(
-        decoded: parsed.decoded,
-        srcZ: parsed.srcZ,
-        z: z,
-        x: x,
-        y: y,
-        rasterTiles: rasterImages,
-        rasterCoords: rasterCoords,
-        isRelevant: () => _isRelevant(z, x, y),
-        yieldBudget: workScheduler == null
-            ? VectorTileRenderer.defaultYieldBudget
-            : Duration.zero,
-        yieldControl: workScheduler == null
-            ? null
-            : () => workScheduler!
-                .checkpoint(isRelevant: () => _isRelevant(z, x, y)),
-      );
+      final picture = await VectorTrace.async(
+          'record',
+          () => VectorTileRenderer(loaded).renderAsync(
+                decoded: parsed.decoded,
+                srcZ: parsed.srcZ,
+                z: z,
+                x: x,
+                y: y,
+                rasterTiles: rasterImages,
+                rasterCoords: rasterCoords,
+                isRelevant: () => _isRelevant(z, x, y),
+                yieldBudget: workScheduler == null
+                    ? VectorTileRenderer.defaultYieldBudget
+                    : Duration.zero,
+                yieldControl: workScheduler == null
+                    ? null
+                    : () => workScheduler!
+                        .checkpoint(isRelevant: () => _isRelevant(z, x, y)),
+              ));
       try {
         // Skip the `toImage` snapshot too if the tile went stale while
         // rendering — it is the single most expensive stage.
@@ -503,13 +507,17 @@ class VectorTileRuntime {
         // `toImage` (the single most expensive stage) for a stale tile.
         _checkRelevant(z, x, y);
         final scheduler = workScheduler;
-        final image = scheduler == null
-            ? await picture.toImage(256, 256)
-            : await scheduler.image(
-                () => picture.toImage(256, 256),
-                priority: () => tilePriority?.call(z, x, y) ?? 0,
-                isRelevant: () => _isRelevant(z, x, y),
-              );
+        Future<ui.Image> snapshot() =>
+            VectorTrace.async('toImage', () => picture.toImage(256, 256));
+        final image = await VectorTrace.async(
+            'imageWait',
+            () => scheduler == null
+                ? snapshot()
+                : scheduler.image(
+                    snapshot,
+                    priority: () => tilePriority?.call(z, x, y) ?? 0,
+                    isRelevant: () => _isRelevant(z, x, y),
+                  ));
         // Publish the base image immediately. Label preparation runs on a
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness

@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import '../vector/mvt/vector_tile.dart';
+import '../vector/render/vector_trace.dart';
 
 /// Decodes raw MVT bytes into a [DecodedVectorTile].
 ///
@@ -20,14 +21,17 @@ Future<DecodedVectorTile> decodeMvtAsync(
   bool Function()? isRelevant,
 }) async {
   if (!useIsolate) {
-    return decodeVectorTile(bytes, sourceLayers: sourceLayers);
+    return VectorTrace.sync(
+        'parse', () => decodeVectorTile(bytes, sourceLayers: sourceLayers));
   }
   if (kIsWeb) {
-    return decodeVectorTileAsync(
-      bytes,
-      sourceLayers: sourceLayers,
-      isRelevant: isRelevant,
-    );
+    return VectorTrace.async(
+        'parseCooperative',
+        () => decodeVectorTileAsync(
+              bytes,
+              sourceLayers: sourceLayers,
+              isRelevant: isRelevant,
+            ));
   }
   return compute(
     decodeMvtRequest,

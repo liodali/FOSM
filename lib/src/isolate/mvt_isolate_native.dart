@@ -3,6 +3,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:fosm/src/vector/mvt/vector_tile.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// Persistent MVT decode isolate (native implementation).
 ///
@@ -66,7 +67,8 @@ class MvtIsolate {
       throw StateError('MvtIsolate not ready — call spawn() first');
     }
     final responsePort = ReceivePort();
-    _sendPort!.send([responsePort.sendPort, bytes, sourceLayers]);
+    VectorTrace.sync('parseDispatch',
+        () => _sendPort!.send([responsePort.sendPort, bytes, sourceLayers]));
     return responsePort.first.then((response) {
       responsePort.close();
       if (response is DecodedVectorTile) return response;
@@ -98,9 +100,9 @@ class MvtIsolate {
       final sourceLayers = parts[2] as Set<String>?;
 
       try {
-        replyPort.send(
-          decodeVectorTile(bytes, sourceLayers: sourceLayers),
-        );
+        final decoded = VectorTrace.sync(
+            'parse', () => decodeVectorTile(bytes, sourceLayers: sourceLayers));
+        VectorTrace.sync('parseReply', () => replyPort.send(decoded));
       } catch (e) {
         replyPort.send(e.toString());
       }

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import '../mvt/vector_tile.dart';
@@ -7,6 +6,7 @@ import '../style/css_color.dart';
 import '../style/expression.dart';
 import '../style/map_style.dart';
 import '../style/style_loader.dart';
+import 'vector_trace.dart';
 
 /// Maps source-layer coordinates (0..extent of the *source* tile) to pixel
 /// coordinates inside the 256px tile being rendered, including the
@@ -193,7 +193,13 @@ class VectorTileRenderer {
             continue;
         }
 
-        for (final _ in chunks) {
+        // Sync spans end before awaiting a frame; their duration excludes
+        // scheduler waits. Layer id identifies style-heavy vs geometry-heavy
+        // work when inspecting CPU samples inside a recording chunk.
+        final iterator = chunks.iterator;
+        while (VectorTrace.enabled
+            ? VectorTrace.sync('recordChunk.${layer.id}', iterator.moveNext)
+            : iterator.moveNext()) {
           await maybeYield();
         }
         await maybeYield();
@@ -260,10 +266,10 @@ class VectorTileRenderer {
 
   void _paintBackground(
       ui.Canvas canvas, StyleLayer layer, EvaluationContext ctx) {
-    final color = evaluateColorExpr(layer.paint['background-color'], ctx) ??
+    final color = _styleColor(layer.paint['background-color'], ctx) ??
         const ui.Color(0xFF000000);
     final opacity =
-        evaluateNumExpr(layer.paint['background-opacity'], ctx, fallback: 1)
+        _styleNumber(layer.paint['background-opacity'], ctx, fallback: 1)
             .clamp(0.0, 1.0);
     canvas.drawRect(
       const ui.Rect.fromLTWH(0, 0, tileSize, tileSize),
@@ -288,7 +294,7 @@ class VectorTileRenderer {
     if (image == null || coord == null) return;
 
     final opacity =
-        evaluateNumExpr(layer.paint['raster-opacity'], ctx, fallback: 1)
+        _styleNumber(layer.paint['raster-opacity'], ctx, fallback: 1)
             .clamp(0.0, 1.0);
     if (opacity <= 0) return;
 
@@ -388,7 +394,7 @@ class VectorTileRenderer {
     // A static opacity of 0 retires the layer before any geometry work.
     if (opacityIsStatic) {
       final opacity =
-          evaluateNumExpr(opacityExpr, baseCtx, fallback: 1).clamp(0.0, 1.0);
+          _styleNumber(opacityExpr, baseCtx, fallback: 1).clamp(0.0, 1.0);
       if (opacity <= 0) return;
     }
 
@@ -396,10 +402,10 @@ class VectorTileRenderer {
     final bounds = const ui.Rect.fromLTWH(-4, -4, tileSize + 8, tileSize + 8);
 
     final staticColor = colorIsStatic
-        ? (evaluateColorExpr(colorExpr, baseCtx) ?? const ui.Color(0xFF000000))
+        ? (_styleColor(colorExpr, baseCtx) ?? const ui.Color(0xFF000000))
         : null;
     final staticOpacity = opacityIsStatic
-        ? evaluateNumExpr(opacityExpr, baseCtx, fallback: 1).clamp(0.0, 1.0)
+        ? _styleNumber(opacityExpr, baseCtx, fallback: 1).clamp(0.0, 1.0)
         : 0.0;
 
     // Batch key → (color, opacity, path). Static layers collapse to one.
@@ -414,7 +420,7 @@ class VectorTileRenderer {
         zoom: baseCtx.zoom,
         properties: feature.properties,
       );
-      if (!matchesFilter(layer.filter, featureCtx)) continue;
+      if (!_styleFilter(layer.filter, featureCtx)) continue;
 
       final ui.Color color;
       final double opacity;
@@ -422,10 +428,10 @@ class VectorTileRenderer {
         color = staticColor;
         opacity = staticOpacity;
       } else {
-        color = evaluateColorExpr(colorExpr, featureCtx) ??
-            const ui.Color(0xFF000000);
-        opacity = evaluateNumExpr(opacityExpr, featureCtx, fallback: 1)
-            .clamp(0.0, 1.0);
+        color =
+            _styleColor(colorExpr, featureCtx) ?? const ui.Color(0xFF000000);
+        opacity =
+            _styleNumber(opacityExpr, featureCtx, fallback: 1).clamp(0.0, 1.0);
         if (opacity <= 0) continue;
       }
 
@@ -539,7 +545,7 @@ class VectorTileRenderer {
         zoom: baseCtx.zoom,
         properties: feature.properties,
       );
-      if (!matchesFilter(layer.filter, featureCtx)) continue;
+      if (!_styleFilter(layer.filter, featureCtx)) continue;
 
       final ui.Color color;
       final double opacity, width;
@@ -548,12 +554,12 @@ class VectorTileRenderer {
         opacity = staticOpacity;
         width = staticWidthValue;
       } else {
-        color = evaluateColorExpr(colorExpr, featureCtx) ??
-            const ui.Color(0xFF000000);
-        opacity = evaluateNumExpr(opacityExpr, featureCtx, fallback: 1)
-            .clamp(0.0, 1.0);
-        width = evaluateNumExpr(widthExpr, featureCtx, fallback: 1)
-            .clamp(0.0, 100.0);
+        color =
+            _styleColor(colorExpr, featureCtx) ?? const ui.Color(0xFF000000);
+        opacity =
+            _styleNumber(opacityExpr, featureCtx, fallback: 1).clamp(0.0, 1.0);
+        width =
+            _styleNumber(widthExpr, featureCtx, fallback: 1).clamp(0.0, 100.0);
         if (opacity <= 0 || width <= 0) continue;
       }
 
@@ -577,7 +583,8 @@ class VectorTileRenderer {
         ..strokeCap = cap
         ..strokeJoin = join;
       if (hasDash && batch.width >= 0.5) {
-        _drawDashed(canvas, batch.path, paint, dashRaw, batch.width);
+        yield* _traceChunks('dash',
+            _drawDashedChunks(canvas, batch.path, paint, dashRaw, batch.width));
       } else {
         canvas.drawPath(batch.path, paint);
       }
@@ -671,19 +678,19 @@ class VectorTileRenderer {
         zoom: baseCtx.zoom,
         properties: feature.properties,
       );
-      if (!matchesFilter(layer.filter, featureCtx)) continue;
+      if (!_styleFilter(layer.filter, featureCtx)) continue;
 
       double opacity = staticOpacity, radius = staticRadius;
       ui.Color color = staticColor;
       if (dataDriven) {
-        opacity = evaluateNumExpr(layer.paint['circle-opacity'], featureCtx,
+        opacity = _styleNumber(layer.paint['circle-opacity'], featureCtx,
                 fallback: staticOpacity)
             .clamp(0.0, 1.0);
-        radius = evaluateNumExpr(layer.paint['circle-radius'], featureCtx,
+        radius = _styleNumber(layer.paint['circle-radius'], featureCtx,
                 fallback: staticRadius)
             .clamp(0.0, 512.0);
-        color = evaluateColorExpr(layer.paint['circle-color'], featureCtx) ??
-            staticColor;
+        color =
+            _styleColor(layer.paint['circle-color'], featureCtx) ?? staticColor;
         if (opacity <= 0 || radius <= 0) continue;
       }
 
@@ -718,6 +725,16 @@ class VectorTileRenderer {
     TileTransform transform,
     ui.Rect bounds, {
     required bool close,
+  }) =>
+      _traceChunks('geometry',
+          _addPartsWork(path, feature, transform, bounds, close: close));
+
+  Iterable<void> _addPartsWork(
+    ui.Path path,
+    DecodedFeature feature,
+    TileTransform transform,
+    ui.Rect bounds, {
+    required bool close,
   }) sync* {
     var verbs = 0;
     for (final part in feature.geometry) {
@@ -733,7 +750,30 @@ class VectorTileRenderer {
         }
         continue;
       }
-      if (_partOutside(part, transform, bounds)) continue;
+      // Stop scanning as soon as the accumulated bounds overlap. Bounds only
+      // grow, so later vertices cannot make this part eligible for culling.
+      // Entirely off-tile parts still yield while scanning (before any verbs).
+      var minX = double.infinity, minY = double.infinity;
+      var maxX = double.negativeInfinity, maxY = double.negativeInfinity;
+      var outside = true;
+      for (var i = 0; i + 1 < part.length; i += 2) {
+        final px = transform.x(part[i]);
+        final py = transform.y(part[i + 1]);
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        if (maxX >= bounds.left &&
+            minX <= bounds.right &&
+            maxY >= bounds.top &&
+            minY <= bounds.bottom) {
+          outside = false;
+          break;
+        }
+        verbs++;
+        if (verbs % 512 == 0) yield null;
+      }
+      if (outside) continue;
       for (var i = 0; i + 1 < part.length; i += 2) {
         final px = transform.x(part[i]);
         final py = transform.y(part[i + 1]);
@@ -749,32 +789,15 @@ class VectorTileRenderer {
     }
   }
 
-  bool _partOutside(Float32List part, TileTransform transform, ui.Rect bounds) {
-    var minX = double.infinity, minY = double.infinity;
-    var maxX = double.negativeInfinity, maxY = double.negativeInfinity;
-    for (var i = 0; i + 1 < part.length; i += 2) {
-      final px = transform.x(part[i]);
-      final py = transform.y(part[i + 1]);
-      if (px < minX) minX = px;
-      if (px > maxX) maxX = px;
-      if (py < minY) minY = py;
-      if (py > maxY) maxY = py;
-    }
-    return maxX < bounds.left ||
-        minX > bounds.right ||
-        maxY < bounds.top ||
-        minY > bounds.bottom;
-  }
-
   /// Flutter has no dash API — walk path metrics and stroke the "on"
   /// segments. Dash values are multiples of the line width (style spec).
-  void _drawDashed(
+  Iterable<void> _drawDashedChunks(
     ui.Canvas canvas,
     ui.Path path,
     ui.Paint paint,
     List<dynamic> dash,
     double width,
-  ) {
+  ) sync* {
     final pattern = <double>[
       for (final v in dash) (v is num ? v.toDouble() : 0.0) * width,
     ];
@@ -784,7 +807,11 @@ class VectorTileRenderer {
       return;
     }
 
+    var segments = 0;
     for (final metric in path.computeMetrics()) {
+      // Advancing the native metric iterator is indivisible, but extraction
+      // and draw dispatch must not monopolise the rest of a frame.
+      yield null;
       var distance = 0.0;
       var segment = 0;
       var draw = true;
@@ -798,6 +825,8 @@ class VectorTileRenderer {
         distance = next;
         segment++;
         draw = !draw;
+        segments++;
+        if (segments % 64 == 0) yield null;
         if (segmentLength <= 0 && segment > pattern.length * 2) break;
       }
     }
@@ -853,9 +882,13 @@ class _StaticPaintCache {
     final expr = props[key];
     if (expr == null) return null;
     if (dependsOnProperties(expr)) {
-      return evaluateExpression(expr, featureCtx);
+      return VectorTrace.sync(
+          'style', () => evaluateExpression(expr, featureCtx));
     }
-    return _cache.putIfAbsent(key, () => evaluateExpression(expr, baseCtx));
+    return _cache.putIfAbsent(
+        key,
+        () =>
+            VectorTrace.sync('style', () => evaluateExpression(expr, baseCtx)));
   }
 
   double number(
@@ -879,5 +912,33 @@ class _StaticPaintCache {
     if (value is ui.Color) return value;
     if (value is String) return parseCssColor(value);
     return null;
+  }
+}
+
+// Keep expression spans outside the recursive evaluator: one event per paint
+// value/filter, rather than one event for every expression-tree node.
+ui.Color? _styleColor(dynamic expr, EvaluationContext ctx) =>
+    VectorTrace.enabled
+        ? VectorTrace.sync('style', () => evaluateColorExpr(expr, ctx))
+        : evaluateColorExpr(expr, ctx);
+
+double _styleNumber(dynamic expr, EvaluationContext ctx,
+        {required double fallback}) =>
+    VectorTrace.enabled
+        ? VectorTrace.sync(
+            'style', () => evaluateNumExpr(expr, ctx, fallback: fallback))
+        : evaluateNumExpr(expr, ctx, fallback: fallback);
+
+bool _styleFilter(dynamic filter, EvaluationContext ctx) => VectorTrace.enabled
+    ? VectorTrace.sync('style', () => matchesFilter(filter, ctx))
+    : matchesFilter(filter, ctx);
+
+Iterable<void> _traceChunks(String name, Iterable<void> chunks) =>
+    VectorTrace.enabled ? _tracedChunks(name, chunks) : chunks;
+
+Iterable<void> _tracedChunks(String name, Iterable<void> chunks) sync* {
+  final iterator = chunks.iterator;
+  while (VectorTrace.sync(name, iterator.moveNext)) {
+    yield null;
   }
 }
