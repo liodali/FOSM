@@ -893,22 +893,26 @@ if (hasDash && width >= 0.5) {
 
 **Why:** Dash patterns imperceptible below 0.5px width.
 
-### 4. Concurrent Decode Limiting
+### 4. Frame-paced Tile Work
 
-```dart
-static const int maxConcurrentDecodes = 3;
+Each `MapView` shares one cooperative 2 ms UI-work allowance between vector
+path recording and label preparation. Once spent, work waits until Flutter
+finishes a frame, then rechecks whether the tile is still needed. Independent
+jobs no longer each consume their full rendering allowance before yielding.
 
-Future<ui.Image> decoder(bytes, z, x, y) async {
-  await _waitForDecodeSlot();
-  try {
-    return await _decodeAndRender(bytes, z, x, y);
-  } finally {
-    _releaseDecodeSlot();
-  }
-}
-```
+Raster image decoding and vector `Picture.toImage()` submissions use the same
+map-owned image lane: at most two active operations and two starts between frame
+waits. Queued work is re-ranked by the latest camera demand before it starts;
+stale tiles are discarded before entering a codec or image snapshot.
 
-**Purpose:** Prevent overwhelming the GPU with simultaneous `toImage()` calls.
+HTTP fetches remain separate from presentation so new visible requests can
+start while older images finish. Background padding/adjacent-zoom preloads wait
+for foreground downloads **and** foreground presentation work to drain. Base
+tiles publish progressively; label preparation stays separate.
+
+These are cooperative limits: one Canvas, text-layout, or codec operation can
+exceed the allowance. They constrain bursts without guaranteeing a frame rate;
+use profile-mode device measurements to assess smoothness and coverage latency.
 
 ### 5. Pre-loading Strategy
 

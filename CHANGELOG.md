@@ -1,5 +1,20 @@
 ## Unreleased
 
+* Yield during long vector bounds scans and dashed-line extraction, stop bounds scanning once overlap is established, and add optional `fosm.traceVector` timeline spans for parsing, style/geometry recording and image creation.
+
+* Separate camera motion from grid reconciliation: paint anchors recompute on every pan frame while tile slots, jobs, cache keys and demand generations are rebuilt only when the covering membership (source zoom, window, viewport, padding) actually changes. Sub-tile panning no longer reallocates the grid or reprioritises in-flight work.
+* Coalesce pinch/pan updates to one application per display frame — first event immediate, bursts keep the latest focal point and cumulative scale — while discrete zoom steps keep their own event timing, snapshot capture and focal anchoring. Camera commands cancel queued gesture updates and rebase an active gesture onto the commanded camera with a floating zoom baseline (cancelling any animation the command started when manipulation resumes), and the per-frame slot re-arms at real frame boundaries so sparse input applies immediately.
+
+* Fix a potential image-lane stall: `TileManager` no longer infers decoder scheduling ownership from `byteOnlyPadding`. Pass `decoderOwnsImageScheduling` when a decoder (e.g. `VectorTileRuntime`) already submits its own image work through the shared `TileWorkScheduler`; nesting both would occupy every slot with decodes waiting for a slot.
+* Stop charging idle time (network waits, frames without tile work) against the shared work budget: `TileWorkScheduler` restarts the allowance after an idle gap and an idle image lane accepts new submissions without waiting another frame.
+
+* Fix web (dart2js) vector rendering: bitwise operators truncate to unsigned 32-bit values in JavaScript, which corrupted every negative geometry delta (`2^32 + delta`), silently misplaced or culled geometry, and broke browser pixel output. Decode zigzag and multi-byte varints with exact arithmetic and key fill batches without `<<` packing.
+* Add web-regression decoder tests for negative deltas on both axes and for feature ids/int values above 2^31.
+
+* Share a frame-paced UI-work allowance across vector rendering and label preparation; yield through Flutter paint before continuing heavy tile work.
+* Bound raster decode/vector image submissions, re-evaluate queued image priority and relevance, and release pending work on disposal.
+* Hold background preloads until foreground presentation drains, preserving independent visible download capacity.
+
 * Add host-supplied location streams, validated/timestamp-ordered fixes, smooth camera following, gesture pause and recenter, and follow-state callbacks/notifications.
 * Add position, bearing, and geographic accuracy overlays plus a configurable location control; retain last-known fixes on recoverable stream errors.
 * Add a simulated-location example and coverage for stream lifecycle, fractional zoom, camera bounds, gestures, and follow animation retargeting.
