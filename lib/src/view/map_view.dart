@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/physics.dart';
 
 import 'package:fosm/src/api/geo_point.dart';
@@ -802,6 +803,15 @@ class _MapViewState extends State<MapView>
 
   /// Last zoom direction, used to damp reversals around a rounding boundary.
   int _pinchZoomDirection = 0;
+
+  /// Coalesced scale updates: pointer events can arrive faster than the
+  /// display renders (multi-pointer storms, high-rate touch digitisers).
+  /// The first update of a frame applies immediately; later ones only
+  /// overwrite this slot and are applied once at the next frame boundary,
+  /// using the latest focal point and the recognizer's cumulative scale.
+  ScaleUpdateDetails? _pendingScaleUpdate;
+  bool _scaleFlushScheduled = false;
+  bool _scaleAppliedSinceFrame = false;
 
   /// True from gesture start to gesture end. Full-viewport blur is skipped
   /// during direct manipulation so a pinch/drag never pays for an
@@ -1766,6 +1776,10 @@ class _MapViewState extends State<MapView>
     _stopFractionalAnimation();
     _fractionalSnapshotTimer?.cancel();
     _interacting = false;
+    // A fresh gesture starts with a clean coalescing slot so its first
+    // update applies immediately.
+    _pendingScaleUpdate = null;
+    _scaleAppliedSinceFrame = false;
     _scaleStartCameraZoom = manager.cameraZoom;
     _lastFractionalFocal = details.localFocalPoint;
 
@@ -1793,6 +1807,80 @@ class _MapViewState extends State<MapView>
     }
 
     _pauseLocationFollowing();
+    // Zoom steps are discrete, user-visible transitions (snapshot capture,
+    // focal anchoring, re-baselining): they must run at their own event so
+    // the step timing and anchors stay identical with and without
+    // coalescing. Only the continuous work (pans, fractional zoom) is
+    // coalesced to once per frame.
+    final stepsZoom =
+        !_usesFractionalZoom && _scaleUpdateStepsZoom(manager, details);
+    final pending = _pendingScaleUpdate;
+    if (stepsZoom && pending != null) {
+      _pendingScaleUpdate = null;
+      _applyScaleUpdate(manager, pending);
+    }
+    if (!_scaleAppliedSinceFrame || stepsZoom) {
+      // First update of this frame — or a zoom step: apply immediately.
+      _scaleAppliedSinceFrame = true;
+      _applyScaleUpdate(manager, details);
+    } else {
+      // Bursts within one frame coalesce to their latest event; the
+      // cumulative scale and latest focal point are preserved because
+      // the recognizer reports them absolutely from gesture start.
+      _pendingScaleUpdate = details;
+      _scheduleScaleFlush();
+    }
+  }
+
+  /// Whether applying [details] on the integer-zoom path would cross a
+  /// zoom level. Mirrors the quantization in [_applyScaleUpdate].
+  bool _scaleUpdateStepsZoom(TileManager manager, ScaleUpdateDetails details) {
+    final startZoom = _scaleStartZoom;
+    if (startZoom == null ||
+        !details.scale.isFinite ||
+        details.scale <= 0 ||
+        _usesFractionalZoom) {
+      return false;
+    }
+    final continuousZoom = startZoom + math.log(details.scale) / math.ln2;
+    var newZoom = continuousZoom.round().clamp(widget.minZoom, widget.maxZoom);
+    if ((_pinchZoomDirection > 0 &&
+            newZoom < manager.zoom &&
+            continuousZoom > manager.zoom - 0.65) ||
+        (_pinchZoomDirection < 0 &&
+            newZoom > manager.zoom &&
+            continuousZoom < manager.zoom + 0.65)) {
+      newZoom = manager.zoom;
+    }
+    return newZoom != manager.zoom;
+  }
+
+  /// Applies a coalesced update at the next frame boundary, then re-arms
+  /// the per-frame application slot. Never forces a frame by itself.
+  void _scheduleScaleFlush() {
+    if (_scaleFlushScheduled) return;
+    _scaleFlushScheduled = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _scaleFlushScheduled = false;
+      _scaleAppliedSinceFrame = false;
+      final details = _pendingScaleUpdate;
+      _pendingScaleUpdate = null;
+      final manager = _tileManager;
+      if (details != null && manager != null) {
+        _applyScaleUpdate(manager, details);
+      }
+    });
+  }
+
+  void _applyScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
+    final startZoom = _scaleStartZoom;
+    final startFocal = _scaleStartFocal;
+    if (startZoom == null ||
+        startFocal == null ||
+        !details.scale.isFinite ||
+        details.scale <= 0) {
+      return;
+    }
     final focalLocal = details.localFocalPoint;
     if (_usesFractionalZoom) {
       final delta = focalLocal - (_lastFractionalFocal ?? focalLocal);
@@ -1883,6 +1971,14 @@ class _MapViewState extends State<MapView>
 
   void _onScaleEnd(ScaleEndDetails details) {
     final manager = _tileManager;
+    // Apply any update still waiting for its frame before the gesture
+    // ends, so fling velocity and the final camera agree with the last
+    // pointer movement.
+    final pending = _pendingScaleUpdate;
+    _pendingScaleUpdate = null;
+    if (pending != null && manager != null) {
+      _applyScaleUpdate(manager, pending);
+    }
     if (manager != null) {
       MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
               fractionalZoom: manager.cameraZoom)

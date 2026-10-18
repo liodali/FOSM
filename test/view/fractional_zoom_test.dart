@@ -196,11 +196,13 @@ void main() {
     const next = Offset(510, 290);
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: next, scale: 1.2, pointerCount: 2));
+    await tester.pump();
     expect(controller.fractionalZoom,
         closeTo(10.2 + math.log(1.2) / math.ln2, 1e-8));
     expect((manager.latLngToScreen(point) - next).distance, lessThan(1e-6));
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: next, scale: 2, pointerCount: 2));
+    await tester.pump();
     expect(controller.fractionalZoom, closeTo(11.2, 1e-8));
     expect((manager.latLngToScreen(point) - next).distance, lessThan(1e-6));
     gestures.onScaleEnd!(ScaleEndDetails());

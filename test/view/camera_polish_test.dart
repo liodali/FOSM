@@ -338,23 +338,71 @@ void main() {
     for (final scale in [1.43, 1.6, 1.9, 2.0]) {
       gestures.onScaleUpdate!(
           ScaleUpdateDetails(focalPoint: focal, scale: scale, pointerCount: 2));
+      // Updates coalesce to once per display frame; a pump flushes the
+      // current one before the assertion.
+      await tester.pump();
       expect(controller.zoom, 6,
           reason: '2x pinch means exactly one zoom level');
     }
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: focal, scale: 4, pointerCount: 2));
+    await tester.pump();
     expect(controller.zoom, 7);
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: focal, scale: 2.8, pointerCount: 2));
+    await tester.pump();
     expect(controller.zoom, 7,
         reason: 'minor reversal near boundary should not flicker');
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: focal, scale: 2, pointerCount: 2));
+    await tester.pump();
     expect(controller.zoom, 6);
     gestures.onScaleUpdate!(
         ScaleUpdateDetails(focalPoint: focal, scale: 1, pointerCount: 2));
+    await tester.pump();
     expect(controller.zoom, 5);
     gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('scale-update bursts coalesce to one build per frame',
+      (tester) async {
+    final controller = MapController();
+    await _mount(tester, controller);
+    final gestures = tester.widget<GestureDetector>(find.descendant(
+        of: find.byType(MapView),
+        matching: find.byWidgetPredicate((widget) =>
+            widget is GestureDetector && widget.onScaleStart != null)));
+    const start = Offset(400, 300);
+
+    // Single-pointer pan burst: several events arrive before the display
+    // renders the next frame.
+    gestures
+        .onScaleStart!(ScaleStartDetails(focalPoint: start, pointerCount: 1));
+    MapView.debugBuildCount = 0;
+    for (final dx in [12, 24, 36, 48]) {
+      gestures.onScaleUpdate!(ScaleUpdateDetails(
+          focalPoint: start + Offset(dx.toDouble(), 0),
+          scale: 1,
+          pointerCount: 1));
+    }
+    // No frame has rendered: exactly one application (the first event)
+    // happened, and no build ran.
+    expect(MapView.debugBuildCount, 0);
+    final midPan = controller.center!;
+    final midPanLatitude = midPan.latitude;
+
+    await tester.pump();
+    // The burst's latest focal point wins, and the whole burst cost a
+    // single map build.
+    final end = controller.center!;
+    expect(end.longitude, lessThan(midPan.longitude),
+        reason: 'the coalesced remainder of the burst must still apply');
+    expect(end.latitude, midPanLatitude);
+    expect(MapView.debugBuildCount, 1);
+
+    gestures.onScaleEnd!(ScaleEndDetails());
+    await tester.pump();
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
