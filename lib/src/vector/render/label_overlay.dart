@@ -12,6 +12,7 @@ import 'package:fosm/src/vector/style/expression.dart';
 import 'package:fosm/src/vector/style/map_style.dart';
 import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// Paints symbol layers (place labels, POI icons, …) on top of the tile
 /// grid for the whole viewport.
@@ -33,6 +34,10 @@ class LabelOverlay {
   static const int maxLabelsPerFrame = 500;
   static const int _maxPreparedTiles = 64;
 
+  /// Upper bound for cached per-zoom layer styles. One entry per zoom in
+  /// use; the bound only guards against unbounded zoom keys.
+  static const int _maxCachedLayerStyles = 32;
+
   /// Pixel distance between sampled line label placements.
   /// Roads typically need ~200-300px gaps to avoid clutter.
   static const double _lineLabelSpacing = 250.0;
@@ -42,11 +47,53 @@ class LabelOverlay {
   /// for the lifetime of the runtime — see [VectorTileRuntime.labelOverlay].
   final LinkedHashMap<String, List<_PreparedLabel>> _prepared = LinkedHashMap();
 
+  /// Symbol-layer style facts keyed by zoom, shared by every tile prepared
+  /// at that zoom: compiled filters, precomputed property-dependency
+  /// analysis and memoised zoom-only expression results (text-size steps,
+  /// static colors, …). Invalidation is ownership-based — the overlay is
+  /// created by, and disposed with, one [VectorTileRuntime] and therefore
+  /// one loaded style, so a style change implies a fresh overlay and cache.
+  final LinkedHashMap<int, List<_SymbolLayerStyle>> _layerStylesByZoom =
+      LinkedHashMap();
+
   bool _disposed = false;
 
   /// Number of tiles with cached prepared labels (test hook).
   @visibleForTesting
   int get preparedTileCount => _prepared.length;
+
+  /// The prepared-tile cache bound (test hook).
+  @visibleForTesting
+  static int get maxPreparedTilesLimit => _maxPreparedTiles;
+
+  /// Number of zoom levels with cached layer styles (test hook).
+  @visibleForTesting
+  int get cachedLayerStyleZooms => _layerStylesByZoom.length;
+
+  /// Text/halo layouts triggered from [paint] (test hook). Labels are
+  /// laid out during [prepare]; paint must keep this at zero for prepared
+  /// tiles.
+  @visibleForTesting
+  int debugPaintTimeLayouts = 0;
+
+  /// Labels whose painters this overlay released — aborted batches, LRU
+  /// evictions and overlay disposal (test hook).
+  @visibleForTesting
+  int debugDisposedLabels = 0;
+
+  /// Releases [label]'s painters, routing every overlay-side disposal
+  /// through one place so cleanup is observable in tests.
+  void _disposeLabel(_PreparedLabel label) {
+    label.dispose();
+    debugDisposedLabels++;
+  }
+
+  /// Memoised font sizes of one tile's prepared labels (test hook).
+  @visibleForTesting
+  List<double> debugPreparedFontSizes(int zoom, int x, int y) => [
+        for (final label in _prepared['$zoom/$x/$y'] ?? const [])
+          label.fontSize,
+      ];
 
   /// Forces the next [prepare] call to throw, to test lifecycle cleanup.
   @visibleForTesting
@@ -60,10 +107,11 @@ class LabelOverlay {
     _disposed = true;
     for (final labels in _prepared.values) {
       for (final label in labels) {
-        label.dispose();
+        _disposeLabel(label);
       }
     }
     _prepared.clear();
+    _layerStylesByZoom.clear();
   }
 
   void paint(
@@ -78,6 +126,34 @@ class LabelOverlay {
     required List<Tile> tiles,
   }) {
     if (_disposed) return;
+    // Traced separately from `labels.build`/`labels.layout` so timeline
+    // captures show collision placement during motion on its own.
+    VectorTrace.sync('labels.paint', () {
+      _paintTiles(
+        canvas,
+        size,
+        zoom: zoom,
+        tileScale: tileScale,
+        leftColumnTilesCanvasX: leftColumnTilesCanvasX,
+        topRowTilesCanvasY: topRowTilesCanvasY,
+        leftColumnTilesLngIndex: leftColumnTilesLngIndex,
+        topRowTilesLatIndex: topRowTilesLatIndex,
+        tiles: tiles,
+      );
+    });
+  }
+
+  void _paintTiles(
+    ui.Canvas canvas,
+    ui.Size size, {
+    required int zoom,
+    double tileScale = 1,
+    required double leftColumnTilesCanvasX,
+    required double topRowTilesCanvasY,
+    required int leftColumnTilesLngIndex,
+    required int topRowTilesLatIndex,
+    required List<Tile> tiles,
+  }) {
     final sprite = runtime.sprite;
     final collision = _CollisionGrid(cellSize: 72);
     final seenSymbols = <String>{};
@@ -122,6 +198,13 @@ class LabelOverlay {
           continue;
         }
 
+        // Preparation should have laid these out already; count (in tests)
+        // any paint that still has to build painters synchronously.
+        if (label.text != null && !label.isTextLaidOut) {
+          debugPaintTimeLayouts++;
+        } else if (label.haloWidth > 0 && !label.isHaloLaidOut) {
+          debugPaintTimeLayouts++;
+        }
         final textPainter = label.text == null ? null : label.painter();
         final haloPainter = label.text == null || label.haloWidth <= 0
             ? null
@@ -246,50 +329,60 @@ class LabelOverlay {
     final cached = _prepared.remove(key);
     if (cached != null) {
       _prepared[key] = cached; // refresh LRU
-      await _layOutLabels(
-        cached,
-        isRelevant: isRelevant,
-        yieldBudget: yieldBudget,
-        yieldControl: yieldControl,
+      await VectorTrace.async(
+        'labels.layout',
+        () => _layOutLabels(
+          cached,
+          isRelevant: isRelevant,
+          yieldBudget: yieldBudget,
+          yieldControl: yieldControl,
+        ),
       );
       if (_stale(isRelevant)) throw const TileDecodeAborted();
       return;
     }
 
     final labels = <_PreparedLabel>[];
+    // Build and layout share one cleanup guard: until the batch is stored
+    // it is cache-invisible, so *any* exit besides success — a stale
+    // check, a cancellation or a layout failure — must dispose every
+    // label, including painters already laid out before the abort.
     try {
-      await _buildLabels(
-        labels,
-        zoom,
-        x,
-        y,
-        parsed,
-        isRelevant: isRelevant,
-        yieldBudget: yieldBudget,
-        yieldControl: yieldControl,
+      await VectorTrace.async(
+        'labels.build',
+        () => _buildLabels(
+          labels,
+          zoom,
+          x,
+          y,
+          parsed,
+          isRelevant: isRelevant,
+          yieldBudget: yieldBudget,
+          yieldControl: yieldControl,
+        ),
       );
+      if (_stale(isRelevant)) throw const TileDecodeAborted();
+      // Lay out text/halo painters *before* the batch becomes
+      // cache-visible, so a paint that races preparation can never trigger
+      // text layout.
+      await VectorTrace.async(
+        'labels.layout',
+        () => _layOutLabels(
+          labels,
+          isRelevant: isRelevant,
+          yieldBudget: yieldBudget,
+          yieldControl: yieldControl,
+        ),
+      );
+      if (_stale(isRelevant)) throw const TileDecodeAborted();
     } catch (_) {
-      // Nothing is cached yet; dispose the partial batch and let the caller
-      // invalidate the tile.
       for (final label in labels) {
-        label.dispose();
+        _disposeLabel(label);
       }
       rethrow;
     }
-    if (_stale(isRelevant)) {
-      for (final label in labels) {
-        label.dispose();
-      }
-      throw const TileDecodeAborted();
-    }
+    // Cache insertion is the last step of a successful prepare.
     _storePrepared(key, labels);
-    await _layOutLabels(
-      labels,
-      isRelevant: isRelevant,
-      yieldBudget: yieldBudget,
-      yieldControl: yieldControl,
-    );
-    if (_stale(isRelevant)) throw const TileDecodeAborted();
   }
 
   /// Builds [labels] for one tile, yielding every [yieldBudget].
@@ -303,14 +396,12 @@ class LabelOverlay {
     required Duration yieldBudget,
     Future<void> Function()? yieldControl,
   }) async {
-    final style = runtime.loaded.style;
     final stopwatch = Stopwatch()..start();
 
-    for (final layer in style.layers) {
+    for (final style in _layerStylesFor(zoom)) {
       if (_stale(isRelevant)) throw const TileDecodeAborted();
-      if (layer.type != StyleLayerType.symbol || !layer.isVisible) continue;
-      if (zoom < layer.minZoom || zoom > layer.maxZoom) continue;
-      final sourceLayer = layer.sourceLayer;
+      if (!style.visible) continue;
+      final sourceLayer = style.layer.sourceLayer;
       if (sourceLayer == null) continue;
       final data = parsed.decoded.layerByName(sourceLayer);
       if (data == null) continue;
@@ -322,21 +413,34 @@ class LabelOverlay {
         srcZ: parsed.srcZ,
         extent: data.extent,
       );
-      final isLineLayer = _isLineLayer(layer, zoom);
 
       for (final feature in data.features) {
         if (_stale(isRelevant)) throw const TileDecodeAborted();
-        _appendFeatureLabels(
-          labels,
-          layer,
-          feature,
-          transform,
-          isLineLayer,
-          zoom,
-        );
+        _appendFeatureLabels(labels, style, feature, transform);
         await _maybeYield(stopwatch, yieldBudget, yieldControl);
       }
     }
+  }
+
+  /// Symbol-layer style facts for [zoom], shared by every tile prepared at
+  /// that zoom: the layer list is scanned and each expression's dependency
+  /// analysis + zoom-only values are computed once, then memoised across
+  /// tiles (see [_SymbolLayerStyle]).
+  List<_SymbolLayerStyle> _layerStylesFor(int zoom) {
+    final hit = _layerStylesByZoom.remove(zoom);
+    if (hit != null) {
+      _layerStylesByZoom[zoom] = hit; // refresh LRU
+      return hit;
+    }
+    final built = [
+      for (final layer in runtime.loaded.style.layers)
+        if (layer.type == StyleLayerType.symbol) _SymbolLayerStyle(layer, zoom),
+    ];
+    _layerStylesByZoom[zoom] = built;
+    while (_layerStylesByZoom.length > _maxCachedLayerStyles) {
+      _layerStylesByZoom.remove(_layerStylesByZoom.keys.first);
+    }
+    return built;
   }
 
   /// Lays out text/halo painters, yielding every [yieldBudget].
@@ -387,82 +491,40 @@ class LabelOverlay {
     return hit;
   }
 
-  /// Whether [layer] places its symbols along line geometry. Liberty uses
-  /// `["step", ["zoom"], "point", N, "line"]` for shields, plus plain
-  /// `"line"` for road/water names.
-  bool _isLineLayer(StyleLayer layer, int zoom) {
-    final placementExpr = layer.layout['symbol-placement'];
-    return placementExpr == 'line' ||
-        (placementExpr is List &&
-            evaluateStringExpr(
-                    placementExpr,
-                    EvaluationContext(
-                      zoom: zoom.toDouble(),
-                      properties: null,
-                    )) ==
-                'line');
-  }
-
   void _appendFeatureLabels(
     List<_PreparedLabel> labels,
-    StyleLayer layer,
+    _SymbolLayerStyle style,
     DecodedFeature feature,
     TileTransform transform,
-    bool isLineLayer,
-    int zoom,
   ) {
     if (feature.geometry.isEmpty || feature.geometry.first.length < 2) {
       return;
     }
     final ctx = EvaluationContext(
-      zoom: zoom.toDouble(),
+      zoom: style.zoom.toDouble(),
       properties: feature.properties,
     );
-    if (!matchesFilter(layer.filter, ctx)) return;
+    if (!style.filter(ctx)) return;
 
-    final text = _resolveText(layer, ctx);
-    final icon = _resolveIcon(layer, ctx);
+    final text = style.resolveText(ctx);
+    final icon = style.resolveIcon(ctx);
     if (text == null && icon == null) return;
 
-    final fontSize = evaluateNumExpr(
-      layer.layout['text-size'],
-      ctx,
-      fallback: 16,
-      min: 6,
-      max: 64,
-    );
-    final color = evaluateColorExpr(layer.paint['text-color'], ctx) ??
-        const ui.Color(0xFF000000);
-    final haloColor = evaluateColorExpr(layer.paint['text-halo-color'], ctx);
-    final haloWidth = evaluateNumExpr(
-      layer.paint['text-halo-width'],
-      ctx,
-      fallback: 0,
-      min: 0,
-      max: 8,
-    );
-    final letterSpacing = evaluateNumExpr(
-      layer.layout['text-letter-spacing'],
-      ctx,
-      fallback: 0,
-    );
-    final anchor =
-        evaluateStringExpr(layer.layout['text-anchor'], ctx) ?? 'center';
-    final offsetDx = _offsetEms(layer, ctx, 0);
-    final offsetDy = _offsetEms(layer, ctx, 1);
-    final iconSize = evaluateNumExpr(
-      layer.layout['icon-size'],
-      ctx,
-      fallback: 1,
-      min: 0.5,
-      max: 4,
-    );
+    final fontSize = style.fontSize.number(ctx, fallback: 16, min: 6, max: 64);
+    final color = style.textColor.color(ctx) ?? const ui.Color(0xFF000000);
+    final haloColor = style.haloColor.color(ctx);
+    final haloWidth = style.haloWidth.number(ctx, fallback: 0, min: 0, max: 8);
+    final letterSpacing = style.letterSpacing.number(ctx, fallback: 0);
+    final anchor = style.textAnchor.string(ctx) ?? 'center';
+    final offsetDx = style.offsetEms(ctx, 0);
+    final offsetDy = style.offsetEms(ctx, 1);
+    final iconSize = style.iconSize.number(ctx, fallback: 1, min: 0.5, max: 4);
 
-    if (isLineLayer && feature.geomType == MvtGeomType.lineString) {
+    if (style.isLine && feature.geomType == MvtGeomType.lineString) {
       // Line label: sample placements along the geometry.
       _addLineLabels(
         labels,
-        layer.id,
+        style.layer.id,
         feature,
         transform,
         text: text,
@@ -480,7 +542,8 @@ class LabelOverlay {
       labels.add(_PreparedLabel(
         text: text,
         icon: icon,
-        dedupeKey: '${layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
+        dedupeKey:
+            '${style.layer.id}:${feature.id > 0 ? feature.id : text ?? icon}',
         localX: transform.x(first[0]),
         localY: transform.y(first[1]),
         fontSize: fontSize,
@@ -501,47 +564,15 @@ class LabelOverlay {
     while (_prepared.length > _maxPreparedTiles) {
       final evicted = _prepared.remove(_prepared.keys.first);
       for (final label in evicted ?? const <_PreparedLabel>[]) {
-        label.dispose();
+        _disposeLabel(label);
       }
     }
-  }
-
-  String? _resolveText(StyleLayer layer, EvaluationContext ctx) {
-    final raw = layer.layout['text-field'];
-    if (raw == null) return null;
-    // Legacy shorthand: a bare string names a property.
-    final value =
-        raw is String ? (ctx.properties?[raw]) : evaluateExpression(raw, ctx);
-    if (value == null) return null;
-    var text = stringifyStyleValue(value);
-    switch (evaluateStringExpr(layer.layout['text-transform'], ctx)) {
-      case 'uppercase':
-        text = text.toUpperCase();
-      case 'lowercase':
-        text = text.toLowerCase();
-    }
-    return text.isEmpty ? null : text;
-  }
-
-  String? _resolveIcon(StyleLayer layer, EvaluationContext ctx) {
-    final raw = layer.layout['icon-image'];
-    if (raw == null) return null;
-    // Template strings like "{maki}-11" need interpolation. We handle
-    // the common "{property}" pattern.
-    if (raw is String) {
-      if (raw.contains('{')) {
-        return _interpolateTemplate(raw, ctx.properties);
-      }
-      return raw.isEmpty ? null : raw;
-    }
-    final name = stringifyStyleValue(evaluateExpression(raw, ctx));
-    if (name.isEmpty || name == 'null') return null;
-    return name;
   }
 
   /// Replaces `{property}` tokens in a template string with feature values.
   /// e.g. `"{maki}-11"` with `maki: "park"` → `"park-11"`.
-  String? _interpolateTemplate(String template, Map<String, dynamic>? props) {
+  static String? _interpolateTemplate(
+      String template, Map<String, dynamic>? props) {
     if (props == null) return null;
     final result = template.replaceAllMapped(
       RegExp(r'\{([^}]+)\}'),
@@ -642,13 +673,6 @@ class LabelOverlay {
     }
   }
 
-  double _offsetEms(StyleLayer layer, EvaluationContext ctx, int index) {
-    final raw = layer.layout['text-offset'];
-    if (raw is! List || raw.length <= index) return 0;
-    final value = evaluateExpression(raw[index], ctx);
-    return value is num ? value.toDouble() : 0;
-  }
-
   /// Parses `…/z/x/y` tile keys (with or without a style namespace).
   (int, int, int)? _parseTileIndex(String index) {
     final parts = index.split('/');
@@ -658,6 +682,118 @@ class LabelOverlay {
     final y = int.tryParse(parts[parts.length - 1]);
     if (z == null || x == null || y == null) return null;
     return (z, x, y);
+  }
+}
+
+/// Per-(layer, zoom) symbol-layer style facts, shared by every tile
+/// prepared at that zoom.
+///
+/// Each layout/paint expression is wrapped in a [CachedExpression], so
+/// property-dependency analysis runs once per layer/zoom and zoom-only
+/// values (text-size zoom steps, static colors, …) are evaluated once and
+/// memoised across every tile and feature at that zoom. Property-driven
+/// values still evaluate per feature. The layer filter is compiled once
+/// into closures (see [compileFilter]) instead of being re-walked per
+/// feature, and `symbol-placement` is resolved once per zoom.
+class _SymbolLayerStyle {
+  final StyleLayer layer;
+  final int zoom;
+
+  /// `visibility` is not `none` and [zoom] is within the layer's range.
+  final bool visible;
+
+  /// Whether the layer places symbols along line geometry at [zoom].
+  final bool isLine;
+
+  /// The layer filter, compiled once and evaluated per feature.
+  final CompiledFilter filter;
+
+  late final CachedExpression _textField;
+  late final CachedExpression _textTransform;
+  late final CachedExpression _icon;
+  late final CachedExpression fontSize;
+  late final CachedExpression textColor;
+  late final CachedExpression haloColor;
+  late final CachedExpression haloWidth;
+  late final CachedExpression letterSpacing;
+  late final CachedExpression textAnchor;
+  late final CachedExpression iconSize;
+  late final List<CachedExpression> _offsets;
+
+  _SymbolLayerStyle(this.layer, this.zoom)
+      : visible =
+            layer.isVisible && zoom >= layer.minZoom && zoom <= layer.maxZoom,
+        isLine = _evaluateIsLine(layer.layout['symbol-placement'], zoom),
+        filter = compileFilter(layer.filter) {
+    _textField = CachedExpression(layer.layout['text-field']);
+    _textTransform = CachedExpression(layer.layout['text-transform']);
+    _icon = CachedExpression(layer.layout['icon-image']);
+    fontSize = CachedExpression(layer.layout['text-size']);
+    textColor = CachedExpression(layer.paint['text-color']);
+    haloColor = CachedExpression(layer.paint['text-halo-color']);
+    haloWidth = CachedExpression(layer.paint['text-halo-width']);
+    letterSpacing = CachedExpression(layer.layout['text-letter-spacing']);
+    textAnchor = CachedExpression(layer.layout['text-anchor']);
+    iconSize = CachedExpression(layer.layout['icon-size']);
+    final rawOffsets = layer.layout['text-offset'];
+    _offsets = rawOffsets is List
+        ? [for (final element in rawOffsets) CachedExpression(element)]
+        : const [];
+  }
+
+  /// Whether [placementExpr] resolves to `"line"` at [zoom]. Liberty uses
+  /// `["step", ["zoom"], "point", N, "line"]` for shields, plus plain
+  /// `"line"` for road/water names.
+  static bool _evaluateIsLine(dynamic placementExpr, int zoom) {
+    return placementExpr == 'line' ||
+        (placementExpr is List &&
+            evaluateStringExpr(
+                  placementExpr,
+                  EvaluationContext(
+                    zoom: zoom.toDouble(),
+                    properties: null,
+                  ),
+                ) ==
+                'line');
+  }
+
+  String? resolveText(EvaluationContext ctx) {
+    final raw = layer.layout['text-field'];
+    if (raw == null) return null;
+    // Legacy shorthand: a bare string names a property.
+    final value =
+        raw is String ? (ctx.properties?[raw]) : _textField.evaluate(ctx);
+    if (value == null) return null;
+    var text = stringifyStyleValue(value);
+    switch (_textTransform.string(ctx)) {
+      case 'uppercase':
+        text = text.toUpperCase();
+      case 'lowercase':
+        text = text.toLowerCase();
+    }
+    return text.isEmpty ? null : text;
+  }
+
+  String? resolveIcon(EvaluationContext ctx) {
+    final raw = layer.layout['icon-image'];
+    if (raw == null) return null;
+    // Template strings like "{maki}-11" need interpolation. We handle
+    // the common "{property}" pattern.
+    if (raw is String) {
+      if (raw.contains('{')) {
+        return LabelOverlay._interpolateTemplate(raw, ctx.properties);
+      }
+      return raw.isEmpty ? null : raw;
+    }
+    final name = stringifyStyleValue(_icon.evaluate(ctx));
+    if (name.isEmpty || name == 'null') return null;
+    return name;
+  }
+
+  double offsetEms(EvaluationContext ctx, int index) {
+    if (index >= _offsets.length) return 0;
+    final value = _offsets[index].evaluate(ctx);
+    return value is num ? value.toDouble() : 0;
   }
 }
 
@@ -685,6 +821,12 @@ class _PreparedLabel {
 
   TextPainter? _textPainter;
   TextPainter? _haloPainter;
+
+  /// Whether the text painter was already laid out by preparation.
+  bool get isTextLaidOut => _textPainter != null;
+
+  /// Whether the halo painter was already laid out by preparation.
+  bool get isHaloLaidOut => _haloPainter != null;
 
   _PreparedLabel({
     required this.text,

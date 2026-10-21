@@ -339,6 +339,213 @@ void main() {
     });
   });
 
+  group('CachedExpression', () {
+    test('zoom-only expressions memoise their first evaluation', () {
+      final cached = CachedExpression(['zoom']);
+      // First evaluation locks in the zoom for every later context —
+      // that is the point of the cross-tile cache.
+      expect(cached.evaluate(ctx(7)), 7);
+      expect(cached.evaluate(ctx(12)), 7);
+      expect(cached.propertyDependent, isFalse);
+    });
+
+    test('property-dependent expressions re-evaluate per context', () {
+      final cached = CachedExpression(['get', 'class']);
+      expect(cached.propertyDependent, isTrue);
+      expect(cached.evaluate(ctx(7)), 'motorway');
+      expect(
+        cached.evaluate(
+            const EvaluationContext(zoom: 7, properties: {'class': 'river'})),
+        'river',
+      );
+    });
+
+    test('literal and null expressions', () {
+      expect(CachedExpression(null).evaluate(ctx(7)), isNull);
+      expect(CachedExpression(16).evaluate(ctx(7)), 16);
+      expect(
+          CachedExpression([
+            'literal',
+            ['get', 'x']
+          ]).propertyDependent,
+          isFalse);
+    });
+
+    test('typed accessors match evaluateNumExpr/Color/String semantics', () {
+      // One instance per (layer, zoom): each memoises its own zoom.
+      final below = CachedExpression([
+        'step',
+        ['zoom'],
+        10,
+        8,
+        16
+      ]);
+      expect(below.number(ctx(7), fallback: 1), 10);
+      final above = CachedExpression([
+        'step',
+        ['zoom'],
+        10,
+        8,
+        16
+      ]);
+      expect(above.number(ctx(9), fallback: 1), 16);
+      expect(
+        CachedExpression(['voodoo']).number(ctx(7), fallback: 42),
+        42,
+      );
+      expect(
+        CachedExpression('#ff0000').color(ctx(7)),
+        const Color(0xFFFF0000),
+      );
+      expect(
+        CachedExpression([
+          'to-string',
+          ['get', 'name']
+        ]).string(ctx(7)),
+        'Zürich',
+      );
+      expect(CachedExpression(null).string(ctx(7)), isNull);
+    });
+
+    test('clamping bounds apply to cached values', () {
+      final cached = CachedExpression(['get', 'rank']);
+      expect(
+        cached.number(
+            const EvaluationContext(zoom: 7, properties: {'rank': 99}),
+            fallback: 0,
+            min: 6,
+            max: 64),
+        64,
+      );
+    });
+  });
+
+  group('compiled filters', () {
+    // Filters covering every matchesFilter branch; each is checked for
+    // exact parity between the tree-walking and compiled evaluators.
+    final parityFilters = [
+      null,
+      <dynamic>[],
+      ['non-string-op', 'class', 'motorway'],
+      ['==', 'class', 'motorway'],
+      ['==', 'class', 'trunk'],
+      ['!=', 'class', 'motorway'],
+      ['>=', 'admin_level', 4],
+      ['<', 'admin_level', 2],
+      ['<=', 'admin_level', 4],
+      ['>', 'admin_level', 3],
+      [
+        '==',
+        ['get', 'class'],
+        'motorway'
+      ],
+      [
+        '==',
+        ['get', 'missing'],
+        'motorway'
+      ],
+      ['in', 'class', 'motorway', 'trunk'],
+      ['in', 'class', 'river'],
+      ['!in', 'class', 'motorway', 'trunk'],
+      ['!in', 'class', 'river'],
+      ['has', 'name'],
+      ['has', 'missing'],
+      ['!has', 'name'],
+      ['!has', 'missing'],
+      [
+        'has',
+        ['get', 'name']
+      ],
+      [
+        'all',
+        ['==', 'class', 'motorway'],
+        ['>=', 'admin_level', 2],
+      ],
+      [
+        'all',
+        ['==', 'class', 'river'],
+        ['>=', 'admin_level', 2],
+      ],
+      [
+        'any',
+        ['==', 'class', 'river'],
+        ['==', 'brunnel', 'tunnel'],
+      ],
+      [
+        'any',
+        ['==', 'class', 'river'],
+        ['==', 'brunnel', 'bridge'],
+      ],
+      [
+        'none',
+        ['==', 'class', 'river'],
+      ],
+      [
+        'none',
+        ['==', 'class', 'motorway'],
+      ],
+      ['all'],
+      ['any'],
+      ['none'],
+      ['=='],
+      ['in'],
+      ['!in'],
+      ['has'],
+      ['!has'],
+      [
+        'case',
+        [
+          '==',
+          ['get', 'class'],
+          'motorway'
+        ],
+        true,
+        false
+      ],
+    ];
+    final parityContexts = [
+      ctx(7),
+      const EvaluationContext(zoom: 7, properties: {}),
+      const EvaluationContext(zoom: 12, properties: null),
+      const EvaluationContext(
+          zoom: 7, properties: {'class': 'river', 'name': 'Aare'}),
+    ];
+
+    test('compiled filters match matchesFilter on every branch', () {
+      for (final filter in parityFilters) {
+        final compiled = compileFilter(filter);
+        for (final context in parityContexts) {
+          expect(
+            compiled(context),
+            matchesFilter(filter, context),
+            reason: 'parity failure for filter $filter at zoom '
+                '${context.zoom} with ${context.properties}',
+          );
+        }
+      }
+    });
+
+    test('null filter compiles to a constant match-all', () {
+      expect(compileFilter(null)(ctx(3)), isTrue);
+    });
+
+    test('legacy bare-string right operand is a literal, not a key', () {
+      // In legacy form the LEFT bare string is a property key; the right
+      // side stays a literal even when it is a bare string.
+      final compiled = compileFilter(['==', 'class', 'motorway']);
+      expect(compiled(ctx(7)), isTrue);
+      // A feature whose properties contain a 'motorway' key must not make
+      // the right side suddenly read that property.
+      expect(
+        compiled(const EvaluationContext(zoom: 7, properties: {
+          'class': 'other',
+          'motorway': 'other',
+        })),
+        isFalse,
+      );
+    });
+  });
+
   group('CSS colors', () {
     test('hex forms', () {
       expect(parseCssColor('#f00'), const Color(0xFFFF0000));

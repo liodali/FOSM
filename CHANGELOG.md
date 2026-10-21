@@ -1,5 +1,11 @@
 ## Unreleased
 
+* Fix label cache-insertion timing: prepared labels become cache-visible only after every text/halo painter is laid out, so a frame painting while preparation is in flight can never trigger feature scanning or text layout. Build and layout share one cleanup guard — any cancellation or failure disposes the whole uncached batch, including painters already laid out before the abort.
+* Cache zoom-only style expressions across tiles: symbol layers get one per-(layer, zoom) style entry with precomputed property-dependency analysis, memoised static values (text-size steps, colors, halos, spacing, anchors) and `symbol-placement`, shared by every tile at that zoom. Property-driven expressions still evaluate per feature.
+* Compile layer filters once into closures (`compileFilter`) for label preparation instead of re-walking the raw filter tree per feature, with `matchesFilter` semantics preserved exactly (legacy bare-key forms, `in`/`has` variants, empty-argument edges).
+* Add `fosm.vector.labels.paint`/`labels.build`/`labels.layout` timeline spans so collision placement during motion profiles separately from feature scanning and text layout (`--dart-define=fosm.traceVector=true`).
+* Add label regressions: prepared-tile LRU bound, dense line-label cancellation mid-layout, static vs data-driven text sizing across tiles, zero paint-time layouts after notification, and a no-starvation drain harness behind continuously entering tiles.
+
 * Yield during long vector bounds scans and dashed-line extraction, stop bounds scanning once overlap is established, and add optional `fosm.traceVector` timeline spans for parsing, style/geometry recording and image creation.
 
 * Separate camera motion from grid reconciliation: paint anchors recompute on every pan frame while tile slots, jobs, cache keys and demand generations are rebuilt only when the covering membership (source zoom, window, viewport, padding) actually changes. Sub-tile panning no longer reallocates the grid or reprioritises in-flight work.

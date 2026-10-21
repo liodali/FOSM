@@ -69,6 +69,74 @@ bool dependsOnProperties(dynamic expr) {
   return false;
 }
 
+/// A style expression paired with precomputed property-dependency
+/// analysis.
+///
+/// Zoom-only expressions (`!dependsOnProperties`) are evaluated once and
+/// memoised — the cached result is then shared by every feature *and every
+/// tile* that evaluates this instance, so static `text-size` steps or
+/// fixed colors cost one evaluation per layer/zoom instead of one per
+/// feature. Property-dependent expressions re-evaluate per context.
+///
+/// Instances must not outlive their style: there is no invalidation
+/// because a style change builds new expressions (see the label overlay's
+/// per-zoom style cache for the owner pattern).
+class CachedExpression {
+  final dynamic _expr;
+
+  /// Whether [_expr] reads feature properties anywhere (`get`/`has`).
+  final bool propertyDependent;
+
+  bool _evaluated = false;
+  dynamic _staticValue;
+
+  CachedExpression(dynamic expr)
+      : _expr = expr,
+        propertyDependent = dependsOnProperties(expr);
+
+  /// The raw style value; `null` when the style omits the property.
+  dynamic get expr => _expr;
+
+  /// Evaluates against [ctx], memoising zoom-only results.
+  dynamic evaluate(EvaluationContext ctx) {
+    final expr = _expr;
+    if (expr == null) return null;
+    if (propertyDependent) return evaluateExpression(expr, ctx);
+    if (!_evaluated) {
+      _staticValue = evaluateExpression(expr, ctx);
+      _evaluated = true;
+    }
+    return _staticValue;
+  }
+
+  /// [evaluateNumExpr] semantics over the cached evaluation.
+  double number(
+    EvaluationContext ctx, {
+    required double fallback,
+    double min = double.negativeInfinity,
+    double max = double.infinity,
+  }) {
+    if (_expr == null) return fallback;
+    final v = _asNum(evaluate(ctx));
+    if (v == null) return fallback;
+    return v.clamp(min, max);
+  }
+
+  /// [evaluateColorExpr] semantics over the cached evaluation.
+  Color? color(EvaluationContext ctx) {
+    if (_expr == null) return null;
+    return _asColor(evaluate(ctx));
+  }
+
+  /// [evaluateStringExpr] semantics over the cached evaluation.
+  String? string(EvaluationContext ctx) {
+    if (_expr == null) return null;
+    final v = evaluate(ctx);
+    if (v == null) return null;
+    return stringifyStyleValue(v);
+  }
+}
+
 /// Evaluates a style expression against [ctx]. Non-expression values are
 /// returned as-is; unsupported operators yield `null`.
 dynamic evaluateExpression(dynamic expr, EvaluationContext ctx) {
@@ -376,6 +444,132 @@ bool matchesFilter(dynamic filter, EvaluationContext ctx) {
     default:
       return _truthy(evaluateExpression(filter, ctx));
   }
+}
+
+// ── Compiled filters ────────────────────────────────────────────────────────
+
+/// A layer filter compiled to nested closures.
+typedef CompiledFilter = bool Function(EvaluationContext ctx);
+
+bool _matchAll(EvaluationContext _) => true;
+
+/// Compiles [filter] (legacy array or expression form) once so per-feature
+/// evaluation dispatches through closures instead of re-walking the raw
+/// tree — no per-feature operator switch, `isExpression` checks or
+/// `sublist` allocations. Semantics match [matchesFilter] exactly;
+/// unsupported forms fall back to generic evaluation.
+CompiledFilter compileFilter(dynamic filter) {
+  if (filter == null) return _matchAll;
+  if (filter is! List || filter.isEmpty) return _matchAll;
+  final op = filter.first;
+  if (op is! String) {
+    return (ctx) => _truthy(evaluateExpression(filter, ctx));
+  }
+  final args = filter.sublist(1);
+
+  switch (op) {
+    case 'all':
+      if (args.isEmpty) return _matchAll;
+      final parts = [for (final f in args) compileFilter(f)];
+      return (ctx) {
+        for (final part in parts) {
+          if (!part(ctx)) return false;
+        }
+        return true;
+      };
+
+    case 'any':
+      if (args.isEmpty) return (_) => false;
+      final parts = [for (final f in args) compileFilter(f)];
+      return (ctx) {
+        for (final part in parts) {
+          if (part(ctx)) return true;
+        }
+        return false;
+      };
+
+    case 'none':
+      if (args.isEmpty) return _matchAll;
+      final parts = [for (final f in args) compileFilter(f)];
+      return (ctx) {
+        for (final part in parts) {
+          if (part(ctx)) return false;
+        }
+        return true;
+      };
+
+    case '==':
+    case '!=':
+    case '<':
+    case '<=':
+    case '>':
+    case '>=':
+      if (args.length < 2) return _matchAll;
+      // Legacy filters name the property as a bare string on the left;
+      // the right side is always evaluated as an expression.
+      final left = _compileFilterOperand(args[0]);
+      final right = _compileFilterOperand(args[1], legacyKey: false);
+      return switch (op) {
+        '==' => (ctx) => _looseEquals(left(ctx), right(ctx)),
+        '!=' => (ctx) => !_looseEquals(left(ctx), right(ctx)),
+        _ => (ctx) => _compare(op, left(ctx), right(ctx)) ?? false,
+      };
+
+    case 'in':
+      if (args.isEmpty) return (_) => false;
+      final value = _compileFilterOperand(args[0]);
+      final candidates = args.sublist(1);
+      return (ctx) {
+        final v = value(ctx);
+        for (final c in candidates) {
+          if (_looseEquals(c, v)) return true;
+        }
+        return false;
+      };
+
+    case '!in':
+      if (args.isEmpty) return _matchAll;
+      final value = _compileFilterOperand(args[0]);
+      final candidates = args.sublist(1);
+      return (ctx) {
+        final v = value(ctx);
+        for (final c in candidates) {
+          if (_looseEquals(c, v)) return false;
+        }
+        return true;
+      };
+
+    case 'has':
+      if (args.isEmpty) return (_) => false;
+      final key = args[0];
+      if (key is String) {
+        return (ctx) => ctx.properties?.containsKey(key) ?? false;
+      }
+      return (ctx) => _truthy(evaluateExpression(key, ctx));
+
+    case '!has':
+      if (args.isEmpty) return _matchAll;
+      final key = args[0];
+      if (key is String) {
+        return (ctx) => !(ctx.properties?.containsKey(key) ?? false);
+      }
+      return (ctx) => !_truthy(evaluateExpression(key, ctx));
+
+    default:
+      return (ctx) => _truthy(evaluateExpression(filter, ctx));
+  }
+}
+
+/// Compiles one comparison/`in` operand. With [legacyKey], a bare string
+/// that is not itself an expression names a property (legacy filter form).
+dynamic Function(EvaluationContext) _compileFilterOperand(
+  dynamic operand, {
+  bool legacyKey = true,
+}) {
+  if (legacyKey && operand is String && !isExpression(operand)) {
+    return (ctx) => ctx.properties?[operand];
+  }
+  return (ctx) => evaluateExpression(operand, ctx);
 }
 
 // ── Typed accessors with spec defaults ─────────────────────────────────────
