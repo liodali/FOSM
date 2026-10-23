@@ -8,6 +8,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/view/marker_cluster_engine.dart';
+import 'package:fosm/src/view/polygon_layer.dart';
+import 'package:fosm/src/view/polyline_layer.dart';
 import 'package:fosm/src/view/user_location_layer.dart';
 
 class _Probe extends StatelessWidget {
@@ -233,4 +235,191 @@ void main() {
     markers.dispose();
     controller.dispose();
   });
+
+  testWidgets('live route updates stay culled and remain selectable',
+      (tester) async {
+    MapPolylineHit? hit;
+    final key = GlobalKey<_LiveRouteHarnessState>();
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: _LiveRouteHarness(
+                key: key, onRouteTap: (value) => hit = value))));
+
+    // Replace the whole points list (fresh instances, the documented
+    // live-update path) every frame for 30 frames.
+    for (var frame = 0; frame < 30; frame++) {
+      PolylinePainter.debugSolidSegments = 0;
+      key.currentState!.advance(frame);
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+      expect(PolylinePainter.debugSolidSegments, greaterThan(0),
+          reason: 'frame $frame must paint the visible band');
+      expect(
+          PolylinePainter.debugSolidSegments, lessThan(2000),
+          reason: 'frame $frame must cull the offscreen majority of the '
+              'route');
+    }
+
+    // The final generation is selectable at its center.
+    final painter = _routePainterOf(tester);
+    final center =
+        painter.manager.latLngToScreen(key.currentState!.currentCenter);
+    await tester.tapAt(center);
+    await tester.pump(const Duration(milliseconds: 350));
+    expect(hit, isNotNull);
+    expect(hit!.distancePixels, lessThan(1));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('several simultaneously visible polygons and routes select '
+      'correctly', (tester) async {
+    const center = LatLng(latitude: 47, longitude: 8);
+    final polygonHits = <MapPolygon>[];
+    final routeHits = <MapPolyline>[];
+    var bareMapTaps = 0;
+
+    List<LatLng> square(LatLng c) => [
+          LatLng(latitude: c.latitude + 0.015, longitude: c.longitude - 0.02),
+          LatLng(latitude: c.latitude + 0.015, longitude: c.longitude + 0.02),
+          LatLng(latitude: c.latitude - 0.015, longitude: c.longitude + 0.02),
+          LatLng(latitude: c.latitude - 0.015, longitude: c.longitude - 0.02),
+        ];
+
+    const rowTop = LatLng(latitude: 47.04, longitude: 8);
+    const rowBottom = LatLng(latitude: 46.96, longitude: 8);
+    final polygons = <MapPolygon>[
+      for (final row in [rowTop, rowBottom])
+        for (final lng in [7.94, 8.0, 8.06])
+          MapPolygon(
+            points: square(LatLng(latitude: row.latitude, longitude: lng)),
+            interactive: true,
+            onTap: (hit) => polygonHits.add(hit.polygon),
+          ),
+      // Far offscreen: projected and painted never.
+      MapPolygon(
+          points: square(const LatLng(latitude: 12, longitude: 40)),
+          interactive: true,
+          onTap: (hit) => polygonHits.add(hit.polygon)),
+    ];
+    final polylines = <MapPolyline>[
+      // Horizontal band between the polygon rows.
+      MapPolyline(
+          points: const [
+            LatLng(latitude: 47, longitude: 7.92),
+            LatLng(latitude: 47, longitude: 8.08),
+          ],
+          interactive: true,
+          onTap: (hit) => routeHits.add(hit.polyline)),
+      // Above every polygon, still inside the viewport.
+      MapPolyline(
+          points: const [
+            LatLng(latitude: 47.065, longitude: 7.95),
+            LatLng(latitude: 47.065, longitude: 8.05),
+          ],
+          interactive: true,
+          onTap: (hit) => routeHits.add(hit.polyline)),
+      // Vertical through both center polygons; last = topmost.
+      MapPolyline(
+          points: const [
+            LatLng(latitude: 46.93, longitude: 8),
+            LatLng(latitude: 47.07, longitude: 8),
+          ],
+          interactive: true,
+          onTap: (hit) => routeHits.add(hit.polyline)),
+    ];
+
+    PolygonPainter.debugPaintedPolygons = 0;
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: center,
+      zoom: 12,
+      polygons: polygons,
+      polylines: polylines,
+      onTap: (_) => bareMapTaps++,
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    expect(PolygonPainter.debugPaintedPolygons, 6,
+        reason: 'the offscreen polygon must be skipped entirely');
+
+    final manager = _routePainterOf(tester).manager;
+    Future<void> tapAt(LatLng point) async {
+      await tester.tapAt(manager.latLngToScreen(point));
+      await tester.pump(const Duration(milliseconds: 350));
+    }
+
+    // Routes win over polygons where both are present: the vertical route
+    // crosses both center polygons.
+    await tapAt(const LatLng(latitude: 47.04, longitude: 8));
+    await tapAt(const LatLng(latitude: 46.96, longitude: 8));
+    expect(routeHits.length, 2,
+        reason: 'routes must select above overlapping polygons');
+
+    // The four outer polygons select on their own.
+    for (final row in [rowTop, rowBottom]) {
+      for (final lng in [7.94, 8.06]) {
+        await tapAt(LatLng(latitude: row.latitude, longitude: lng));
+      }
+    }
+    expect(polygonHits.length, 4);
+
+    // The two remaining routes select at unobstructed points.
+    await tapAt(const LatLng(latitude: 47, longitude: 7.94));
+    await tapAt(const LatLng(latitude: 47.065, longitude: 8.01));
+    expect(routeHits.length, 4);
+
+    // Empty space falls through to the bare-map tap.
+    await tapAt(const LatLng(latitude: 47, longitude: 8.13));
+    expect(bareMapTaps, 1);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+}
+
+PolylinePainter _routePainterOf(WidgetTester tester) {
+  final found = find.byWidgetPredicate(
+      (widget) => widget is CustomPaint && widget.painter is PolylinePainter);
+  return (tester.widget<CustomPaint>(found).painter!) as PolylinePainter;
+}
+
+/// Replaces its route's points list (fresh instances) every frame, the
+/// documented live-update workload.
+class _LiveRouteHarness extends StatefulWidget {
+  const _LiveRouteHarness({super.key, required this.onRouteTap});
+
+  final void Function(MapPolylineHit hit) onRouteTap;
+
+  @override
+  State<_LiveRouteHarness> createState() => _LiveRouteHarnessState();
+}
+
+class _LiveRouteHarnessState extends State<_LiveRouteHarness> {
+  List<MapPolyline> polylines = const [];
+  LatLng currentCenter = const LatLng(latitude: 0, longitude: 0);
+
+  void advance(int frame) {
+    currentCenter = LatLng(latitude: 0, longitude: frame * 0.001);
+    final drift = currentCenter.longitude;
+    setState(() => polylines = [
+          MapPolyline(
+            points: List.generate(
+                2000,
+                (i) => LatLng(
+                    latitude: math.sin(i / 1999 * math.pi * 12) * 0.02,
+                    longitude: -0.8 + i / 1999 * 1.6 + drift)),
+            onTap: widget.onRouteTap,
+          ),
+        ]);
+  }
+
+  @override
+  Widget build(BuildContext context) => MapView(
+        latLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 10,
+        polylines: polylines,
+        showZoomControls: false,
+        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      );
 }

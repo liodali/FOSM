@@ -30,6 +30,7 @@ import 'package:fosm/src/view/marker_layer.dart';
 import 'package:fosm/src/view/polyline_layer.dart';
 import 'package:fosm/src/view/polygon_layer.dart';
 import 'package:fosm/src/view/shape_geometry.dart';
+import 'package:fosm/src/view/shape_geometry_cache.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
 import 'scale_bar.dart';
@@ -694,6 +695,13 @@ class _MapViewState extends State<MapView>
 
   final TileWorkScheduler _tileWorkScheduler = TileWorkScheduler();
   TileManager? _tileManager;
+
+  /// Cached world projections for route/area geometry, shared by the
+  /// polyline/polygon layers and tap hit testing. Keyed by points-list
+  /// identity, so replacing a route's points invalidates automatically and
+  /// the retention budget bounds live-updating routes.
+  final ShapeGeometryCache _shapeGeometryCache = ShapeGeometryCache();
+
   int _currentZoom = 0;
   bool _explicitFractional = false;
   bool get _usesFractionalZoom =>
@@ -2150,7 +2158,8 @@ class _MapViewState extends State<MapView>
         longPress: longPress,
         enableAll: longPress
             ? widget.onPolylineLongPress != null
-            : widget.onPolylineTap != null);
+            : widget.onPolylineTap != null,
+        cache: _shapeGeometryCache);
     if (route != null) {
       if (longPress) {
         route.polyline.onLongPress?.call(route);
@@ -2167,7 +2176,8 @@ class _MapViewState extends State<MapView>
         longPress: longPress,
         enableAll: longPress
             ? widget.onPolygonLongPress != null
-            : widget.onPolygonTap != null);
+            : widget.onPolygonTap != null,
+        cache: _shapeGeometryCache);
     if (area != null) {
       if (longPress) {
         area.polygon.onLongPress?.call(area);
@@ -2375,7 +2385,9 @@ class _MapViewState extends State<MapView>
                 if (widget.polygons.isNotEmpty)
                   Positioned.fill(
                       child: PolygonLayer(
-                          polygons: widget.polygons, manager: manager)),
+                          polygons: widget.polygons,
+                          manager: manager,
+                          cache: _shapeGeometryCache)),
 
                 // ── Polylines (above tiles, below markers and labels) ──
                 if (widget.polylines.isNotEmpty) ...[
@@ -2383,6 +2395,7 @@ class _MapViewState extends State<MapView>
                     child: PolylineLayer(
                       polylines: widget.polylines,
                       manager: manager,
+                      cache: _shapeGeometryCache,
                     ),
                   ),
                 ],
