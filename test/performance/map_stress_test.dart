@@ -7,6 +7,8 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
+import 'package:fosm/src/view/marker_cluster_engine.dart';
+import 'package:fosm/src/view/user_location_layer.dart';
 
 class _Probe extends StatelessWidget {
   const _Probe(this.onBuild);
@@ -75,5 +77,160 @@ void main() {
     expect(hit!.segmentIndex, inInclusiveRange(24990, 25010));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('frequently moving markers keep culling to the viewport',
+      (tester) async {
+    final markers = MarkerManager();
+    final controller = MapController();
+    var builds = 0;
+    // Wide fleet over ±10° longitude; the zoom-10 viewport (plus cull
+    // margin) only ever sees a narrow band around the center.
+    List<Marker> fleet(int offset) => List.generate(
+        2000,
+        (i) => Marker(
+              point: LatLng(
+                  latitude: (i % 50) * 0.002,
+                  longitude: (i ~/ 50 - 20) * 0.5 + offset * 0.01),
+              child: _Probe(() => builds++),
+            ));
+    markers.addAll(fleet(0));
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: const LatLng(latitude: 0, longitude: 0),
+      zoom: 10,
+      markers: markers,
+      controller: controller,
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    await tester.pump();
+    final visibleAtStart = find.byType(_Probe).evaluate().length;
+    expect(visibleAtStart, greaterThan(0));
+    expect(visibleAtStart, lessThan(400),
+        reason: 'only a viewport band of the 2000-marker fleet is built');
+
+    // Replace the whole fleet with new instances every frame — the
+    // "frequently moving markers" workload. Builds must stay bounded by
+    // the visible band, never the fleet size.
+    final buildsBefore = builds;
+    for (var frame = 1; frame <= 10; frame++) {
+      markers
+        ..clear()
+        ..addAll(fleet(frame));
+      await tester.pump();
+      final visible = find.byType(_Probe).evaluate().length;
+      expect(visible, allOf(greaterThan(0), lessThan(400)),
+          reason: 'frame $frame keeps builds bounded to the viewport band');
+    }
+    final rebuiltPerFrame = (builds - buildsBefore) / 10;
+    expect(rebuiltPerFrame, lessThan(400),
+        reason: 'per-frame rebuilds must track the visible band, not the '
+            'collection: $rebuiltPerFrame');
+
+    // Panning across the moving fleet repositions without errors and
+    // still builds nothing offscreen.
+    controller.moveTo(const LatLng(latitude: 0, longitude: 5), animate: false);
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    markers.dispose();
+    controller.dispose();
+  });
+
+  testWidgets('frequent location updates reposition the indicator',
+      (tester) async {
+    final locationController = MapLocationController(follow: true);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: const LatLng(latitude: 47, longitude: 8),
+      zoom: 14,
+      locationController: locationController,
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    var tick = 0;
+    DateTime stamp = DateTime(2026, 1, 1);
+    await tester.pump();
+    for (var i = 0; i < 20; i++) {
+      tick++;
+      locationController.updateLocation(MapLocation(
+        point: LatLng(latitude: 47 + tick * 0.0002, longitude: 8),
+        accuracyMeters: 10,
+        timestamp: stamp.add(Duration(seconds: tick)),
+      ));
+      await tester.pump();
+    }
+    expect(tester.takeException(), isNull);
+    expect(find.byType(UserLocationLayer), findsOneWidget);
+    await tester.pumpAndSettle(const Duration(seconds: 1));
+    await tester.pumpWidget(const SizedBox.shrink());
+    locationController.dispose();
+  });
+
+  testWidgets('cluster results are reused across pans and fractional zoom '
+      'within an integer step', (tester) async {
+    final markers = MarkerManager()
+      ..addAll([
+        for (var i = 0; i < 200; i++)
+          ClusterMarker(
+            point: LatLng(
+                latitude: 47 + (i % 20) * 0.001,
+                longitude: 8 + (i ~/ 20) * 0.001),
+            child: const SizedBox(width: 10, height: 10),
+          ),
+      ]);
+    final controller = MapController();
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: const LatLng(latitude: 47, longitude: 8),
+      zoom: 12,
+      enableFractionalZoom: true,
+      markers: markers,
+      markerClusterOptions: const MarkerClusterOptions(),
+      controller: controller,
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    await tester.pumpAndSettle();
+    MarkerClusterEngine.debugComputations = 0;
+
+    // Small pan: world-pixel grouping is camera-independent — reuse.
+    controller.moveTo(
+        const LatLng(latitude: 47.01, longitude: 8.01),
+        animate: false);
+    await tester.pump();
+    expect(MarkerClusterEngine.debugComputations, 0,
+        reason: 'a pan must not recluster');
+
+    // Fractional zoom inside the same integer step: reuse.
+    controller.setFractionalZoom(12.2, animate: false);
+    await tester.pump();
+    controller.setFractionalZoom(12.4, animate: false);
+    await tester.pump();
+    expect(MarkerClusterEngine.debugComputations, 0,
+        reason: 'fractional zoom within one integer step must not recluster');
+
+    // Crossing an integer step regroups — grouping rules keyed by zoom.
+    controller.setFractionalZoom(13.0, animate: false);
+    await tester.pump();
+    expect(MarkerClusterEngine.debugComputations, greaterThan(0),
+        reason: 'crossing an integer zoom step must recluster');
+
+    // Mutating the collection invalidates.
+    final afterZoom = MarkerClusterEngine.debugComputations;
+    markers.add(ClusterMarker(
+      point: const LatLng(latitude: 47.005, longitude: 8.005),
+      child: const SizedBox(width: 10, height: 10),
+    ));
+    await tester.pump();
+    expect(MarkerClusterEngine.debugComputations, greaterThan(afterZoom));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(const SizedBox.shrink());
+    markers.dispose();
+    controller.dispose();
   });
 }

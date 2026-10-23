@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import 'marker.dart';
+import 'marker_index.dart';
 
 /// Owns the marker collection shown on a [MapView].
 ///
@@ -30,14 +31,23 @@ import 'marker.dart';
 /// fire on every transition — including automatic dismissals
 /// (`removeOnMove`, map tap) and marker removal.
 class MarkerManager extends ChangeNotifier {
-  final List<Marker> _markers = [];
+  /// Geographic index maintained incrementally by every mutation. The
+  /// revision below tracks mutation count; the index is always consistent
+  /// with the current revision. Internal — layers query it instead of
+  /// scanning the whole collection each frame.
+  final MarkerIndex _index = MarkerIndex();
+
   int _revision = 0;
 
   Marker? _overlayMarker;
 
-  /// Monotonically increasing revision counter bumped on every mutation.
-  /// Used internally to invalidate cached cluster computations.
+  /// Monotonically increasing revision counter bumped on every mutation
+  /// (including removals and clears). Used internally to invalidate
+  /// cached cluster computations and to reason about [index] freshness.
   int get revision => _revision;
+
+  /// The geographic index over the current markers. Internal.
+  MarkerIndex get index => _index;
 
   /// The marker whose overlay is currently visible, if any.
   Marker? get overlayMarker => _overlayMarker;
@@ -52,19 +62,25 @@ class MarkerManager extends ChangeNotifier {
   /// before [onOverlayShown] fires for the new one.
   void Function(Marker marker)? onOverlayHidden;
 
-  /// The current markers, oldest first. Read-only view.
-  List<Marker> get markers => List.unmodifiable(_markers);
+  /// The current markers, oldest first. Read-only view (an O(n) copy —
+  /// prefer [index] for iteration-heavy internal work).
+  List<Marker> get markers =>
+      List.unmodifiable([for (final e in _index.entries) e.marker]);
 
   /// Number of markers currently managed.
-  int get length => _markers.length;
+  int get length => _index.length;
 
-  bool get isEmpty => _markers.isEmpty;
+  bool get isEmpty => _index.isEmpty;
 
-  bool get isNotEmpty => _markers.isNotEmpty;
+  bool get isNotEmpty => _index.isNotEmpty;
+
+  /// Whether [marker] is present (identity comparison), without copying
+  /// the collection.
+  bool containsMarker(Marker marker) => _index.contains(marker);
 
   /// Adds a marker and notifies listeners.
   void add(Marker marker) {
-    _markers.add(marker);
+    _index.insert(marker);
     _revision++;
     notifyListeners();
   }
@@ -73,16 +89,17 @@ class MarkerManager extends ChangeNotifier {
   void addAll(Iterable<Marker> markers) {
     final list = markers.toList();
     if (list.isEmpty) return;
-    _markers.addAll(list);
+    _index.insertAll(list);
     _revision++;
     notifyListeners();
   }
 
-  /// Removes [marker] (matched by identity). Returns whether it was found.
-  /// Hides its overlay first if it was open.
+  /// Removes [marker] (matched by identity, first occurrence). Returns
+  /// whether it was found. Hides its overlay first if it was open.
   bool remove(Marker marker) {
-    final removed = _markers.remove(marker);
+    final removed = _index.remove(marker);
     if (removed) {
+      _revision++;
       _hideOverlayIfOpen(marker);
       notifyListeners();
     }
@@ -94,25 +111,24 @@ class MarkerManager extends ChangeNotifier {
   /// Hides the overlay if its marker was removed.
   bool removeWhere(bool Function(Marker marker) test) {
     final overlayBefore = _overlayMarker;
-    final before = _markers.length;
-    _markers.removeWhere(test);
-    final removed = _markers.length != before;
-    if (removed) {
+    final removed = _index.removeWhere(test);
+    if (removed > 0) {
       _revision++;
-      if (overlayBefore != null && !_markers.contains(overlayBefore)) {
+      if (overlayBefore != null && !_index.contains(overlayBefore)) {
         _hideOverlayIfOpen(overlayBefore);
       }
       notifyListeners();
     }
-    return removed;
+    return removed > 0;
   }
 
   /// Removes all markers and notifies listeners. Hides any open overlay.
   void clear() {
-    if (_markers.isEmpty) return;
+    if (_index.isEmpty) return;
     final overlay = _overlayMarker;
     if (overlay != null) _hideOverlayIfOpen(overlay);
-    _markers.clear();
+    _index.clear();
+    _revision++;
     notifyListeners();
   }
 
@@ -123,7 +139,7 @@ class MarkerManager extends ChangeNotifier {
   /// marker has no overlay builder or is not in this manager.
   bool showOverlay(Marker marker) {
     if (marker.overlayBuilder == null) return false;
-    if (!_markers.contains(marker)) return false;
+    if (!_index.contains(marker)) return false;
     if (_overlayMarker == marker) return true;
 
     final previous = _overlayMarker;

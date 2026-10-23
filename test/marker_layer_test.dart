@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -107,7 +108,86 @@ Future<void> _pumpMap(
   );
 }
 
+class _StatefulMarkerProbe extends StatefulWidget {
+  final String id;
+  const _StatefulMarkerProbe(this.id);
+
+  @override
+  State<_StatefulMarkerProbe> createState() => _StatefulMarkerProbeState();
+}
+
+class _StatefulMarkerProbeState extends State<_StatefulMarkerProbe> {
+  late final String initialId = widget.id;
+
+  @override
+  Widget build(BuildContext context) => Text('${widget.id}:$initialId');
+}
+
 void main() {
+  for (final clustered in [false, true]) {
+    testWidgets(
+        'visible marker state survives sibling culling (clustering: $clustered)',
+        (tester) async {
+      final manager = MarkerManager()
+        ..addAll([
+          const Marker(
+              point: LatLng(latitude: 0, longitude: -100),
+              child: _StatefulMarkerProbe('A')),
+          const Marker(
+              point: LatLng(latitude: 0, longitude: 0),
+              child: _StatefulMarkerProbe('B')),
+        ]);
+      final controller = MapController();
+      await tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+              body: MapView(
+        latLng: _center,
+        zoom: 3,
+        markers: manager,
+        controller: controller,
+        markerClusterOptions: clustered ? const MarkerClusterOptions() : null,
+        showZoomControls: false,
+        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      ))));
+      final before = tester.state(find
+          .byWidgetPredicate((w) => w is _StatefulMarkerProbe && w.id == 'B'));
+      controller.moveTo(const LatLng(latitude: 0, longitude: 40),
+          animate: false);
+      await tester.pump();
+      expect(find.text('B:B'), findsOneWidget);
+      expect(
+          tester.state(find.byWidgetPredicate(
+              (w) => w is _StatefulMarkerProbe && w.id == 'B')),
+          same(before));
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      manager.dispose();
+      controller.dispose();
+    });
+  }
+
+  testWidgets(
+      'duplicate cluster occurrences have distinct widget keys above maxZoom',
+      (tester) async {
+    final marker = ClusterMarker(
+        point: _center, child: const _StatefulMarkerProbe('duplicate'));
+    final markers = MarkerManager()..addAll([marker, marker]);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: _center,
+      zoom: 3,
+      markers: markers,
+      markerClusterOptions: const MarkerClusterOptions(maxZoom: 0),
+      showZoomControls: false,
+      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    ))));
+    expect(find.byType(_StatefulMarkerProbe), findsNWidgets(2));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    markers.dispose();
+  });
+
   group('TileManager.latLngToScreen', () {
     test('projects the map center to the viewport center', () {
       final manager = TileManager.init(

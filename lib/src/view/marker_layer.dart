@@ -1,11 +1,15 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/scheduler.dart';
 
 import '../api/marker.dart';
 import '../api/marker_cluster.dart';
+import '../api/marker_index.dart';
 import '../api/marker_manager.dart';
 import '../api/tile_manager.dart';
+import '../common/marker_trace.dart';
 import 'marker_cluster_engine.dart';
 
 /// Renders the markers of a [MarkerManager] at their projected positions,
@@ -156,8 +160,8 @@ class _MarkerLayerState extends State<MarkerLayer>
   }
 
   void _onMarkersChanged() {
-    final live = widget.markers.markers;
-    _markerSizes.removeWhere((marker, _) => !live.contains(marker));
+    final markers = widget.markers;
+    _markerSizes.removeWhere((marker, _) => !markers.containsMarker(marker));
 
     final currentOverlay = widget.markers.overlayMarker;
     if (currentOverlay != _lastOverlayMarker) {
@@ -272,25 +276,35 @@ class _MarkerLayerState extends State<MarkerLayer>
 
   @override
   Widget build(BuildContext context) {
+    return MarkerTrace.sync('build', () => _build(context));
+  }
+
+  Widget _build(BuildContext context) {
     final manager = widget.manager;
 
     final options = widget.clusterOptions;
     final hasClustering = options != null;
     final clusterItems = hasClustering ? _computeClusters() : null;
 
+    // Viewport query: instead of scanning and projecting the whole
+    // collection each frame, ask the manager's geographic index for the
+    // entries inside the cull-padded viewport (insertion order), then
+    // project just those from cached world coordinates.
+    final visibleEntries =
+        MarkerTrace.sync('query', () => _queryVisible(manager));
+    final visiblePositions = MarkerTrace.sync(
+        'project',
+        () => [
+              for (final entry in visibleEntries)
+                _screenFromWorld(entry.nx, entry.ny, manager),
+            ]);
+
     // Hide overlay of any marker that is currently grouped into a cluster.
-    final groupedMarkers = <Marker>{};
-    if (hasClustering && clusterItems != null) {
-      for (final item in clusterItems) {
-        if (item is ClusterGroupItem) {
-          for (final m in item.cluster.markers) {
-            groupedMarkers.add(m);
-          }
-        }
-      }
-    }
+    // Only checked while an overlay is open; early-exits on first match.
     final overlayMarker = widget.markers.overlayMarker;
-    if (overlayMarker != null && groupedMarkers.contains(overlayMarker)) {
+    if (overlayMarker != null &&
+        clusterItems != null &&
+        _isGroupedIntoCluster(overlayMarker, clusterItems)) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         widget.markers.hideOverlay();
@@ -306,32 +320,111 @@ class _MarkerLayerState extends State<MarkerLayer>
         if (hasClustering && clusterItems != null) ...[
           for (final item in clusterItems)
             switch (item) {
-              SingleClusterMarkerItem(:final marker) =>
-                _buildMarkerWidget(context, manager, marker),
-              ClusterGroupItem(:final cluster) =>
-                _buildClusterWidget(context, manager, cluster),
+              SingleClusterMarkerItem(:final marker, :final entry) =>
+                _buildMarkerWidget(context, manager, marker, entry),
+              ClusterGroupItem(:final cluster, :final nx, :final ny) =>
+                _buildClusterWidget(context, manager, cluster, nx, ny),
             },
           // Plain markers are not part of the clustering result; render them
           // on top so they remain interactive above generated clusters.
-          for (final marker in widget.markers.markers)
-            if (marker is! ClusterMarker)
-              _buildMarkerWidget(context, manager, marker),
+          for (var i = 0; i < visibleEntries.length; i++)
+            if (visibleEntries[i].marker is! ClusterMarker)
+              _buildPositionedMarker(
+                visibleEntries[i].marker,
+                visiblePositions[i],
+                manager,
+                entry: visibleEntries[i],
+              ),
         ] else ...[
-          for (final marker in widget.markers.markers)
-            _buildMarkerWidget(context, manager, marker),
+          for (var i = 0; i < visibleEntries.length; i++)
+            _buildPositionedMarker(
+              visibleEntries[i].marker,
+              visiblePositions[i],
+              manager,
+              entry: visibleEntries[i],
+            ),
         ],
         if (overlay != null) overlay,
       ],
     );
   }
 
+  /// Whether [marker] is a member of any generated cluster.
+  bool _isGroupedIntoCluster(Marker marker, List<ClusterRenderItem> items) {
+    for (final item in items) {
+      if (item is ClusterGroupItem && item.cluster.markers.contains(marker)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Entries inside the cull-padded viewport, in insertion order.
+  List<MarkerIndexEntry> _queryVisible(TileManager manager) {
+    final rect = _visibleWorldRect(manager);
+    return widget.markers.index.queryRect(rect.$1, rect.$2, rect.$3, rect.$4);
+  }
+
+  /// Normalized world rectangle covering everything the per-marker screen
+  /// cull test could keep: `[−_cullMargin, size + _cullMargin]` on both
+  /// axes, inverted through the current camera. The index query is padded
+  /// with a small slack so float boundary cases always over-select; the
+  /// exact screen-space `_isVisible` test makes the final decision.
+  (double, double, double, double) _visibleWorldRect(TileManager manager) {
+    final worldTiles = math.pow(2.0, manager.zoom).toDouble();
+    final minTileX = manager.centerTileLng +
+        (-_cullMargin - manager.centerCanvasX) / manager.renderedTileWidth;
+    final maxTileX = manager.centerTileLng +
+        (manager.width + _cullMargin - manager.centerCanvasX) /
+            manager.renderedTileWidth;
+    final minTileY = manager.centerTileLat +
+        (-_cullMargin - manager.centerCanvasY) / manager.renderedTileHeight;
+    final maxTileY = manager.centerTileLat +
+        (manager.height + _cullMargin - manager.centerCanvasY) /
+            manager.renderedTileHeight;
+    return (
+      minTileX / worldTiles,
+      minTileY / worldTiles,
+      maxTileX / worldTiles,
+      maxTileY / worldTiles,
+    );
+  }
+
+  /// Cached-world → screen projection. Scaling a normalized world
+  /// coordinate by a power of two is exact in IEEE-754, so this is
+  /// bit-identical to `TileManager.latLngToScreen(marker.point)` while
+  /// skipping the per-marker trigonography.
+  Offset _screenFromWorld(double nx, double ny, TileManager manager) {
+    final worldTiles = math.pow(2.0, manager.zoom).toDouble();
+    return Offset(
+      (nx * worldTiles - manager.centerTileLng) * manager.renderedTileWidth +
+          manager.centerCanvasX,
+      (ny * worldTiles - manager.centerTileLat) * manager.renderedTileHeight +
+          manager.centerCanvasY,
+    );
+  }
+
+  /// Builds a single (non-grouped) cluster marker, positioned through its
+  /// cached index entry.
   Widget _buildMarkerWidget(
     BuildContext context,
     TileManager manager,
-    Marker marker,
-  ) {
-    final position = manager.latLngToScreen(marker.point);
+    Marker marker, [
+    MarkerIndexEntry? occurrence,
+  ]) {
+    final entry = occurrence ?? widget.markers.index[marker];
+    final position = entry != null
+        ? _screenFromWorld(entry.nx, entry.ny, manager)
+        : manager.latLngToScreen(marker.point);
+    return _buildPositionedMarker(marker, position, manager, entry: entry);
+  }
 
+  Widget _buildPositionedMarker(
+    Marker marker,
+    Offset position,
+    TileManager manager, {
+    MarkerIndexEntry? entry,
+  }) {
     // Viewport culling: markers whose anchor is off-screen (beyond the
     // margin that lets wide/tall widgets stay visible while partially
     // on screen) are skipped entirely — not built, laid out or painted.
@@ -345,6 +438,10 @@ class _MarkerLayerState extends State<MarkerLayer>
     final child = _buildMarkerChild(marker);
 
     return Positioned(
+      // Entries survive viewport queries and bulk filtering. Their identity
+      // keeps rich marker state with its occurrence even as siblings leave
+      // the viewport; duplicate marker instances still have distinct keys.
+      key: entry == null ? ObjectKey(marker) : ObjectKey(entry),
       left: position.dx,
       top: position.dy,
       child: FractionalTranslation(
@@ -361,8 +458,10 @@ class _MarkerLayerState extends State<MarkerLayer>
     BuildContext context,
     TileManager manager,
     MarkerCluster cluster,
+    double nx,
+    double ny,
   ) {
-    final position = manager.latLngToScreen(cluster.point);
+    final position = _screenFromWorld(nx, ny, manager);
     if (!_isVisible(position, manager)) return const SizedBox.shrink();
 
     final child = _buildClusterChild(context, cluster);
