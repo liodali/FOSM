@@ -58,6 +58,31 @@ void main() {
     );
   });
 
+  test('disposing before the spawn resolves kills the late worker', () async {
+    final worker = MvtIsolate();
+    // Dispose synchronously right after starting the spawn: dispose runs
+    // while _doSpawn is still awaiting Isolate.spawn, sees a null
+    // isolate handle and can kill nothing. The late handle arrives only
+    // on the next event turn and must be killed there, never published.
+    final spawning = worker.spawn();
+    worker.dispose();
+
+    await expectLater(spawning, throwsStateError);
+    expect(worker.debugLateSpawnKills, 1,
+        reason: 'a worker whose spawn resolved after dispose must be '
+            'killed immediately, not leaked until a second dispose');
+    // No handle may remain for a second dispose to "clean up".
+    worker.dispose();
+    expect(worker.debugLateSpawnKills, 1);
+
+    // The aborted attempt must not pin the spawn cache: a retry works.
+    await worker.spawn();
+    expect(worker.isReady, isTrue);
+    final decoded = await worker.decode(buildDenseLineTile());
+    expect(decoded, isA<DecodedVectorTile>());
+    worker.dispose();
+  });
+
   test('runtime with native parsing unwinds decodes at dispose', () async {
     // parseOffThread spawns the persistent worker — the native parse
     // path production vector maps use.
