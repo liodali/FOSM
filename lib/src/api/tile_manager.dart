@@ -126,7 +126,7 @@ class TileManager with CacheTiles {
 
   /// Protects cached images held by a zoom snapshot until it is released.
   VoidCallback retainSnapshot(Iterable<Tile> tiles) =>
-      _memoryCache.pin(tiles.map((tile) => tile.index));
+      pinRenderedImages(tiles.map((tile) => tile.index));
 
   void updateRenderedCachePolicy({
     required int maxBytes,
@@ -384,6 +384,12 @@ class TileManager with CacheTiles {
 
   /// Number of strict-viewport grid cells (including off-world rows).
   int get visibleTileCount => _visibleHorizontalCount * _visibleVerticalCount;
+
+  /// Strict (un-padded) viewport grid dimensions last computed by
+  /// [calculate]. Exposed for the per-region zoom-fallback coverage,
+  /// which walks exactly the cells readiness ignores padding for.
+  int get visibleHorizontalCount => _visibleHorizontalCount;
+  int get visibleVerticalCount => _visibleVerticalCount;
 
   /// Whether [z]/[x]/[y] still justifies the expensive decode of the
   /// current mode.
@@ -1896,6 +1902,21 @@ class TileManager with CacheTiles {
   /// because over-zoom children render different sub-rects.
   String _key(int z, int x, int y) =>
       cacheNamespace.isEmpty ? '$z/$x/$y' : '$cacheNamespace/$z/$x/$y';
+
+  /// The grid's rendered-image cache key for [z]/[x]/[y]. Exposed so the
+  /// zoom-fallback coverage can address retained imagery at neighbouring
+  /// zooms with the exact convention the grid populates.
+  String renderTileKey(int z, int x, int y) => _key(z, x, y);
+
+  /// Retrieves a retained rendered image, refreshing its LRU position so
+  /// imagery actively serving as zoom fallback stays warm.
+  ui.Image? retainedImage(String key) => _memoryCache.get(key);
+
+  /// Protects rendered images keyed by [keys] until the returned callback
+  /// runs. Regions of the zoom-fallback coverage pin only the images
+  /// their cells actually draw.
+  VoidCallback pinRenderedImages(Iterable<String> keys) =>
+      _memoryCache.pin(keys);
 
   /// Canonical source identity of the logical tile at [z]/[x]/[y].
   ///

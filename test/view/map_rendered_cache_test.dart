@@ -77,11 +77,34 @@ void main() {
         maxRenderedCacheBytes: 0,
       ))));
       await _ready(tester);
-      final oldImages =
-          _grids(tester).single.tiles.map((tile) => tile.sourceTile!).toList();
+      // Old-grid images keyed by slot, to observe the per-region pins.
+      final oldImages = <String, ui.Image>{
+        for (final tile in _grids(tester).single.tiles)
+          tile.index: tile.sourceTile!,
+      };
       controller.setFractionalZoom(6.25, animate: false);
       await tester.pump();
-      expect(oldImages.every((image) => !image.debugDisposed), isTrue);
+      // Images still serving as per-region fallback (parents of the
+      // missing z6 cells) stay pinned despite the zero budget; obsolete
+      // imagery (the old grid's padding ring) may already be evicted.
+      final grid = _grids(tester).single;
+      const pad = 2; // manager default tilePadding
+      final visH = grid.horizontalTileCount - 2 * pad;
+      final visV = grid.verticalTileCount - 2 * pad;
+      var fallbackPinned = 0;
+      for (var h = 0; h < visH; h++) {
+        for (var v = 0; v < visV; v++) {
+          final tile = grid.tiles[(h + pad) * grid.verticalTileCount + pad + v];
+          if (tile.sourceTile != null) continue;
+          final parent =
+              oldImages['5/${tile.lngIndex ~/ 2}/${tile.latIndex ~/ 2}'];
+          if (parent == null) continue;
+          fallbackPinned++;
+          expect(parent.debugDisposed, isFalse,
+              reason: 'fallback imagery for ${tile.index} must stay pinned');
+        }
+      }
+      expect(fallbackPinned, greaterThan(0));
       if (blocked) {
         controller.moveTo(const LatLng(latitude: 0.1, longitude: 0),
             animate: false);
@@ -90,7 +113,7 @@ void main() {
         await _ready(tester);
         await tester.pump();
       }
-      expect(oldImages.every((image) => image.debugDisposed), isTrue);
+      expect(oldImages.values.every((image) => image.debugDisposed), isTrue);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       // Let only the caller-owned fake fetch settle; MapView has already

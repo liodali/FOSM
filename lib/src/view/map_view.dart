@@ -32,6 +32,7 @@ import 'package:fosm/src/view/polygon_layer.dart';
 import 'package:fosm/src/view/shape_geometry.dart';
 import 'package:fosm/src/view/shape_geometry_cache.dart';
 import 'package:fosm/src/view/render.dart';
+import 'package:fosm/src/view/zoom_fallback.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
 import 'scale_bar.dart';
 import 'location_control.dart';
@@ -243,51 +244,6 @@ class _OldGridOverlay extends StatelessWidget {
       ),
     );
   }
-}
-
-/// Last loaded grid behind missing cells during continuous zoom. No blur or
-/// extra image decode: the old images remain pinned until replacement/timeout.
-class _FractionalFallbackPainter extends CustomPainter {
-  _FractionalFallbackPainter(this.snapshot, this.manager);
-  final _GridSnapshot snapshot;
-  final TileManager manager;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final scale =
-        math.pow(2, manager.cameraZoom - snapshot.cameraZoom).toDouble();
-    final ratio = math.pow(2, manager.zoom - snapshot.zoom).toDouble();
-    final dx = manager.centerCanvasX -
-        snapshot.sourceCenterCanvasX * scale +
-        (snapshot.sourceCenterTileLng * ratio - manager.centerTileLng) *
-            manager.renderedTileWidth;
-    final dy = manager.centerCanvasY -
-        snapshot.sourceCenterCanvasY * scale +
-        (snapshot.sourceCenterTileLat * ratio - manager.centerTileLat) *
-            manager.renderedTileHeight;
-    canvas.save();
-    canvas.clipRect(Offset.zero & size);
-    canvas.translate(dx, dy);
-    canvas.scale(scale);
-    RenderCanvasOSM(
-      horizontalTileCount: snapshot.horizontalTileCount,
-      verticalTileCount: snapshot.verticalTileCount,
-      leftColumnTilesLngIndex: snapshot.leftColumnTilesLngIndex,
-      topRowTilesLatIndex: snapshot.topRowTilesLatIndex,
-      leftColumnTilesCanvasX: snapshot.leftColumnTilesCanvasX,
-      topRowTilesCanvasY: snapshot.topRowTilesCanvasY,
-      tiles: snapshot.tiles,
-      revision: snapshot.revision,
-      tileScale: snapshot.tileScale,
-    ).paint(
-        canvas,
-        Size(snapshot.sourceCenterCanvasX * 2,
-            snapshot.sourceCenterCanvasY * 2));
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(_FractionalFallbackPainter oldDelegate) => true;
 }
 
 /// How the old tile grid animates out during a zoom transition
@@ -709,8 +665,8 @@ class _MapViewState extends State<MapView>
       widget.enableFractionalZoom ||
       widget.fractionalZoom != null;
   AnimationController? _fractionalController;
-  _GridSnapshot? _fractionalSnapshot;
-  Timer? _fractionalSnapshotTimer;
+  ZoomFallbackCoverage? _zoomFallback;
+  Timer? _zoomFallbackTimer;
   double? _scaleStartCameraZoom;
   Offset? _lastFractionalFocal;
 
@@ -934,7 +890,7 @@ class _MapViewState extends State<MapView>
     if (widget.vectorStyle != oldWidget.vectorStyle) {
       _styleCancel?.cancel('Style changed');
       _stopFractionalAnimation();
-      _clearFractionalSnapshot();
+      _clearZoomFallback();
       // Style switch: tear everything down and reload.
       _animController.stop();
       _stopPanAnimation();
@@ -981,7 +937,7 @@ class _MapViewState extends State<MapView>
         widget.maxZoom != oldWidget.maxZoom) {
       _stopPanAnimation();
       _stopFractionalAnimation();
-      _clearFractionalSnapshot();
+      _clearZoomFallback();
     }
     if (_usesFractionalZoom &&
         _tileManager != null &&
@@ -1000,13 +956,18 @@ class _MapViewState extends State<MapView>
     if (externalCenter) {
       _rebaseGestureOntoCamera();
       _tileManager?.setCenterTile(latLng: widget.latLng);
+      _tileManager?.calculate();
       setState(() {});
+      // External center echo is a programmatic pan: cover the newly
+      // revealed cells with the same bounded settle as controller pans.
+      _settleZoomFallback();
     }
     if (externalFractional && widget.fractionalZoom != null) {
       _rebaseGestureOntoCamera();
       _tileManager?.setCameraZoom(widget.fractionalZoom!
           .clamp(widget.minZoom.toDouble(), widget.maxZoom.toDouble()));
       _currentZoom = _tileManager?.zoom ?? _currentZoom;
+      _settleZoomFallback();
     } else if (externalZoom) {
       _rebaseGestureOntoCamera();
       if (_usesFractionalZoom) {
@@ -1016,6 +977,7 @@ class _MapViewState extends State<MapView>
       }
       _currentZoom = widget.zoom;
       setState(() {});
+      _settleZoomFallback();
     }
     if (externalCenter ||
         externalZoom ||
@@ -1028,7 +990,7 @@ class _MapViewState extends State<MapView>
         widget.fractionalZoom == null) {
       _explicitFractional = false;
       _stopFractionalAnimation();
-      _clearFractionalSnapshot();
+      _clearZoomFallback();
       _tileManager?.setZoom(_tileManager!.zoom);
     }
   }
@@ -1038,7 +1000,9 @@ class _MapViewState extends State<MapView>
     widget.locationController?.removeListener(_onLocationChanged);
     _tileWorkScheduler.dispose();
     _stopFractionalAnimation();
-    _clearFractionalSnapshot();
+    _cancelZoomFallbackTimer();
+    _zoomFallback?.dispose();
+    _zoomFallback = null;
     _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
     _animController.removeListener(_onAnimTick);
@@ -1053,14 +1017,9 @@ class _MapViewState extends State<MapView>
   }
 
   void _notify() {
-    if (_fractionalSnapshot != null &&
-        !_interacting &&
-        !(_fractionalController?.isAnimating ?? false) &&
-        _newTilesReady()) {
-      _clearFractionalSnapshot();
-    }
-    // If we're in the wait phase and new tiles are now ready, kick off
-    // the scale animation before setState to avoid a wasted frame.
+    // Per-region fallback retirement happens at the reconcile in build;
+    // here only the wait phase needs to react before setState so it does
+    // not spend a frame on the stale overlay.
     if (_animWaitingTiles && !_interacting && _newTilesReady()) {
       _beginScalePhase();
     }
@@ -1143,42 +1102,67 @@ class _MapViewState extends State<MapView>
     controller?.dispose();
   }
 
-  void _clearFractionalSnapshot() {
-    _fractionalSnapshotTimer?.cancel();
-    _fractionalSnapshotTimer = null;
-    _fractionalSnapshot?.releaseImages();
-    _fractionalSnapshot = null;
+  void _clearZoomFallback() {
+    _cancelZoomFallbackTimer();
+    _zoomFallback?.clear();
   }
 
-  void _settleFractionalSnapshot() {
-    if (_fractionalSnapshot == null ||
-        _interacting ||
-        (_fractionalController?.isAnimating ?? false)) {
+  void _cancelZoomFallbackTimer() {
+    _zoomFallbackTimer?.cancel();
+    _zoomFallbackTimer = null;
+  }
+
+  /// Whether any animated camera motion currently owns the camera: an
+  /// animated pan/fling (or location-follow retarget), the fractional
+  /// zoom animation, or the two-phase integer zoom transition. A zoom
+  /// fallback settle timer armed before the motion must neither fire
+  /// mid-motion nor be re-armed by it — every motion's completion path
+  /// performs its own settle.
+  bool get _cameraMotionActive =>
+      _panController != null ||
+      (_fractionalController?.isAnimating ?? false) ||
+      _isAnimating;
+
+  void _settleZoomFallback() {
+    final coverage = _zoomFallback;
+    if (coverage == null) return;
+    // Regions must reflect the live grid even before a build ran, so the
+    // settle decision (and any timeout) sees the current coverage.
+    coverage.reconcile();
+    if (!coverage.hasRegions) return;
+    if (_interacting || _cameraMotionActive) {
       return;
     }
     if (_newTilesReady()) {
-      _clearFractionalSnapshot();
+      _clearZoomFallback();
       if (mounted) setState(() {});
-    } else {
-      _fractionalSnapshotTimer?.cancel();
-      _fractionalSnapshotTimer = Timer(_animWaitTimeout, () {
-        if (!mounted || _interacting) return;
-        _clearFractionalSnapshot();
-        setState(() {});
-      });
+      return;
     }
+    _cancelZoomFallbackTimer();
+    _zoomFallbackTimer = Timer(_animWaitTimeout, () {
+      // Gesture input or a camera motion that started after this timer
+      // was armed owns the camera now: its end path re-settles.
+      if (!mounted || _interacting || _cameraMotionActive) return;
+      final current = _zoomFallback;
+      if (current == null || !current.hasRegions) return;
+      // Drop remaining regions (still-missing cells fall back to
+      // checkerboards) and keep the fallback suspended until the grid
+      // membership changes again.
+      current.suspend();
+      setState(() {});
+    });
   }
 
   void _applyContinuousZoom(TileManager manager, double value, Offset focal,
       {bool notify = true}) {
     if (value == manager.cameraZoom) return;
     final oldZoom = manager.zoom;
-    if (value.round() != oldZoom &&
-        _fractionalSnapshot == null &&
-        manager.renderTiles.any((tile) => tile.sourceTile != null)) {
-      manager.calculate();
-      _fractionalSnapshot = _GridSnapshot.from(manager);
-    }
+    // No snapshot capture here: the per-region zoom fallback derives its
+    // coverage from the rendered cache at the next build, so a zoom step
+    // (or a plain pan revealing unloaded cells) is covered geographically
+    // without pinning one whole-grid snapshot. The transition pin keeps
+    // the old imagery alive across the grid switch itself.
+    _zoomFallback?.beginZoomTransition();
     manager.setCameraZoom(value, focalPoint: focal);
     _currentZoom = manager.zoom;
     if (oldZoom != manager.zoom) {
@@ -1212,7 +1196,7 @@ class _MapViewState extends State<MapView>
     _clearZoomSnapshot();
     _animWaitingTiles = false;
     _pinchTransitionActive = false;
-    _fractionalSnapshotTimer?.cancel();
+    _cancelZoomFallbackTimer();
     final origin =
         focal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
     if (!animate ||
@@ -1228,7 +1212,7 @@ class _MapViewState extends State<MapView>
             .dispatch(context);
         setState(() {});
       }
-      _settleFractionalSnapshot();
+      _settleZoomFallback();
       _scheduleLocationFollow(force: true);
       return;
     }
@@ -1273,7 +1257,7 @@ class _MapViewState extends State<MapView>
     }
     if (!mounted || _fractionalController != controller) return;
     _stopFractionalAnimation();
-    _settleFractionalSnapshot();
+    _settleZoomFallback();
     _scheduleLocationFollow(force: true);
   }
 
@@ -1346,6 +1330,9 @@ class _MapViewState extends State<MapView>
     final oldZoom = manager.zoom;
     final focal =
         focalLocal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
+    // Instant integer steps have no animated overlay, so the per-region
+    // fallback is the only continuity — pin across the switch.
+    _zoomFallback?.beginZoomTransition();
     manager.setZoomWithFocalPoint(newZoom, focal, oldZoom);
     _currentZoom = newZoom;
     widget.onZoomChanged?.call(newZoom);
@@ -1355,6 +1342,7 @@ class _MapViewState extends State<MapView>
             fractionalZoom: manager.cameraZoom)
         .dispatch(context);
     setState(() {});
+    _settleZoomFallback();
     _scheduleLocationFollow(force: true);
   }
 
@@ -1370,19 +1358,28 @@ class _MapViewState extends State<MapView>
 
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _settleFractionalSnapshot();
+    // A settle timer from an earlier zoom/pan must not suspend coverage
+    // while this pan owns the camera; the completion path re-settles.
+    _cancelZoomFallbackTimer();
     final target = LatLng(
       latitude: clampLatitude(latLng.latitude),
       longitude: clampLongitude(latLng.longitude),
     );
 
     if (!(animate ?? widget.animateZoom) || duration == Duration.zero) {
+      // setCenterTile does not reconcile the grid (unlike the zoom
+      // setters); calculate explicitly so the settle below covers the
+      // post-move window, not the pre-move one.
       manager.setCenterTile(latLng: target);
+      manager.calculate();
       _notifyCamera(manager);
       MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
               fractionalZoom: manager.cameraZoom)
           .dispatch(context);
       if (mounted) setState(() {});
+      // Settle after the move: reconciling before it would cover the old
+      // window only, leaving newly revealed regions without a timeout.
+      _settleZoomFallback();
       return;
     }
 
@@ -1422,6 +1419,12 @@ class _MapViewState extends State<MapView>
     }
     if (!mounted || _panController != controller) return;
     _stopPanAnimation();
+    // The final tick's frame may not have built yet; refresh the grid so
+    // the settle reconciles the post-motion window. Animated pans reveal
+    // new cells as they run, and their fallback only becomes
+    // timeout-bounded once the motion is over.
+    manager.calculate();
+    _settleZoomFallback();
     MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
             fractionalZoom: manager.cameraZoom)
         .dispatch(context);
@@ -1439,6 +1442,9 @@ class _MapViewState extends State<MapView>
     final speed = velocity.distance;
     if (!widget.enableFling || !speed.isFinite || speed < 50) return;
     _stopPanAnimation();
+    // Fling motion owns the camera until it ends; any earlier settle
+    // timer is stale (the fling's completion/stop path re-settles).
+    _cancelZoomFallbackTimer();
     final direction = velocity / speed;
     final start = Offset(manager.centerTileLng, manager.centerTileLat);
     final controller = AnimationController.unbounded(vsync: this);
@@ -1455,6 +1461,8 @@ class _MapViewState extends State<MapView>
       // edge. Stop the ticker once both axes are blocked by bounds.
       if (controller.value > 0 && (current - previous).distance < 1e-10) {
         _stopPanAnimation();
+        manager.calculate();
+        _settleZoomFallback();
         MapCameraChangeNotification(manager.centerLatLng, manager.zoom,
                 fractionalZoom: manager.cameraZoom)
             .dispatch(context);
@@ -1478,7 +1486,7 @@ class _MapViewState extends State<MapView>
     }
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _settleFractionalSnapshot();
+    _settleZoomFallback();
     _scrollPixels = 0;
     if (_pointers.isEmpty) {
       _gestureHadMultiplePointers = false;
@@ -1777,6 +1785,9 @@ class _MapViewState extends State<MapView>
     _pinchTransitionActive = false;
     _visualScale = 1.0;
     setState(() {});
+    // Any per-region fallback still covering never-loaded cells gets the
+    // same bounded settle as the fractional path.
+    _settleZoomFallback();
     _scheduleLocationFollow(force: true);
   }
 
@@ -1803,7 +1814,7 @@ class _MapViewState extends State<MapView>
     }
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _fractionalSnapshotTimer?.cancel();
+    _cancelZoomFallbackTimer();
     _interacting = false;
     // A fresh gesture starts with a clean coalescing slot so its first
     // update applies immediately.
@@ -1912,7 +1923,7 @@ class _MapViewState extends State<MapView>
     }
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _fractionalSnapshotTimer?.cancel();
+    _cancelZoomFallbackTimer();
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
     final focal = _lastAppliedGestureFocal;
@@ -2031,6 +2042,10 @@ class _MapViewState extends State<MapView>
         _pinchTransitionActive = true;
         _startPinchTransition(manager, newZoom, focalLocal);
       } else {
+        // Instant (or later) zoom steps of this gesture: no animated
+        // overlay holds the old grid, so pin it across the switch for
+        // the per-region fallback.
+        _zoomFallback?.beginZoomTransition();
         manager.setZoomWithFocalPoint(newZoom, focalLocal, manager.zoom);
         _currentZoom = newZoom;
         widget.onZoomChanged?.call(newZoom);
@@ -2108,7 +2123,7 @@ class _MapViewState extends State<MapView>
       _startFling(manager, details.velocity.pixelsPerSecond);
     }
 
-    _settleFractionalSnapshot();
+    _settleZoomFallback();
     if (_pinchTransitionActive && _animOldSnapshot != null) {
       if (_newTilesReady()) {
         _beginScalePhase();
@@ -2282,6 +2297,25 @@ class _MapViewState extends State<MapView>
         manager.calculate();
         final loadState = manager.loadState;
 
+        // Per-region zoom fallback: cover each missing visible cell with
+        // retained imagery from neighbouring zooms. The coverage object
+        // follows the manager (recreated on style switches); reconcile is
+        // a no-op unless the grid/content revision changed.
+        var coverage = _zoomFallback;
+        if (coverage == null || coverage.manager != manager) {
+          coverage?.dispose();
+          coverage = ZoomFallbackCoverage(manager);
+          _zoomFallback = coverage;
+        }
+        coverage.reconcile();
+        // While the two-phase zoom animation holds its fully opaque old
+        // grid over the viewport, the fallback beneath is invisible — skip
+        // painting it. Direct manipulation keeps it active so a pan past
+        // the snapshot's extent still shows fallback at the leading edge.
+        final fallbackSuppressed =
+            !_interacting && _animWaitingTiles && _animOldSnapshot != null;
+        final fallbackActive = coverage.hasRegions && !fallbackSuppressed;
+
         final runtime = _vectorRuntime;
 
         // During scale animation, render two layers.
@@ -2330,12 +2364,21 @@ class _MapViewState extends State<MapView>
                         _onMapPress(details.localPosition, longPress: true),
                     child: Stack(
                       children: [
-                        if (_fractionalSnapshot != null)
+                        // ── Per-region zoom fallback (below the grid) ──
+                        // Missing cells paint retained ancestor/descendant
+                        // imagery over the checkerboard; loaded cells only
+                        // get the opaque base so transparent replacement
+                        // tiles blend against the plain-grid background.
+                        if (fallbackActive)
                           Positioned.fill(
-                              child: CustomPaint(
-                                  size: size,
-                                  painter: _FractionalFallbackPainter(
-                                      _fractionalSnapshot!, manager))),
+                            child: CustomPaint(
+                              size: size,
+                              painter: ZoomFallbackPainter(
+                                coverage: coverage,
+                                manager: manager,
+                              ),
+                            ),
+                          ),
                         // ── Current tile grid ─
                         Positioned.fill(
                           child: CustomPaint(
@@ -2352,8 +2395,8 @@ class _MapViewState extends State<MapView>
                               tiles: manager.renderTiles,
                               revision: manager.revision,
                               tileScale: manager.zoomScale,
-                              paintBackground: _fractionalSnapshot == null,
-                              paintPlaceholders: _fractionalSnapshot == null,
+                              paintBackground: !fallbackActive,
+                              paintPlaceholders: !fallbackActive,
                             ),
                           ),
                         ),

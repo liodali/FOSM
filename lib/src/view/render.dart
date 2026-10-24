@@ -64,6 +64,13 @@ class RenderCanvasOSM extends CustomPainter {
   static ui.Picture? _checkerEven; // dark top-left
   static ui.Picture? _checkerOdd; // light top-left
 
+  /// The reusable checkerboard picture whose top-left cell is dark for
+  /// even `(lngIndex + latIndex)` parity. Shared with the zoom-fallback
+  /// painter so both layers replay identical placeholders.
+  static ui.Picture checkerPicture(bool darkTopLeft) => darkTopLeft
+      ? (_checkerEven ??= _checkerPicture(true))
+      : (_checkerOdd ??= _checkerPicture(false));
+
   static ui.Picture _checkerPicture(bool darkTopLeft) {
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder);
@@ -125,10 +132,8 @@ class RenderCanvasOSM extends CustomPainter {
           // Reusable checkerboard placeholder — a single picture replay
           // per missing tile instead of hundreds of rect draws. The
           // picture is recorded at (0,0), so translate to the tile origin.
-          final darkTopLeft = (tileLngIndex + tileLatIndex) % 2 == 0;
-          final picture = darkTopLeft
-              ? (_checkerEven ??= _checkerPicture(true))
-              : (_checkerOdd ??= _checkerPicture(false));
+          final picture = checkerPicture(
+              (tileLngIndex + tileLatIndex) % 2 == 0);
           canvas
             ..save()
             ..translate(tileCanvasX, tileCanvasY)
