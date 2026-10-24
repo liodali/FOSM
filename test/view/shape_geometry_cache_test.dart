@@ -41,9 +41,9 @@ List<LatLng> _zigzag(int count, double latSpan, double lngSpan,
       LatLng(
         latitude:
             (center.latitude + math.sin(i * 0.7) * latSpan).clamp(-84.9, 84.9),
-        longitude: (center.longitude + (i / math.max(1, count - 1) - 0.5) *
-                lngSpan)
-            .clamp(-179.9, 179.9),
+        longitude:
+            (center.longitude + (i / math.max(1, count - 1) - 0.5) * lngSpan)
+                .clamp(-179.9, 179.9),
       ),
   ];
 }
@@ -66,8 +66,7 @@ List<LatLng> _circle(int count, double radiusDegrees,
 
 void main() {
   group('ShapeCamera projection parity', () {
-    test('cached world projection is bit-identical to latLngToScreen',
-        () {
+    test('cached world projection is bit-identical to latLngToScreen', () {
       final rng = math.Random(20261023);
       final probes = <LatLng>[
         // Structured edges plus randomized points.
@@ -103,8 +102,7 @@ void main() {
                   reason: 'NaN must project to NaN at zoom $zoom');
             } else {
               expect(actual, expected,
-                  reason:
-                      'offset must be bit-identical at zoom $zoom for $i');
+                  reason: 'offset must be bit-identical at zoom $zoom for $i');
             }
           }
         }
@@ -118,15 +116,36 @@ void main() {
       addTearDown(manager.dispose);
       final cache = ShapeGeometryCache();
       final cases = <List<LatLng>>[
-        [const LatLng(latitude: 0, longitude: -1), const LatLng(latitude: 1, longitude: 1)],
+        [
+          const LatLng(latitude: 0, longitude: -1),
+          const LatLng(latitude: 1, longitude: 1)
+        ],
         const [],
         [const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: 86, longitude: 0), const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: 0, longitude: 181), const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: 0, longitude: -180.5), const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: double.nan, longitude: 0), const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: 0, longitude: double.infinity), const LatLng(latitude: 0, longitude: 0)],
-        [const LatLng(latitude: 90, longitude: 0), const LatLng(latitude: 0, longitude: 0)],
+        [
+          const LatLng(latitude: 86, longitude: 0),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
+        [
+          const LatLng(latitude: 0, longitude: 181),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
+        [
+          const LatLng(latitude: 0, longitude: -180.5),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
+        [
+          const LatLng(latitude: double.nan, longitude: 0),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
+        [
+          const LatLng(latitude: 0, longitude: double.infinity),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
+        [
+          const LatLng(latitude: 90, longitude: 0),
+          const LatLng(latitude: 0, longitude: 0)
+        ],
         _zigzag(64, 40, 100),
       ];
       for (final points in cases) {
@@ -283,8 +302,7 @@ void main() {
             if ((nearest - tap).distanceSquared <= radius * radius) {
               accepted++;
               expect(candidates.contains(i), isTrue,
-                  reason:
-                      'segment $i within radius $radius of $tap must be a '
+                  reason: 'segment $i within radius $radius of $tap must be a '
                       'candidate');
             }
           }
@@ -369,12 +387,10 @@ void main() {
           LatLng(latitude: 0, longitude: -20),
           LatLng(latitude: 0, longitude: 20),
         ]),
-        MapPolyline(
-            points: [
-              const LatLng(latitude: 0, longitude: -5),
-              const LatLng(latitude: 89, longitude: 5), // not projectable
-            ],
-            interactive: true),
+        MapPolyline(points: [
+          const LatLng(latitude: 0, longitude: -5),
+          const LatLng(latitude: 89, longitude: 5), // not projectable
+        ], interactive: true),
         MapPolyline(
             points: _zigzag(9, 3, 6)
               ..addAll(_zigzag(3, 0, 0)), // duplicate vertices
@@ -400,9 +416,7 @@ void main() {
             final direct = hitTestPolylines(lines, manager, tap,
                 longPress: longPress, enableAll: enableAll);
             final cached = hitTestPolylines(lines, manager, tap,
-                longPress: longPress,
-                enableAll: enableAll,
-                cache: cache);
+                longPress: longPress, enableAll: enableAll, cache: cache);
             if (direct == null) {
               expect(cached, isNull,
                   reason: 'longPress=$longPress enableAll=$enableAll '
@@ -460,18 +474,14 @@ void main() {
     test('prefers the topmost eligible route with identical answers', () {
       final manager = _manager();
       addTearDown(manager.dispose);
-      final lower = MapPolyline(
-          points: [
-            manager.screenToLatLng(const ui.Offset(0, 100)),
-            manager.screenToLatLng(const ui.Offset(200, 100)),
-          ],
-          interactive: true);
-      final top = MapPolyline(
-          points: [
-            manager.screenToLatLng(const ui.Offset(0, 104)),
-            manager.screenToLatLng(const ui.Offset(200, 104)),
-          ],
-          interactive: true);
+      final lower = MapPolyline(points: [
+        manager.screenToLatLng(const ui.Offset(0, 100)),
+        manager.screenToLatLng(const ui.Offset(200, 100)),
+      ], interactive: true);
+      final top = MapPolyline(points: [
+        manager.screenToLatLng(const ui.Offset(0, 104)),
+        manager.screenToLatLng(const ui.Offset(200, 104)),
+      ], interactive: true);
       final cache = ShapeGeometryCache();
       const tap = ui.Offset(100, 102);
       final direct = hitTestPolylines([lower, top], manager, tap)!;
@@ -513,14 +523,12 @@ void main() {
             interactive: true,
             hitTolerance: 4),
         MapPolygon(points: square(150, 150, 190, 190)), // decorative
-        MapPolygon(
-            points: [
-              // Not projectable — both paths must skip it.
-              const LatLng(latitude: 0, longitude: 200),
-              const LatLng(latitude: 1, longitude: 1),
-              const LatLng(latitude: 2, longitude: 2),
-            ],
-            interactive: true),
+        MapPolygon(points: [
+          // Not projectable — both paths must skip it.
+          const LatLng(latitude: 0, longitude: 200),
+          const LatLng(latitude: 1, longitude: 1),
+          const LatLng(latitude: 2, longitude: 2),
+        ], interactive: true),
       ];
 
       final taps = <ui.Offset>[
@@ -545,9 +553,7 @@ void main() {
             final direct = hitTestPolygons(polygons, manager, tap,
                 longPress: longPress, enableAll: enableAll);
             final cached = hitTestPolygons(polygons, manager, tap,
-                longPress: longPress,
-                enableAll: enableAll,
-                cache: cache);
+                longPress: longPress, enableAll: enableAll, cache: cache);
             if (direct == null) {
               expect(cached, isNull, reason: 'tap=$tap longPress=$longPress');
               continue;
@@ -570,8 +576,8 @@ void main() {
         final canvas = ui.Canvas(recorder);
         paint(canvas, _size);
         final picture = recorder.endRecording();
-        final image = await picture.toImage(
-            _size.width.toInt(), _size.height.toInt());
+        final image =
+            await picture.toImage(_size.width.toInt(), _size.height.toInt());
         picture.dispose();
         final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
         image.dispose();
@@ -582,7 +588,8 @@ void main() {
 
     /// Spec mirror of the original solid painter: full path, border then
     /// main stroke, identical stroke parameters, no culling.
-    ui.Paint referenceStroke(MapPolyline polyline, double width, ui.Color color) =>
+    ui.Paint referenceStroke(
+            MapPolyline polyline, double width, ui.Color color) =>
         ui.Paint()
           ..style = ui.PaintingStyle.stroke
           ..strokeWidth = width
@@ -592,8 +599,8 @@ void main() {
           ..color = color
           ..isAntiAlias = true;
 
-    void referenceSolid(
-        ui.Canvas canvas, ui.Size size, MapPolyline polyline, TileManager manager) {
+    void referenceSolid(ui.Canvas canvas, ui.Size size, MapPolyline polyline,
+        TileManager manager) {
       canvas.save();
       canvas.clipRect(ui.Offset.zero & size);
       final path = ui.Path();
@@ -610,12 +617,13 @@ void main() {
       if (polyline.borderColor != null && polyline.borderWidth > 0) {
         canvas.drawPath(
             path,
-            referenceStroke(polyline,
+            referenceStroke(
+                polyline,
                 polyline.strokeWidth + 2 * polyline.borderWidth,
                 polyline.borderColor!));
       }
-      canvas.drawPath(
-          path, referenceStroke(polyline, polyline.strokeWidth, polyline.color));
+      canvas.drawPath(path,
+          referenceStroke(polyline, polyline.strokeWidth, polyline.color));
       canvas.restore();
     }
 
@@ -657,14 +665,12 @@ void main() {
                   cache: ShapeGeometryCache())
               .paint(canvas, size);
         });
-        final reference =
-            await renderToBytes(tester, (canvas, size) {
+        final reference = await renderToBytes(tester, (canvas, size) {
           referenceSolid(canvas, size, route, manager);
         });
         if (!kIsWeb) {
           expect(painted, equals(reference),
-              reason:
-                  'culled solid path must match the full path for width '
+              reason: 'culled solid path must match the full path for width '
                   '${route.strokeWidth}');
           continue;
         }
@@ -687,12 +693,10 @@ void main() {
           }
         }
         expect(alphaFlips, 0,
-            reason:
-                'culling must never add or remove visible geometry (width '
+            reason: 'culling must never add or remove visible geometry (width '
                 '${route.strokeWidth})');
         expect(maxDelta, lessThanOrEqualTo(96),
-            reason:
-                'web deltas must stay within sub-pixel AA noise (width '
+            reason: 'web deltas must stay within sub-pixel AA noise (width '
                 '${route.strokeWidth})');
       }
       manager.dispose();
@@ -769,14 +773,16 @@ void main() {
       final local = _zigzag(50, 0.3, 1);
       PolylinePainter.debugSolidSegments = 0;
       await renderToBytes(tester, (canvas, size) {
-        PolylinePainter(polylines: [MapPolyline(points: local)], manager: manager)
+        PolylinePainter(
+                polylines: [MapPolyline(points: local)], manager: manager)
             .paint(canvas, size);
       });
       expect(PolylinePainter.debugSolidSegments, local.length - 1);
       manager.dispose();
     });
 
-    testWidgets('polygon bounds culling skips offscreen polygons and keeps '
+    testWidgets(
+        'polygon bounds culling skips offscreen polygons and keeps '
         'pixels identical', (tester) async {
       final manager = _manager(zoom: 3);
       LatLng at(double x, double y) => manager.screenToLatLng(ui.Offset(x, y));
@@ -844,7 +850,8 @@ void main() {
       // The uncached painter (bounds computed from projected rings) must
       // produce the same pixels as the cached one.
       final direct = await renderToBytes(tester, (canvas, size) {
-        PolygonPainter(polygons: polygons, manager: manager).paint(canvas, size);
+        PolygonPainter(polygons: polygons, manager: manager)
+            .paint(canvas, size);
       });
       expect(direct, equals(painted));
       manager.dispose();

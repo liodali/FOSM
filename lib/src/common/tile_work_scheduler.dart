@@ -87,8 +87,7 @@ class TileWorkScheduler {
   /// continuing a checkpointed burst.
   bool _resumesAfterIdle(Duration now) {
     final lastCheckpoint = _lastCheckpointAt;
-    return lastCheckpoint == null ||
-        now - lastCheckpoint > idleResetInterval;
+    return lastCheckpoint == null || now - lastCheckpoint > idleResetInterval;
   }
 
   Future<void> _waitForFrame() {

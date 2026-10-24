@@ -184,8 +184,8 @@ void main() {
 
     expect(coverage.debugRegionKeys(), isNot(contains(retiring.index)));
     expect(coverage.regionCount, total - 1);
-    for (final other in manager.renderTiles
-        .where((tile) => tile.index != retiring.index)) {
+    for (final other
+        in manager.renderTiles.where((tile) => tile.index != retiring.index)) {
       expect(coverage.debugRegionKeys(), contains(other.index));
     }
     coverage.dispose();
@@ -240,8 +240,7 @@ void main() {
     await _drain(tester);
     coverage.reconcile();
     expect(coverage.regionCount, greaterThan(0));
-    expect(
-        coverage.debugRegionSourceKeys('6/31/31'), contains('5/15/15'));
+    expect(coverage.debugRegionSourceKeys('6/31/31'), contains('5/15/15'));
 
     // Back out: every z5 cell is an instantaneous cache hit, so no
     // fallback is needed at all — reversing must not leave stale regions.
@@ -256,8 +255,7 @@ void main() {
     await _drain(tester);
     coverage.reconcile();
     expect(coverage.regionCount, greaterThan(0));
-    expect(
-        coverage.debugRegionSourceKeys('6/31/31'), contains('5/15/15'));
+    expect(coverage.debugRegionSourceKeys('6/31/31'), contains('5/15/15'));
     coverage.dispose();
     manager.dispose();
   });
@@ -313,8 +311,8 @@ void main() {
     await _drain(tester);
     final stuck = manager.renderTiles.first;
     fetcher.fail(6, stuck.lngIndex, stuck.latIndex);
-    for (final tile in manager.renderTiles
-        .where((tile) => tile.index != stuck.index)) {
+    for (final tile
+        in manager.renderTiles.where((tile) => tile.index != stuck.index)) {
       fetcher.deliver(6, tile.lngIndex, tile.latIndex);
     }
     await _drain(tester, until: () {
@@ -447,10 +445,8 @@ void main() {
     // Column 33's parent (5/16/…) survived; column 34's parent (5/17/…)
     // was never retained, so those cells keep plain checkerboards.
     expect(keys, ['6/33/31', '6/33/32']);
-    expect(
-        coverage.debugRegionSourceKeys('6/33/31'), contains('5/16/15'));
-    expect(
-        coverage.debugRegionSourceKeys('6/33/32'), contains('5/16/16'));
+    expect(coverage.debugRegionSourceKeys('6/33/31'), contains('5/16/15'));
+    expect(coverage.debugRegionSourceKeys('6/33/32'), contains('5/16/16'));
     coverage.dispose();
     manager.dispose();
   });
@@ -509,9 +505,8 @@ void main() {
     fetcher.deliverZoom(5);
     await _drain(tester, until: () => _gridLoaded(tester));
 
-    Finder fallbackLayer() => find.byWidgetPredicate(
-        (widget) =>
-            widget is CustomPaint && widget.painter is ZoomFallbackPainter);
+    Finder fallbackLayer() => find.byWidgetPredicate((widget) =>
+        widget is CustomPaint && widget.painter is ZoomFallbackPainter);
 
     expect(fallbackLayer(), findsNothing);
 
@@ -627,8 +622,7 @@ void main() {
     // A programmatic pan reveals new cells; the window change re-enables
     // coverage, and the post-move settle must bound it with a timeout.
     // (12° ≈ two z6 tiles — the new cells' z5 parents stay cached.)
-    controller.moveTo(const LatLng(latitude: 0, longitude: 12),
-        animate: false);
+    controller.moveTo(const LatLng(latitude: 0, longitude: 12), animate: false);
     await tester.pump();
     expect(fallbackVisible(), isTrue);
     await tester.pump(const Duration(milliseconds: 700));
@@ -688,7 +682,8 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('transparent descendant quadrants never blend over the '
+  testWidgets(
+      'transparent descendant quadrants never blend over the '
       'ancestor base', (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;

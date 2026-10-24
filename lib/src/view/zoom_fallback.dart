@@ -219,8 +219,8 @@ class ZoomFallbackCoverage {
       final unit = 1.0 / span;
       base = _FallbackDraw(
         baseEntry.$2,
-        Rect.fromLTWH((cell.x % span) * unit, (cell.y % span) * unit, unit,
-            unit),
+        Rect.fromLTWH(
+            (cell.x % span) * unit, (cell.y % span) * unit, unit, unit),
         const Rect.fromLTWH(0, 0, 1, 1),
       );
       sourceKeys.add(baseEntry.$1);
@@ -235,13 +235,14 @@ class ZoomFallbackCoverage {
         const Rect.fromLTWH(0, 0, 1, 1), 0, refinements, sourceKeys, budget);
 
     if (base == null && refinements.isEmpty) return null;
-    return _FallbackRegion(
-        cellKey, base, refinements, sourceKeys, manager.pinRenderedImages(sourceKeys));
+    return _FallbackRegion(cellKey, base, refinements, sourceKeys,
+        manager.pinRenderedImages(sourceKeys));
   }
 
   /// Nearest retained ancestor of `(z, x, y)` within
   /// [maxAncestorLevels]. Returns the cache key, image and level.
-  (String, ui.Image, int)? _nearestAncestor(TileManager manager, int z, _TileCoord cell) {
+  (String, ui.Image, int)? _nearestAncestor(
+      TileManager manager, int z, _TileCoord cell) {
     for (var level = 1; level <= maxAncestorLevels; level++) {
       final ancestorZoom = z - level;
       if (ancestorZoom < 0) break;
@@ -272,8 +273,15 @@ class ZoomFallbackCoverage {
     return null;
   }
 
-  void _refineWithChildren(TileManager manager, int z, int x, int y, Rect unit,
-      int depth, List<_FallbackDraw> refinements, Set<String> sourceKeys,
+  void _refineWithChildren(
+      TileManager manager,
+      int z,
+      int x,
+      int y,
+      Rect unit,
+      int depth,
+      List<_FallbackDraw> refinements,
+      Set<String> sourceKeys,
       int budget) {
     if (depth >= maxChildDepth) return;
     for (var i = 0; i < 2; i++) {
@@ -306,8 +314,9 @@ class ZoomFallbackCoverage {
     if (_disposed) return;
     _transitionRelease?.call();
     _transitionRelease = null;
-    _transitionRelease = manager.pinRenderedImages(
-        manager.renderTiles.where((tile) => tile.sourceTile != null).map((tile) => tile.index));
+    _transitionRelease = manager.pinRenderedImages(manager.renderTiles
+        .where((tile) => tile.sourceTile != null)
+        .map((tile) => tile.index));
   }
 
   /// Releases every region. Used by camera commands and teardown paths

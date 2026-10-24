@@ -132,8 +132,8 @@ class RenderCanvasOSM extends CustomPainter {
           // Reusable checkerboard placeholder — a single picture replay
           // per missing tile instead of hundreds of rect draws. The
           // picture is recorded at (0,0), so translate to the tile origin.
-          final picture = checkerPicture(
-              (tileLngIndex + tileLatIndex) % 2 == 0);
+          final picture =
+              checkerPicture((tileLngIndex + tileLatIndex) % 2 == 0);
           canvas
             ..save()
             ..translate(tileCanvasX, tileCanvasY)

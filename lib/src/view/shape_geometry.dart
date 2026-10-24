@@ -109,8 +109,9 @@ Offset nearestOnSegment(Offset point, Offset start, Offset end) {
 /// screen-space test decides.
 MapPolylineHit? hitTestPolylines(
     List<MapPolyline> lines, TileManager manager, Offset position,
-    {bool longPress = false, bool enableAll = false,
-     ShapeGeometryCache? cache}) {
+    {bool longPress = false,
+    bool enableAll = false,
+    ShapeGeometryCache? cache}) {
   return GeometryTrace.sync('hit', () {
     // A non-finite position never hit before (all NaN comparisons fail);
     // the indexed path additionally requires finite query coordinates.
@@ -239,8 +240,9 @@ MapPolylineHit? _hitPolylineCached(MapPolyline line, TileManager manager,
 
 MapPolygonHit? hitTestPolygons(
     List<MapPolygon> polygons, TileManager manager, Offset position,
-    {bool longPress = false, bool enableAll = false,
-     ShapeGeometryCache? cache}) {
+    {bool longPress = false,
+    bool enableAll = false,
+    ShapeGeometryCache? cache}) {
   return GeometryTrace.sync('hit', () {
     if (!position.dx.isFinite || !position.dy.isFinite) return null;
     for (final polygon in polygons.reversed) {
@@ -265,8 +267,8 @@ MapPolygonHit? hitTestPolygons(
         final borderReach = polygon.borderWidth > 0 && polygon.borderColor.a > 0
             ? polygon.borderWidth / 2
             : 0.0;
-        if (!ring.boundsOverlaps(
-            camera.worldQueryRect(position, borderReach + polygon.hitTolerance))) {
+        if (!ring.boundsOverlaps(camera.worldQueryRect(
+            position, borderReach + polygon.hitTolerance))) {
           continue;
         }
       }
@@ -305,8 +307,8 @@ bool _borderHitDirect(
   return false;
 }
 
-bool _borderHitCached(MapPolygon polygon, TileManager manager,
-    Offset position, double radius, ShapeGeometryCache cache) {
+bool _borderHitCached(MapPolygon polygon, TileManager manager, Offset position,
+    double radius, ShapeGeometryCache cache) {
   final camera = ShapeCamera.of(manager);
   final query = camera.worldQueryRect(position, radius);
 

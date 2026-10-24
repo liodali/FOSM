@@ -49,11 +49,11 @@ class ProtobufReader {
   /// exactly representable as doubles, so web and native agree up to 2^53;
   /// the final byte wraps like a 64-bit two's-complement overflow on the VM.
   static int _highByteScale(int shift) => switch (shift) {
-        28 => 268435456,             // 2^28
-        35 => 34359738368,           // 2^35
-        42 => 4398046511104,         // 2^42
-        49 => 562949953421312,       // 2^49
-        56 => 72057594037927936,     // 2^56
+        28 => 268435456, // 2^28
+        35 => 34359738368, // 2^35
+        42 => 4398046511104, // 2^42
+        49 => 562949953421312, // 2^49
+        56 => 72057594037927936, // 2^56
         // 2^63 via exact factors: wraps to min int64 on the VM (protobuf
         // two's-complement wrap) and is exact as a double on the web.
         _ => 8 * 268435456 * 268435456 * 268435456,

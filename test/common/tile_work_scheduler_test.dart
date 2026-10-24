@@ -74,8 +74,7 @@ void main() {
     expect(frameRequests, 1);
   });
 
-  test('an idle image lane resumes submissions without a frame wait',
-      () async {
+  test('an idle image lane resumes submissions without a frame wait', () async {
     var elapsed = Duration.zero;
     var frameRequests = 0;
     final scheduler = TileWorkScheduler(

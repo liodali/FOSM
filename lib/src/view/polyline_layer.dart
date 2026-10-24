@@ -94,16 +94,18 @@ class PolylinePainter extends CustomPainter {
         case SolidMapPolylinePattern _:
           final path = GeometryTrace.sync(
               'path', () => _solidPath(polyline, xs, ys, size));
-          GeometryTrace.sync('paint', () => _drawStroke(canvas, polyline, path));
+          GeometryTrace.sync(
+              'paint', () => _drawStroke(canvas, polyline, path));
         case DashedMapPolylinePattern pattern:
-          final path = GeometryTrace.sync('path',
-              () => _dashedPath(polyline, xs, ys, pattern, size));
+          final path = GeometryTrace.sync(
+              'path', () => _dashedPath(polyline, xs, ys, pattern, size));
           if (path != null) {
-            GeometryTrace.sync('paint', () => _drawStroke(canvas, polyline, path));
+            GeometryTrace.sync(
+                'paint', () => _drawStroke(canvas, polyline, path));
           }
         case DottedMapPolylinePattern pattern:
-          final centers = GeometryTrace.sync('path',
-              () => _dottedCenters(polyline, xs, ys, pattern, size));
+          final centers = GeometryTrace.sync(
+              'path', () => _dottedCenters(polyline, xs, ys, pattern, size));
           if (centers != null) {
             GeometryTrace.sync(
                 'paint', () => _drawDots(canvas, polyline, centers));
@@ -147,8 +149,8 @@ class PolylinePainter extends CustomPainter {
   /// unaffected — culling applies to solid routes only. (CanvasKit's
   /// rasterizer can shift anti-aliased coverage by sub-pixel amounts for
   /// split paths; no geometry appears or disappears — regression-tested.)
-  Path _solidPath(MapPolyline polyline, Float64List xs, Float64List ys,
-      Size size) {
+  Path _solidPath(
+      MapPolyline polyline, Float64List xs, Float64List ys, Size size) {
     final path = Path();
     final canCull = size.width.isFinite &&
         size.height.isFinite &&
@@ -323,8 +325,7 @@ class PolylinePainter extends CustomPainter {
     canvas.drawPath(path, _mainPaint(polyline));
   }
 
-  void _drawDots(
-      Canvas canvas, MapPolyline polyline, List<Offset> centers) {
+  void _drawDots(Canvas canvas, MapPolyline polyline, List<Offset> centers) {
     final borderExtension = polyline.borderColor != null &&
             polyline.borderWidth.isFinite &&
             polyline.borderWidth > 0
@@ -384,8 +385,7 @@ class PolylinePainter extends CustomPainter {
 
       final clipped = _clipSegment(startX, startY, endX, endY, viewport);
       if (clipped != null) {
-        final visibleStart =
-            cumulativeDistance + clipped.$1 * segmentLength;
+        final visibleStart = cumulativeDistance + clipped.$1 * segmentLength;
         final visibleEnd = cumulativeDistance + clipped.$2 * segmentLength;
         if (ranges.isNotEmpty && visibleStart <= ranges.last.end) {
           final previous = ranges.last;

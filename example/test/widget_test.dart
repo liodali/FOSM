@@ -158,8 +158,7 @@ void main() {
     expect(find.byType(MapZoomControls), findsNothing);
   });
 
-  testWidgets('MapView onZoomChanged fires on zoom button tap',
-      (tester) async {
+  testWidgets('MapView onZoomChanged fires on zoom button tap', (tester) async {
     int? lastZoom;
     await tester.pumpWidget(
       MaterialApp(

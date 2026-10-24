@@ -46,8 +46,7 @@ class ShapeCamera {
       (ny * worldTiles - centerTileLat) * tileHeight + centerY;
 
   /// Cached world → screen. See [screenX].
-  Offset toScreen(double nx, double ny) =>
-      Offset(screenX(nx), screenY(ny));
+  Offset toScreen(double nx, double ny) => Offset(screenX(nx), screenY(ny));
 
   /// Inverse projection (screen → normalized world) for spatial queries.
   /// The result may round differently than the forward projection; queries
@@ -172,8 +171,7 @@ class CachedShapeRing {
         projectable = false;
       }
     }
-    return CachedShapeRing._(
-        nx, ny, projectable, minNx, minNy, maxNx, maxNy);
+    return CachedShapeRing._(nx, ny, projectable, minNx, minNy, maxNx, maxNy);
   }
 }
 
@@ -235,8 +233,8 @@ class RingSegmentGrid {
     final segmentCount = nx.length - 1;
     final side = math.max(
         1,
-        math.min(_maxSide,
-            math.sqrt(segmentCount / _targetSegmentsPerCell).ceil()));
+        math.min(
+            _maxSide, math.sqrt(segmentCount / _targetSegmentsPerCell).ceil()));
     final spanX = ring.maxNx - ring.minNx;
     final spanY = ring.maxNy - ring.minNy;
     final cellWidth = spanX > 0 ? spanX / side : 1.0;
@@ -288,8 +286,7 @@ class RingSegmentGrid {
     final lowX = _cellIndex(worldRect.left, _ring.minNx, _cellWidth, _side);
     final highX = _cellIndex(worldRect.right, _ring.minNx, _cellWidth, _side);
     final lowY = _cellIndex(worldRect.top, _ring.minNy, _cellHeight, _side);
-    final highY =
-        _cellIndex(worldRect.bottom, _ring.minNy, _cellHeight, _side);
+    final highY = _cellIndex(worldRect.bottom, _ring.minNy, _cellHeight, _side);
 
     for (var cy = lowY; cy <= highY; cy++) {
       for (var cx = lowX; cx <= highX; cx++) {

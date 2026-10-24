@@ -527,8 +527,7 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('resumed dragging cancels a command animation',
-      (tester) async {
+  testWidgets('resumed dragging cancels a command animation', (tester) async {
     final controller = MapController();
     await _mount(tester, controller);
     final gestures = tester.widget<GestureDetector>(find.descendant(

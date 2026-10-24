@@ -414,11 +414,9 @@ void main() {
       final zoom = controller.zoom!;
       final centerY = lat2TileY(controller.center!.latitude, zoom);
       final northScreenY =
-          (lat2TileY(highLatitudeBox.north, zoom) - centerY) * tileHeight +
-              300;
+          (lat2TileY(highLatitudeBox.north, zoom) - centerY) * tileHeight + 300;
       final southScreenY =
-          (lat2TileY(highLatitudeBox.south, zoom) - centerY) * tileHeight +
-              300;
+          (lat2TileY(highLatitudeBox.south, zoom) - centerY) * tileHeight + 300;
       expect(zoom, 2);
       expect(northScreenY, greaterThanOrEqualTo(150));
       expect(southScreenY, lessThanOrEqualTo(600));

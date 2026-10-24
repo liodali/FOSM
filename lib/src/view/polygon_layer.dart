@@ -67,8 +67,8 @@ class PolygonPainter extends CustomPainter {
         if (!_boundsReachViewport(camera, ring, viewport, polygon)) continue;
       }
 
-      final outer =
-          GeometryTrace.sync('project', () => projectRingCached(polygon.points, manager, cache));
+      final outer = GeometryTrace.sync(
+          'project', () => projectRingCached(polygon.points, manager, cache));
       if (outer == null) continue;
 
       if (camera == null && viewport != null) {
@@ -110,8 +110,8 @@ class PolygonPainter extends CustomPainter {
 
   /// Whether [ring]'s screen bounds can reach the viewport under the
   /// polygon's border outset (fill plus stroke, plus an antialiasing pixel).
-  bool _boundsReachViewport(
-      ShapeCamera camera, CachedShapeRing ring, Rect viewport, MapPolygon polygon) {
+  bool _boundsReachViewport(ShapeCamera camera, CachedShapeRing ring,
+      Rect viewport, MapPolygon polygon) {
     final bounds = camera.boundsToScreen(ring);
     if (!bounds.isFinite) return true;
     return bounds.overlaps(viewport.inflate(polygon.borderWidth / 2 + 1));

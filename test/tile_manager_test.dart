@@ -3,7 +3,8 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter_test/flutter_test.dart';import 'package:fosm/src/api/geo_point.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/lat_lng_bounds.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -1152,8 +1153,8 @@ void main() {
       expect(manager.generation, greaterThan(generation));
       expect(manager.revision, greaterThan(revision));
       expect(
-        manager.renderTiles.every((tile) =>
-            !tilesBefore.any((old) => identical(old, tile))),
+        manager.renderTiles
+            .every((tile) => !tilesBefore.any((old) => identical(old, tile))),
         isTrue,
         reason: 'a membership change rebuilds every slot descriptor',
       );

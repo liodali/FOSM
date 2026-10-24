@@ -172,7 +172,8 @@ void main() {
     locationController.dispose();
   });
 
-  testWidgets('cluster results are reused across pans and fractional zoom '
+  testWidgets(
+      'cluster results are reused across pans and fractional zoom '
       'within an integer step', (tester) async {
     final markers = MarkerManager()
       ..addAll([
@@ -201,8 +202,7 @@ void main() {
     MarkerClusterEngine.debugComputations = 0;
 
     // Small pan: world-pixel grouping is camera-independent — reuse.
-    controller.moveTo(
-        const LatLng(latitude: 47.01, longitude: 8.01),
+    controller.moveTo(const LatLng(latitude: 47.01, longitude: 8.01),
         animate: false);
     await tester.pump();
     expect(MarkerClusterEngine.debugComputations, 0,
@@ -254,8 +254,7 @@ void main() {
       expect(tester.takeException(), isNull);
       expect(PolylinePainter.debugSolidSegments, greaterThan(0),
           reason: 'frame $frame must paint the visible band');
-      expect(
-          PolylinePainter.debugSolidSegments, lessThan(2000),
+      expect(PolylinePainter.debugSolidSegments, lessThan(2000),
           reason: 'frame $frame must cull the offscreen majority of the '
               'route');
     }
@@ -271,7 +270,8 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('several simultaneously visible polygons and routes select '
+  testWidgets(
+      'several simultaneously visible polygons and routes select '
       'correctly', (tester) async {
     const center = LatLng(latitude: 47, longitude: 8);
     final polygonHits = <MapPolygon>[];
@@ -303,29 +303,20 @@ void main() {
     ];
     final polylines = <MapPolyline>[
       // Horizontal band between the polygon rows.
-      MapPolyline(
-          points: const [
-            LatLng(latitude: 47, longitude: 7.92),
-            LatLng(latitude: 47, longitude: 8.08),
-          ],
-          interactive: true,
-          onTap: (hit) => routeHits.add(hit.polyline)),
+      MapPolyline(points: const [
+        LatLng(latitude: 47, longitude: 7.92),
+        LatLng(latitude: 47, longitude: 8.08),
+      ], interactive: true, onTap: (hit) => routeHits.add(hit.polyline)),
       // Above every polygon, still inside the viewport.
-      MapPolyline(
-          points: const [
-            LatLng(latitude: 47.065, longitude: 7.95),
-            LatLng(latitude: 47.065, longitude: 8.05),
-          ],
-          interactive: true,
-          onTap: (hit) => routeHits.add(hit.polyline)),
+      MapPolyline(points: const [
+        LatLng(latitude: 47.065, longitude: 7.95),
+        LatLng(latitude: 47.065, longitude: 8.05),
+      ], interactive: true, onTap: (hit) => routeHits.add(hit.polyline)),
       // Vertical through both center polygons; last = topmost.
-      MapPolyline(
-          points: const [
-            LatLng(latitude: 46.93, longitude: 8),
-            LatLng(latitude: 47.07, longitude: 8),
-          ],
-          interactive: true,
-          onTap: (hit) => routeHits.add(hit.polyline)),
+      MapPolyline(points: const [
+        LatLng(latitude: 46.93, longitude: 8),
+        LatLng(latitude: 47.07, longitude: 8),
+      ], interactive: true, onTap: (hit) => routeHits.add(hit.polyline)),
     ];
 
     PolygonPainter.debugPaintedPolygons = 0;
