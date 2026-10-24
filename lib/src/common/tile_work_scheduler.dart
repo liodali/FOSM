@@ -160,8 +160,7 @@ class TileWorkScheduler {
         }
         _imageStarts++;
         _activeImages++;
-        unawaited(work.run().whenComplete(() {
-          _activeImages--;
+        unawaited(work.run(onFinish: _releaseImageSlot).whenComplete(() {
           unawaited(_pumpImages());
         }));
       }
@@ -170,6 +169,16 @@ class TileWorkScheduler {
     } finally {
       _pumping = false;
     }
+  }
+
+  /// Releases an image-lane slot. Invoked by finished work *before* its
+  /// result future completes, so a caller that immediately submits new
+  /// work already observes the drained lane — completing the result first
+  /// raced the caller's continuation against a decrement scheduled in a
+  /// later microtask (observed on skwasm) and made a fully idle lane look
+  /// busy, costing the next submission an extra frame wait.
+  void _releaseImageSlot() {
+    if (_activeImages > 0) _activeImages--;
   }
 
   void dispose() {
@@ -190,7 +199,7 @@ abstract class _ImageWork {
   final int Function()? priority;
   final bool Function()? isRelevant;
   int get priorityValue => priority?.call() ?? 0;
-  Future<void> run();
+  Future<void> run({void Function()? onFinish});
   void abort();
 }
 
@@ -199,15 +208,24 @@ class _TypedImageWork<T> extends _ImageWork {
   final Future<T> Function() create;
   final result = Completer<T>();
 
+  /// [onFinish] runs after the work produced its outcome but *before*
+  /// [result] completes, letting the lane release its slot with the
+  /// deterministic ordering documented on the caller.
   @override
-  Future<void> run() async {
+  Future<void> run({void Function()? onFinish}) async {
     try {
-      result.complete(await create());
+      final value = await create();
+      onFinish?.call();
+      result.complete(value);
     } catch (error, stack) {
+      onFinish?.call();
       result.completeError(error, stack);
     }
   }
 
   @override
-  void abort() => result.completeError(const TileDecodeAborted());
+  void abort() {
+    if (result.isCompleted) return;
+    result.completeError(const TileDecodeAborted());
+  }
 }

@@ -11,6 +11,12 @@ import 'package:fosm/fosm.dart';
 const _runLabel =
     String.fromEnvironment('BENCHMARK_LABEL', defaultValue: 'baseline');
 const _fractional = bool.fromEnvironment('BENCHMARK_FRACTIONAL');
+
+/// Adds window-resize sampling scenarios (`resize_idle`, `resize_motion`).
+/// The app never resizes its own OS window: run it on desktop and drive
+/// resize from outside (AppleScript, wmctrl, …) while the scenarios
+/// sample — see docs/performance/web-desktop.md.
+const _resize = bool.fromEnvironment('BENCHMARK_RESIZE');
 const _warmup = Duration(seconds: 2);
 const _sample = Duration(seconds: 6);
 const _center = LatLng(latitude: 47, longitude: 8);
@@ -46,13 +52,18 @@ class _Scenario {
       this.routePoints = 0,
       this.clustered = false,
       this.dense = false,
-      this.zoom = false});
+      this.zoom = false,
+      this.idle = false});
   final String name;
   final int markers;
   final int routePoints;
   final bool clustered;
   final bool dense;
   final bool zoom;
+
+  /// Samples without camera motion: frames come from the external
+  /// resize driver only (see [BENCHMARK_RESIZE]).
+  final bool idle;
 }
 
 const _scenarios = [
@@ -61,6 +72,14 @@ const _scenarios = [
   _Scenario('route_50000', routePoints: 50000),
   _Scenario('clusters_10000', markers: 10000, clustered: true),
   _Scenario('mixed_camera', markers: 1000, routePoints: 10000, zoom: true),
+];
+
+/// Window-resize sampling: the app holds still (or moves, for the second
+/// scenario) while an external driver resizes the OS window. Frame
+/// percentiles then attribute resize cost separately from camera cost.
+const _resizeScenarios = [
+  _Scenario('resize_idle', markers: 1000, idle: true),
+  _Scenario('resize_motion', markers: 1000),
 ];
 
 class _Benchmark extends StatefulWidget {
@@ -128,7 +147,7 @@ class _BenchmarkState extends State<_Benchmark>
           'warmupSeconds': _warmup.inSeconds,
           'sampleSeconds': _sample.inSeconds,
         })}');
-    for (final scenario in _scenarios) {
+    for (final scenario in (_resize ? _resizeScenarios : _scenarios)) {
       _scenario = scenario;
       _controller.setZoom(10, animate: false);
       _controller.moveTo(_center, animate: false);
@@ -162,13 +181,23 @@ class _BenchmarkState extends State<_Benchmark>
             ];
       setState(() {});
       await WidgetsBinding.instance.endOfFrame;
-      await _drive(_warmup);
+      if (scenario.idle) {
+        // No scripted motion: the external resize driver produces the
+        // frames. Give it the same warmup/sample schedule.
+        await Future<void>.delayed(_warmup);
+      } else {
+        await _drive(_warmup);
+      }
       // Profile mode batches frame reports. Drain warmup reports before sampling.
       await Future<void>.delayed(const Duration(milliseconds: 400));
       final rssBefore = ProcessInfo.currentRss;
       _timings.clear();
       _recording = true;
-      await _drive(_sample);
+      if (scenario.idle) {
+        await Future<void>.delayed(_sample);
+      } else {
+        await _drive(_sample);
+      }
       await Future<void>.delayed(const Duration(milliseconds: 400));
       _recording = false;
       final uiMs = _timings

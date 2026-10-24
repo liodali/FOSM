@@ -99,3 +99,8 @@ deliberately: rebuildable caches (compressed bytes, unused rendered
 imagery, parsed tiles, raster source images, prepared labels, geometry
 rings) are released while the visible grid, pinned fallback imagery and
 camera state survive.
+
+For browser renderer variants (CanvasKit vs skwasm), the bitwise-packing
+audit checklist, production vector-mode browser profiling and the
+desktop resize/high-DPI/large-viewport workloads, see
+[web and desktop measurements](web-desktop.md).
