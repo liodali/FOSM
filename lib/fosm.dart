@@ -26,5 +26,7 @@ export 'src/common/utils.dart' show initMap, tileWidth, tileHeight;
 export 'src/common/cache_tile_mixin.dart' show MapDiskCache;
 export 'src/common/disk_tile_cache.dart'
     show MapDiskCacheOptions, MapDiskCacheStats;
+export 'src/common/memory_attribution.dart';
+export 'src/common/rendered_tile_cache.dart' show RenderedTileCacheStats;
 export 'src/vector/style/style_loader.dart'
     show VectorMapStyle, openFreeMapLiberty;

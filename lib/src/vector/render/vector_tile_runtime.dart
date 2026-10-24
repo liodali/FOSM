@@ -73,7 +73,13 @@ class VectorTileRuntime {
     // `compute()` spawns are avoided. On web [MvtIsolate] is a stub
     // whose spawn() is a no-op and isReady stays false.
     if (parseOffThread) {
-      _mvtSpawn = _mvtIsolate.spawn();
+      // A failed or dispose-aborted spawn surfaces here as a rejected
+      // future. Swallow the rejection eagerly — decodes treat it as
+      // "worker unavailable" and fall back to one-shot compute — so a
+      // failure with no decode in flight cannot become an unhandled
+      // async error.
+      _mvtSpawn =
+          _mvtIsolate.spawn().then<void>((_) {}, onError: (Object _) {});
     }
   }
 

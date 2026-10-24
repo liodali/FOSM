@@ -6,6 +6,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:fosm/fosm.dart'
+    show FosmMemoryAttribution, MapPolyline, RenderedTileCacheStats;
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/map_controller.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -289,14 +291,18 @@ void main() {
       expect(condition(), isTrue, reason: 'condition not met in time');
     }
 
-    await tester.pumpWidget(MaterialApp(
+    await tester.pumpWidget(
+      MaterialApp(
         home: Scaffold(
-            body: MapView(
-      latLng: const LatLng(latitude: 0, longitude: 0),
-      zoom: 3,
-      controller: controller,
-      tileFetcher: (_, __, ___) async => png!,
-    ))));
+          body: MapView(
+            latLng: const LatLng(latitude: 0, longitude: 0),
+            zoom: 3,
+            controller: controller,
+            tileFetcher: (_, __, ___) async => png!,
+          ),
+        ),
+      ),
+    );
 
     final attribution0 = controller.memoryAttribution;
     expect(attribution0, isNotNull,
@@ -341,5 +347,67 @@ void main() {
     // Raster mode: vector buckets report absence, not zeros.
     expect(attribution.parsedTiles, isNull);
     expect(attribution.preparedLabels, isNull);
+  });
+
+  testWidgets('attribution counts cached geometry coordinates in its total',
+      (tester) async {
+    tester.view.physicalSize = const ui.Size(360, 240);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    final png = await tester.runAsync(_pngBytes);
+    final controller = MapController();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: MapView(
+            latLng: const LatLng(latitude: 0, longitude: 0),
+            zoom: 3,
+            controller: controller,
+            tileFetcher: (_, __, ___) async => png!,
+            polylines: const [
+              MapPolyline(
+                points: [
+                  LatLng(latitude: -1, longitude: -1),
+                  LatLng(latitude: 0, longitude: 0),
+                  LatLng(latitude: 1, longitude: 1),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final attribution = controller.memoryAttribution!;
+    expect(attribution.geometryRings, greaterThan(0),
+        reason: 'the painted route must be cached');
+    expect(attribution.geometryVertexUnits, greaterThan(0));
+    // 16 bytes per vertex unit (coordinate storage, index build included).
+    expect(attribution.geometryEstimatedBytes,
+        attribution.geometryVertexUnits * 16);
+    // The probe that motivated this: a geometry-only map must report its
+    // coordinates inside the total, not zero.
+    expect(attribution.estimatedTotalBytes,
+        greaterThanOrEqualTo(attribution.geometryEstimatedBytes));
+    expect(attribution.toString(), contains('geometry~'));
+  });
+
+  test('attribution types are exported from the public barrel', () {
+    // Compile-level guarantee: typed consumers importing only
+    // package:fosm/fosm.dart can name the attribution types.
+    const attribution = FosmMemoryAttribution(
+      renderedImages: RenderedTileCacheStats.empty(),
+      compressedBytes: 0,
+      compressedEntries: 0,
+      geometryRings: 1,
+      geometryVertexUnits: 100,
+      geometryEstimatedBytes: 1600,
+      inFlightLoads: 0,
+      queuedLoads: 0,
+      pendingPresentations: 0,
+      pendingFetches: 0,
+    );
+    expect(attribution.estimatedTotalBytes, 1600);
   });
 }

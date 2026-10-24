@@ -14,6 +14,15 @@ import 'package:fosm/src/common/rendered_tile_cache.dart';
 ///
 /// Vector-only buckets ([parsedTiles], [rasterTiles], labels) are `null`
 /// in raster mode and after the vector runtime was disposed.
+///
+/// Byte coverage: [estimatedTotalBytes] includes every bucket with a
+/// meaningful estimate — rendered images, compressed bytes, parsed tiles,
+/// raster sources and geometry. Deliberately **not** summed: prepared
+/// label painters (reported as [preparedLabels] counts only — text
+/// layout heap varies too much per label for a fixed allowance to be
+/// honest), the sprite atlas, the marker/clustering index and the
+/// persistent disk cache. Attribute those buckets separately when a
+/// capture needs them.
 class FosmMemoryAttribution {
   const FosmMemoryAttribution({
     required this.renderedImages,
@@ -21,6 +30,7 @@ class FosmMemoryAttribution {
     required this.compressedEntries,
     required this.geometryRings,
     required this.geometryVertexUnits,
+    required this.geometryEstimatedBytes,
     required this.inFlightLoads,
     required this.queuedLoads,
     required this.pendingPresentations,
@@ -48,6 +58,12 @@ class FosmMemoryAttribution {
   /// Vertex units charged against the geometry cache budget (16 bytes of
   /// coordinates per unit, doubled once a segment index exists).
   final int geometryVertexUnits;
+
+  /// Estimated coordinate storage of the cached rings:
+  /// [geometryVertexUnits] × 16 bytes. This is the flat normalized world
+  /// coordinate payload (plus built segment indexes), not Dart list/box
+  /// overhead.
+  final int geometryEstimatedBytes;
 
   /// Logical tiles currently being fetched or decoded.
   final int inFlightLoads;
@@ -83,12 +99,17 @@ class FosmMemoryAttribution {
   /// `null` in raster mode.
   final int? preparedLabels;
 
-  /// Estimated retained bytes across all buckets.
+  /// Estimated retained bytes across all buckets with a meaningful
+  /// estimate: rendered images, compressed bytes, parsed tiles, raster
+  /// sources and geometry coordinates. Label painters, the sprite atlas,
+  /// the marker index and the disk cache are counted but not byte-summed
+  /// — see the class documentation.
   int get estimatedTotalBytes =>
       renderedImages.bytes +
       compressedBytes +
       (parsedTileEstimatedBytes ?? 0) +
-      (rasterTileBytes ?? 0);
+      (rasterTileBytes ?? 0) +
+      geometryEstimatedBytes;
 
   /// One-line summary suitable for periodic logging.
   @override
@@ -103,7 +124,7 @@ class FosmMemoryAttribution {
         ' evictable~${_kb(renderedImages.evictableBytes)},'
         ' ${renderedImages.entries} imgs)'
         ' compressed~${_kb(compressedBytes)}($compressedEntries)'
-        ' geometry=$geometryRings rings/$geometryVertexUnits vu'
+        ' geometry~${_kb(geometryEstimatedBytes)}($geometryRings rings/$geometryVertexUnits vu)'
         ' outstanding=loads:$inFlightLoads queued:$queuedLoads'
         ' presents:$pendingPresentations fetches:$pendingFetches'
         '$vector total~${_kb(estimatedTotalBytes)}';

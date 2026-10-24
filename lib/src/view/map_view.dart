@@ -1055,6 +1055,9 @@ class _MapViewState extends State<MapView>
         compressedEntries: _tileManager?.byteCacheEntries ?? 0,
         geometryRings: _shapeGeometryCache.ringCount,
         geometryVertexUnits: _shapeGeometryCache.cachedVertexUnits,
+        // 16 bytes of normalized world coordinates per vertex unit, per
+        // the ShapeGeometryCache budget accounting (index build included).
+        geometryEstimatedBytes: _shapeGeometryCache.cachedVertexUnits * 16,
         inFlightLoads: _tileManager?.inFlightLoadCount ?? 0,
         queuedLoads: _tileManager?.queuedLoadCount ?? 0,
         pendingPresentations: _tileManager?.pendingPresentationCount ?? 0,
@@ -1990,8 +1993,7 @@ class _MapViewState extends State<MapView>
       _scaleStartZoom = manager.zoom - math.log(scale) / math.ln2;
       final startCameraZoom = _scaleStartCameraZoom;
       if (startCameraZoom != null) {
-        _scaleStartCameraZoom =
-            manager.cameraZoom - math.log(scale) / math.ln2;
+        _scaleStartCameraZoom = manager.cameraZoom - math.log(scale) / math.ln2;
       }
     }
     _pinchZoomDirection = 0;
