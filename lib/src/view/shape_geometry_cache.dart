@@ -366,8 +366,15 @@ class ShapeGeometryCache {
   /// Entries currently retained.
   int get debugRingCount => _entries.length;
 
+  /// Entries currently retained (public attribution surface).
+  int get ringCount => _entries.length;
+
   /// Vertex units currently charged against [maxCachedVertices].
   int get debugCachedVertices => _vertexUnits;
+
+  /// Vertex units currently charged against [maxCachedVertices]
+  /// (public attribution surface).
+  int get cachedVertexUnits => _vertexUnits;
 
   /// Total ring projections computed since creation (cache misses).
   int get debugRingBuilds => _builds;

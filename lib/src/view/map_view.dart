@@ -24,6 +24,7 @@ import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
+import 'package:fosm/src/common/memory_attribution.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/view/marker_layer.dart';
@@ -565,11 +566,12 @@ class MapView extends StatefulWidget {
 }
 
 class _MapViewState extends State<MapView>
-    with TickerProviderStateMixin
+    with TickerProviderStateMixin, WidgetsBindingObserver
     implements
         MapControllerDelegate,
         FractionalMapControllerDelegate,
-        LocationMapControllerDelegate {
+        LocationMapControllerDelegate,
+        MapMemoryDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -650,6 +652,10 @@ class _MapViewState extends State<MapView>
   void _pauseLocationFollowing() => widget.locationController?.pause();
 
   final TileWorkScheduler _tileWorkScheduler = TileWorkScheduler();
+
+  /// Cancels the opt-in periodic memory-attribution logger
+  /// (`--dart-define=fosm.traceMemory=true`), null when disabled.
+  VoidCallback? _memoryTraceCancel;
   TileManager? _tileManager;
 
   /// Cached world projections for route/area geometry, shared by the
@@ -762,6 +768,7 @@ class _MapViewState extends State<MapView>
   // level regardless of how many intermediate updates were delivered.
   double? _scaleStartTileLng;
   double? _scaleStartTileLat;
+
   /// Zoom baseline for gesture quantization, as a continuous value: the
   /// rebased baseline keeps its fractional offset (at scale √2 a command
   /// zoom of 8 rebases to 7.5, so repeating the unchanged scale lands on
@@ -824,6 +831,11 @@ class _MapViewState extends State<MapView>
     );
     _animController.addListener(_onAnimTick);
     _animController.addStatusListener(_onAnimStatus);
+
+    // Memory-pressure notifications (iOS/Android memory warnings) drive
+    // deliberate cache trimming; see [didHaveMemoryPressure].
+    WidgetsBinding.instance.addObserver(this);
+    _memoryTraceCancel = MemoryTrace.start(() => memoryAttribution);
 
     _bindLocationController(null);
     widget.controller?.attach(this);
@@ -997,6 +1009,9 @@ class _MapViewState extends State<MapView>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _memoryTraceCancel?.call();
+    _memoryTraceCancel = null;
     widget.locationController?.removeListener(_onLocationChanged);
     _tileWorkScheduler.dispose();
     _stopFractionalAnimation();
@@ -1015,6 +1030,42 @@ class _MapViewState extends State<MapView>
     _vectorRuntime?.dispose();
     super.dispose();
   }
+
+  /// Deliberate memory-pressure response: drop every rebuildable cache
+  /// while the visible grid, pinned fallback imagery and camera state
+  /// survive. The rendered-image cache keeps active/pinned images; the
+  /// byte cache, unused rendered images, parsed vector tiles, raster
+  /// source images, prepared labels and geometry rings are released and
+  /// repopulate on demand as the camera keeps working.
+  @override
+  void didHaveMemoryPressure() {
+    if (!mounted) return;
+    _tileManager?.handleMemoryPressure();
+    _vectorRuntime?.handleMemoryPressure();
+    _shapeGeometryCache.clear();
+  }
+
+  /// Point-in-time attribution of this map's retained memory. Exposed
+  /// through [MapController.memoryAttribution] for workload captures.
+  @override
+  FosmMemoryAttribution get memoryAttribution => FosmMemoryAttribution(
+        renderedImages: _tileManager?.renderedCacheStats ??
+            const RenderedTileCacheStats.empty(),
+        compressedBytes: _tileManager?.byteCacheBytes ?? 0,
+        compressedEntries: _tileManager?.byteCacheEntries ?? 0,
+        geometryRings: _shapeGeometryCache.ringCount,
+        geometryVertexUnits: _shapeGeometryCache.cachedVertexUnits,
+        inFlightLoads: _tileManager?.inFlightLoadCount ?? 0,
+        queuedLoads: _tileManager?.queuedLoadCount ?? 0,
+        pendingPresentations: _tileManager?.pendingPresentationCount ?? 0,
+        pendingFetches: _tileManager?.pendingFetchCount ?? 0,
+        parsedTiles: _vectorRuntime?.parsedTileCount,
+        parsedTileEstimatedBytes: _vectorRuntime?.parsedTileEstimatedBytes,
+        rasterTiles: _vectorRuntime?.rasterTileCount,
+        rasterTileBytes: _vectorRuntime?.rasterTileBytes,
+        preparedLabelTiles: _vectorRuntime?.labelOverlayPreparedTiles,
+        preparedLabels: _vectorRuntime?.labelOverlayPreparedLabels,
+      );
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;

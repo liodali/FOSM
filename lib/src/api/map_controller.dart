@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show EdgeInsets;
 
+import '../common/memory_attribution.dart';
 import 'geo_point.dart';
 import 'lat_lng_bounds.dart';
 import 'marker.dart';
@@ -48,6 +49,16 @@ abstract class FractionalMapControllerDelegate {
 /// Optional location-following capability; existing delegates stay compatible.
 abstract class LocationMapControllerDelegate {
   MapLocationController? get locationController;
+}
+
+/// Optional memory-attribution capability implemented by MapView.
+///
+/// Exposes the retained-memory buckets of the attached map (rendered
+/// images, compressed bytes, parsed vector data, labels, geometry) for
+/// workload captures and long-session memory measurement.
+abstract class MapMemoryDelegate {
+  /// Point-in-time attribution of the attached map's retained memory.
+  FosmMemoryAttribution get memoryAttribution;
 }
 
 /// Programmatic control surface for a [MapView].
@@ -114,6 +125,19 @@ class MapController extends ChangeNotifier {
     final delegate = _delegate;
     return delegate is LocationMapControllerDelegate
         ? (delegate as LocationMapControllerDelegate).locationController
+        : null;
+  }
+
+  /// Point-in-time attribution of the attached map's retained memory
+  /// (rendered images, compressed bytes, parsed vector data, labels,
+  /// geometry), or `null` when detached.
+  ///
+  /// Read periodically during captured workloads to observe which bucket
+  /// grows; see [FosmMemoryAttribution] for what each bucket counts.
+  FosmMemoryAttribution? get memoryAttribution {
+    final delegate = _delegate;
+    return delegate is MapMemoryDelegate
+        ? (delegate as MapMemoryDelegate).memoryAttribution
         : null;
   }
 

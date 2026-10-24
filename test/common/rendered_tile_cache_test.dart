@@ -150,6 +150,78 @@ void main() {
       cache.dispose();
     });
 
+    testWidgets('stats attribute protected and evictable memory separately',
+        (tester) async {
+      final cache = RenderedTileCache();
+      addTearDown(cache.dispose);
+      cache.setActiveKeys({'active'});
+      final active = _image(2, 2);
+      final pinned = _image(2, 2);
+      final unused = _image(1, 1);
+      cache.put('active', active);
+      cache.put('pinned', pinned);
+      cache.put('unused', unused);
+      final release = cache.pin(['pinned']);
+      cache.setActiveKeys({'active'});
+
+      final stats = cache.stats;
+      expect(stats.entries, 3);
+      expect(stats.bytes, 36);
+      // Active-grid and pinned images are both protected; an entry that is
+      // both active and pinned counts once.
+      expect(stats.protectedEntries, 2);
+      expect(stats.protectedBytes, 32);
+      expect(stats.evictableEntries, 1);
+      expect(stats.evictableBytes, 4);
+      release();
+      cache.dispose();
+    });
+
+    testWidgets(
+        'flushUnused drops only unprotected images regardless of policy',
+        (tester) async {
+      var now = DateTime(2026);
+      final cache = RenderedTileCache(now: () => now);
+      addTearDown(cache.dispose);
+      cache.setActiveKeys({'active'});
+      final active = _image(2, 2);
+      final pinned = _image(2, 2);
+      final fresh = _image(1, 1);
+      cache.put('active', active);
+      cache.put('pinned', pinned);
+      final release = cache.pin(['pinned']);
+      cache.setActiveKeys({'active'});
+      // Freshly used and far inside budget/retention — a plain trim would
+      // keep it; a pressure flush must not.
+      cache.put('fresh', fresh);
+      expect(fresh.debugDisposed, isFalse);
+
+      cache.flushUnused();
+      expect(fresh.debugDisposed, isTrue);
+      expect(active.debugDisposed, isFalse);
+      expect(pinned.debugDisposed, isFalse);
+      expect(cache.length, 2);
+      expect(cache.bytes, 32);
+      expect(cache.stats.evictableBytes, 0);
+
+      // Repeated pressure calls are stable no-ops on protected content.
+      cache.flushUnused();
+      expect(cache.length, 2);
+
+      // When protection lifts, the images become evictable again and the
+      // ordinary retention/expiry machinery reclaims them.
+      release();
+      cache.setActiveKeys({});
+      expect(cache.stats.evictableEntries, 2);
+      now = now.add(const Duration(seconds: 21));
+      await tester.pump(const Duration(seconds: 21));
+      expect(pinned.debugDisposed, isTrue);
+      expect(active.debugDisposed, isTrue);
+      expect(cache.length, 0);
+      release();
+      cache.dispose();
+    });
+
     test('rejects negative policies', () {
       expect(() => RenderedTileCache(maxBytes: -1), throwsArgumentError);
       expect(

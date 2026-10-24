@@ -23,6 +23,34 @@ class DecodedVectorTile {
 
   /// Finds a layer by its MVT `source-layer` name in constant time.
   DecodedLayer? layerByName(String name) => _layersByName[name];
+
+  /// Coarse retained-heap estimate used for memory attribution: flat
+  /// geometry buffers plus fixed allowances for feature/property
+  /// bookkeeping. Exact heap accounting is impossible from Dart (strings,
+  /// maps, boxed values), so this is a reproducible estimate for comparing
+  /// workloads, not a physical measurement.
+  int get estimatedBytes {
+    var total = 0;
+    for (final layer in layers) {
+      total += 64; // layer object, name, feature list, map entry
+      for (final feature in layer.features) {
+        total += 96; // feature object, id, geometry list header
+        for (final part in feature.geometry) {
+          total += part.length * 4 + 32; // Float32List payload + header
+        }
+        for (final entry in feature.properties.entries) {
+          total += 48 + entry.key.length * 2;
+          final value = entry.value;
+          if (value is String) {
+            total += value.length * 2;
+          } else {
+            total += 16;
+          }
+        }
+      }
+    }
+    return total;
+  }
 }
 
 /// One MVT layer: a named feature table (e.g. `water`, `transportation`).

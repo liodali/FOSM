@@ -1,5 +1,11 @@
 ## Unreleased
 
+* Attribute retained memory per bucket and expose it for measurement: `MapController.memoryAttribution` reports rendered-image bytes (protected vs evictable), the compressed byte cache, parsed vector tiles (coarse heap estimate), raster-source images, prepared labels, geometry rings and outstanding load counts; `--dart-define=fosm.traceMemory=true` logs one `FOSM memory:` line per attached map per second for long-session device captures.
+
+* Handle system memory pressure deliberately: on `didHaveMemoryPressure` (iOS/Android memory warnings) the map releases every rebuildable cache — compressed bytes, unused rendered imagery, parsed vector tiles, raster-source images (deferred until the decode lane is idle so no in-flight render references a disposed image), prepared label painters and geometry rings — while the visible grid, pinned zoom-fallback imagery and camera state survive; labels re-prepare as tiles decode again.
+
+* Make `VectorTileRuntime.dispose` idempotent (a second dispose previously threw from the label notifier) and stress-test disposal while network fetches, decodes and presentations are still outstanding: late decode results are disposed at the boundary, late fetches repopulate nothing, queued decode waiters unwind as aborted work instead of hanging, and label preparation pending across dispose is dropped without notifying disposed listeners.
+
 * Keep cached cluster badge coordinates aligned with the clamped public centroid, including polar latitudes and off-world longitudes, so rendering and tap/focal-zoom positions agree.
 
 * Fix indexed-marker review findings: preserve widget state with stable per-insertion keys (including duplicate cluster occurrences above max zoom), remove bulk selections in O(n), keep non-projectable markers outside spatial buckets without corrupting collection state, and preserve identity-based cluster deduplication.

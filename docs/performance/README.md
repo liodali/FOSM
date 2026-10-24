@@ -83,3 +83,19 @@ comparisons. For route/area geometry, run with
 `fosm.geometry.paint` (canvas draw calls) and `fosm.geometry.hit`
 (selection) attribute the geometry pipeline per stage. Disable it for
 final frame-rate comparisons.
+
+For long-session retained-memory attribution, run with
+`--dart-define=fosm.traceMemory=true`: each attached `MapView` logs one
+`FOSM memory:` line per second attributing rendered-image bytes (protected
+vs evictable), the compressed byte cache, parsed vector tiles, raster
+source images, prepared labels, geometry rings and outstanding loads.
+Pair these lines with OS memory reporting (iOS footprint, Android
+`dumpsys meminfo`) during repeated pan/zoom/style-switch workloads and
+across background/resume: the attribution lines explain *which* retained
+bucket grows, the OS numbers include the Dart heap, GPU surfaces and
+allocator peaks. Attribution is also available programmatically via
+`MapController.memoryAttribution`. System memory warnings are handled
+deliberately: rebuildable caches (compressed bytes, unused rendered
+imagery, parsed tiles, raster source images, prepared labels, geometry
+rings) are released while the visible grid, pinned fallback imagery and
+camera state survive.

@@ -124,6 +124,48 @@ class TileManager with CacheTiles {
   /// Estimated RGBA pixel memory of retained rendered tiles.
   int get renderedCacheBytes => _memoryCache.bytes;
 
+  /// Point-in-time attribution of the rendered-image cache.
+  RenderedTileCacheStats get renderedCacheStats => _memoryCache.stats;
+
+  /// Compressed payload bytes currently retained in memory.
+  int get byteCacheBytes => _byteCacheSize;
+
+  /// Entries currently retained in the compressed byte cache.
+  int get byteCacheEntries => _byteCache.length;
+
+  /// Logical tiles currently being fetched or decoded.
+  int get inFlightLoadCount => _inFlight.length;
+
+  /// Load jobs waiting for a concurrency slot.
+  int get queuedLoadCount => _loadQueue.length;
+
+  /// Decoded-but-unpublished presentations (queued plus active).
+  int get pendingPresentationCount =>
+      _presentQueue.length + _activePresentEntries.length;
+
+  /// Presentations queued but not yet started.
+  int get queuedPresentationCount => _presentQueue.length;
+
+  /// Presentations currently decoding/publishing on the presentation lane.
+  int get activePresentationCount => _activePresentEntries.length;
+
+  /// Raw network fetches awaiting bytes or timeout.
+  int get pendingFetchCount => _pendingFetches.length;
+
+  /// Deliberate response to system memory pressure.
+  ///
+  /// Drops the in-memory compressed byte cache and every rendered image
+  /// that is not protected by the current grid or a pin (zoom-fallback
+  /// regions, snapshots). Visible tiles keep painting; evicted imagery is
+  /// reloadable from the persistent disk cache or the network. Load state,
+  /// failure tracking and the persistent cache are untouched.
+  void handleMemoryPressure() {
+    if (_disposed) return;
+    _byteCache.clear();
+    _byteCacheSize = 0;
+    _memoryCache.flushUnused();
+  }
+
   /// Protects cached images held by a zoom snapshot until it is released.
   VoidCallback retainSnapshot(Iterable<Tile> tiles) =>
       pinRenderedImages(tiles.map((tile) => tile.index));

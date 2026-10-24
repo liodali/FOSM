@@ -35,7 +35,12 @@ class ParsedVectorTile {
   /// Zoom of the actual source tile ([decoded]'s coordinates).
   final int srcZ;
 
-  ParsedVectorTile({required this.decoded, required this.srcZ});
+  /// [decoded.estimatedBytes], computed once at parse time so attribution
+  /// can sum retained parsed data without re-walking every feature.
+  final int estimatedBytes;
+
+  ParsedVectorTile({required this.decoded, required this.srcZ})
+      : estimatedBytes = decoded.estimatedBytes;
 }
 
 /// Owns everything stateful for rendering one vector style: parsed-tile
@@ -84,9 +89,33 @@ class VectorTileRuntime {
   static const int maxParsedTiles = 32;
   final LinkedHashMap<String, ParsedVectorTile> _parsedTiles = LinkedHashMap();
 
+  /// Parsed source tiles currently retained.
+  int get parsedTileCount => _parsedTiles.length;
+
+  /// Coarse heap estimate of the retained parsed tiles.
+  int get parsedTileEstimatedBytes {
+    var total = 0;
+    for (final parsed in _parsedTiles.values) {
+      total += parsed.estimatedBytes;
+    }
+    return total;
+  }
+
   // ── Raster source tiles (for raster layers like natural earth relief) ─
   static const int maxRasterTiles = 24;
   final LinkedHashMap<String, ui.Image> _rasterTiles = LinkedHashMap();
+
+  /// Raster-source tiles currently retained.
+  int get rasterTileCount => _rasterTiles.length;
+
+  /// Estimated RGBA pixel bytes of the retained raster-source tiles.
+  int get rasterTileBytes {
+    var total = 0;
+    for (final image in _rasterTiles.values) {
+      total += image.width * image.height * 4;
+    }
+    return total;
+  }
 
   // ── Network ─────────────────────────────────────────────────────────
   /// In-flight byte fetches by URL — over-zoom siblings share one download.
@@ -131,6 +160,14 @@ class VectorTileRuntime {
   /// preserved across tile-arrival rebuilds so cached `TextPainter`s
   /// survive. Disposed in [dispose].
   LabelOverlay get labelOverlay => _labelOverlay ??= LabelOverlay(this);
+
+  /// Tiles with prepared labels for attribution; `0` before the overlay
+  /// was first needed (the getter avoids creating it).
+  int get labelOverlayPreparedTiles => _labelOverlay?.preparedTiles ?? 0;
+
+  /// Prepared labels for attribution; `0` before the overlay was first
+  /// needed.
+  int get labelOverlayPreparedLabels => _labelOverlay?.preparedLabels ?? 0;
 
   /// Optional stale-work predicate set by [TileManager]. When it returns
   /// `false` for a logical tile, an in-progress decode aborts with
@@ -262,6 +299,11 @@ class VectorTileRuntime {
       return await job();
     } finally {
       _activeDecodes--;
+      // A pressure flush waits for the presentation lane to go idle so no
+      // disposed raster image can still be referenced by a running decode.
+      if (_activeDecodes == 0 && _rasterFlushPending) {
+        _flushRasterTilesIfIdle();
+      }
       _releaseNext();
     }
   }
@@ -717,7 +759,58 @@ class VectorTileRuntime {
   /// prepared labels and `TextPainter`s survive tile-arrival rebuilds.
   LabelOverlay createLabelOverlay() => labelOverlay;
 
+  bool _rasterFlushPending = false;
+
+  /// Disposes the retained raster-source images once no decode can still
+  /// be using them. While presentations are active the flush is deferred
+  /// via [_rasterFlushPending] and runs when the lane goes idle.
+  void _flushRasterTilesIfIdle() {
+    if (_disposed || _rasterTiles.isEmpty) {
+      _rasterFlushPending = false;
+      return;
+    }
+    if (_activeDecodes > 0) {
+      _rasterFlushPending = true;
+      return;
+    }
+    _rasterFlushPending = false;
+    for (final image in _rasterTiles.values) {
+      image.dispose();
+    }
+    _rasterTiles.clear();
+  }
+
+  /// Deliberate response to system memory pressure.
+  ///
+  /// Drops every rebuildable vector-side cache: parsed source tiles
+  /// (re-parseable from the byte/disk caches), raster-source images (once
+  /// the presentation lane is idle, so no in-flight render references a
+  /// disposed image) and prepared label painters (laid out again when a
+  /// tile next decodes). Base tile imagery is owned by the map's
+  /// [RenderedTileCache] and handled by its own pressure response.
+  ///
+  /// After this call labels return progressively: any tile that decodes
+  /// again (zoom changes, newly revealed cells, evicted-then-reloaded
+  /// imagery) re-prepares its labels; already-cached visible tiles keep
+  /// painting without labels until then.
+  void handleMemoryPressure() {
+    if (_disposed) return;
+    _parsedTiles.clear();
+    _flushRasterTilesIfIdle();
+    final overlay = _labelOverlay;
+    if (overlay != null) {
+      overlay.releasePrepared();
+      // Repaint the label surface so it stops showing released painters'
+      // last rasterized content.
+      _labelsNotifier.notifyLabelsUpdated();
+    }
+  }
+
+  /// Releases every runtime resource and unwinds outstanding work. Safe to
+  /// call more than once; later calls are no-ops (teardown paths may run
+  /// after an explicit dispose, e.g. style switches inside widget teardown).
   void dispose() {
+    if (_disposed) return;
     _networkCancel.cancel('Map disposed');
     _disposed = true;
     _labelPumpTimer?.cancel();

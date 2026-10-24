@@ -62,6 +62,34 @@ class LabelOverlay {
   @visibleForTesting
   int get preparedTileCount => _prepared.length;
 
+  /// Tiles with cached prepared labels (public attribution surface).
+  int get preparedTiles => _prepared.length;
+
+  /// Prepared labels (text/halo painter pairs) across all cached tiles.
+  int get preparedLabels {
+    var total = 0;
+    for (final labels in _prepared.values) {
+      total += labels.length;
+    }
+    return total;
+  }
+
+  /// Disposes every cached label painter and clears the prepared-tile
+  /// cache — the deliberate response to system memory pressure.
+  ///
+  /// Layer styles stay cached (small, shared per zoom). The overlay keeps
+  /// working: [prepare] re-populates entries, tiles without prepared
+  /// labels simply paint none until they prepare again.
+  void releasePrepared() {
+    if (_disposed) return;
+    for (final labels in _prepared.values) {
+      for (final label in labels) {
+        _disposeLabel(label);
+      }
+    }
+    _prepared.clear();
+  }
+
   /// The prepared-tile cache bound (test hook).
   @visibleForTesting
   static int get maxPreparedTilesLimit => _maxPreparedTiles;
