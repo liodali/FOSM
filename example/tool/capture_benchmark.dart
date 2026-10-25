@@ -83,7 +83,7 @@ Future<void> main(List<String> arguments) async {
         await call('resume', {'isolateId': isolateId});
       }
     }
-    await done.future.timeout(const Duration(minutes: 3));
+    await done.future.timeout(const Duration(minutes: 10));
   } finally {
     await subscription.cancel();
     await socket.close();

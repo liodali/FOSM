@@ -1,4 +1,5 @@
 // Native profile-mode benchmark. See docs/performance/README.md.
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -7,6 +8,10 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fosm/fosm.dart';
+
+import 'network_tile_source.dart';
+import 'viewport_sample.dart';
+import 'benchmark_report.dart' show coverageMeanOverWindow;
 
 const _runLabel =
     String.fromEnvironment('BENCHMARK_LABEL', defaultValue: 'baseline');
@@ -17,10 +22,38 @@ const _fractional = bool.fromEnvironment('BENCHMARK_FRACTIONAL');
 /// resize from outside (AppleScript, wmctrl, …) while the scenarios
 /// sample — see docs/performance/web-desktop.md.
 const _resize = bool.fromEnvironment('BENCHMARK_RESIZE');
+
+/// Adds the load/motion acceptance scenarios (`cold_static`, `cold_fling`,
+/// `cold_pinch`, `warm_fling`, `warm_pinch`, `follow`): cold-cache loads
+/// with coverage sampling, decaying flings, zoom-direction reversals and
+/// simulated GPS following. See docs/performance/README.md.
+const _load = bool.fromEnvironment('BENCHMARK_LOAD');
+
+/// Starts every scenario from recreated in-memory caches and a cleared
+/// persistent disk cache (including the five standard scenarios).
+const _cold = bool.fromEnvironment('BENCHMARK_COLD');
+
+/// Simulated-network conditions applied to every tile fetch: fixed RTT,
+/// bandwidth cap and an every-Nth-request failure. Zero disables each.
+const _netDelayMs = int.fromEnvironment('BENCHMARK_NET_DELAY_MS');
+const _netKbps = int.fromEnvironment('BENCHMARK_NET_KBPS');
+const _netDropEvery = int.fromEnvironment('BENCHMARK_NET_DROP_EVERY');
+
+/// Sampled-motion window per scenario in seconds (default six).
+const _sampleSeconds =
+    int.fromEnvironment('BENCHMARK_SAMPLE_SECONDS', defaultValue: 6);
+
+/// Reported in META so A/B reports state which scheduler arm they measured
+/// (`fosm.unpaced=true` is the unpaced pre-scheduler arm).
+const _unpaced = bool.fromEnvironment('fosm.unpaced');
+
 const _warmup = Duration(seconds: 2);
-const _sample = Duration(seconds: 6);
+const _sample = Duration(seconds: _sampleSeconds);
 const _center = LatLng(latitude: 47, longitude: 8);
 late Uint8List _tile;
+
+/// Camera-motion family used while sampling.
+enum _Motion { loop, fling, pinch, follow, none }
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -53,7 +86,10 @@ class _Scenario {
       this.clustered = false,
       this.dense = false,
       this.zoom = false,
-      this.idle = false});
+      this.idle = false,
+      this.motion = _Motion.loop,
+      this.cold = false,
+      this.coverage = false});
   final String name;
   final int markers;
   final int routePoints;
@@ -64,6 +100,19 @@ class _Scenario {
   /// Samples without camera motion: frames come from the external
   /// resize driver only (see [BENCHMARK_RESIZE]).
   final bool idle;
+
+  /// Camera-motion family driving the sample window.
+  final _Motion motion;
+
+  /// Recreate the map (fresh in-memory caches) and clear the persistent
+  /// disk cache first: the scenario then measures a cold load.
+  final bool cold;
+
+  /// Record strict-viewport coverage per frame (time to covered/sharp
+  /// cells, blank fraction over time).
+  final bool coverage;
+
+  _Motion get effectiveMotion => idle ? _Motion.none : motion;
 }
 
 const _scenarios = [
@@ -82,6 +131,40 @@ const _resizeScenarios = [
   _Scenario('resize_motion', markers: 1000),
 ];
 
+/// Load/motion acceptance scenarios (BENCHMARK_LOAD). The cold variants
+/// measure a from-scratch load (fresh caches, optionally a constrained
+/// simulated network) while coverage is sampled per frame; the warm
+/// variants isolate motion-frame tails from loading cost, and `follow`
+/// exercises the location-following retarget path.
+const _loadScenarios = [
+  _Scenario('cold_static',
+      markers: 1000, motion: _Motion.none, cold: true, coverage: true),
+  _Scenario('cold_fling',
+      markers: 1000, motion: _Motion.fling, cold: true, coverage: true),
+  _Scenario('cold_pinch',
+      markers: 1000, motion: _Motion.pinch, cold: true, coverage: true),
+  _Scenario('warm_fling', markers: 1000, motion: _Motion.fling, coverage: true),
+  _Scenario('warm_pinch', markers: 1000, motion: _Motion.pinch, coverage: true),
+  _Scenario('follow', markers: 100, motion: _Motion.follow),
+];
+
+/// Fling parameters: alternating decaying pans. Velocity is
+/// `v0·e^(−t/τ)`; travel integrates to `v0·τ·(1−e^(−t/τ))`. The initial
+/// speed matches a fast real fling (a few tiles per second at zoom 10).
+const _flingTauSeconds = 0.32;
+const _flingSegmentSeconds = 1.6;
+const _flingV0DegPerSec = 3.0;
+final _flingMaxTravelDeg = _flingV0DegPerSec *
+    _flingTauSeconds *
+    (1 - math.exp(-_flingSegmentSeconds / _flingTauSeconds));
+
+/// Pinch-reversal cadence: the zoom direction reverses every half period.
+const _pinchPeriodSeconds = 1.5;
+const _pinchAmplitudeLevels = 0.75;
+
+/// Simulated-GPS cadence for the `follow` scenario.
+const _followFixInterval = Duration(milliseconds: 250);
+
 class _Benchmark extends StatefulWidget {
   const _Benchmark();
   @override
@@ -92,17 +175,38 @@ class _BenchmarkState extends State<_Benchmark>
     with SingleTickerProviderStateMixin {
   final _controller = MapController();
   final _markers = MarkerManager();
+  final _locations = MapLocationController();
+  final _net = SimulatedNetwork(
+      delayMs: _netDelayMs, kbps: _netKbps, dropEvery: _netDropEvery);
   late final AnimationController _motion;
   final _timings = <ui.FrameTiming>[];
   bool _recording = false;
   _Scenario _scenario = _scenarios.first;
   List<MapPolyline> _routes = const [];
 
-  /// Viewport key (`WxH@DPR`) last seen while sampling. Resize scenarios
-  /// are valid only if the external driver actually changed it.
-  String? _lastViewportKey;
-  int _viewportChanges = 0;
-  final Set<String> _viewportSizes = {};
+  /// Incremented before cold scenarios so the map subtree is recreated:
+  /// a fresh tile manager starts with empty in-memory caches and no jobs.
+  int _mapGeneration = 0;
+
+  /// Whether a map is mounted at all. Cold scenarios unmount entirely
+  /// (nothing can load from or write to storage while it is cleared) and
+  /// remount only after recording is armed, so the replacement's first
+  /// load frame is the first frame of the measured window.
+  bool _mapMounted = true;
+  double _motionSeconds = 1;
+  Timer? _followFixTimer;
+  int _followFixes = 0;
+
+  /// Per-frame coverage samples: `[elapsedMs, coveredFraction,
+  /// sharpFraction]`, collected while recording coverage scenarios.
+  final List<List<double>> _coverageSamples = [];
+  Stopwatch? _coverageClock;
+
+  /// Length of the last coverage recording window in ms (clock armed to
+  /// clock stopped), for window-integrated means.
+  double _coverageWindowMs = 0;
+
+  BenchmarkViewportSample? _viewportSample;
 
   @override
   void initState() {
@@ -115,44 +219,110 @@ class _BenchmarkState extends State<_Benchmark>
   void _onTimings(List<ui.FrameTiming> frames) {
     if (!_recording) return;
     _timings.addAll(frames);
-    _trackViewport();
-  }
-
-  /// Samples the implicit view's metrics with each recorded frame so a
-  /// resize that produced frames can never be missed.
-  void _trackViewport() {
-    final view = ui.PlatformDispatcher.instance.views.first;
-    final key = '${view.physicalSize.width}'
-        'x${view.physicalSize.height}@${view.devicePixelRatio}';
-    if (_lastViewportKey != null && key != _lastViewportKey) {
-      _viewportChanges++;
-    }
-    _lastViewportKey = key;
-    _viewportSizes.add(key);
   }
 
   void _move() {
-    final phase = _motion.value * math.pi * 2;
-    _controller.moveTo(
-        LatLng(
-            latitude: 47 + math.sin(phase) * 0.12,
-            longitude: 8 + math.cos(phase) * 0.15),
-        animate: false);
-    if (_scenario.zoom) {
-      if (_fractional) {
-        _controller.setFractionalZoom(10 + math.sin(phase), animate: false);
-      } else {
-        _controller.setZoom(10 + math.sin(phase).round(), animate: false);
-      }
+    final t = _motion.value * _motionSeconds;
+    switch (_scenario.effectiveMotion) {
+      case _Motion.loop:
+        final phase = t * math.pi * 2 / math.max(1, _motionSeconds);
+        _controller.moveTo(
+            LatLng(
+                latitude: 47 + math.sin(phase) * 0.12,
+                longitude: 8 + math.cos(phase) * 0.15),
+            animate: false);
+        if (_scenario.zoom) {
+          if (_fractional) {
+            _controller.setFractionalZoom(10 + math.sin(phase), animate: false);
+          } else {
+            _controller.setZoom(10 + math.sin(phase).round(), animate: false);
+          }
+        }
+      case _Motion.fling:
+        _moveToFling(t);
+      case _Motion.pinch:
+        _controller.setFractionalZoom(
+            10 +
+                _pinchAmplitudeLevels *
+                    math.sin(t * 2 * math.pi / _pinchPeriodSeconds),
+            animate: false);
+      case _Motion.none:
+      case _Motion.follow:
+        break; // Frames come from tile arrival / retargeting, not the ticker.
     }
   }
 
+  /// Alternating decaying pans: deterministic per tick from closed-form
+  /// integration, so interrupted/restarted drives stay identical.
+  void _moveToFling(double t) {
+    final segment = (t / _flingSegmentSeconds).floor();
+    final tSeg = t - segment * _flingSegmentSeconds;
+    var longitude = 8.0;
+    for (var i = 0; i < segment; i++) {
+      longitude += (i.isEven ? 1.0 : -1.0) * _flingMaxTravelDeg;
+    }
+    longitude += (segment.isEven ? 1.0 : -1.0) *
+        _flingV0DegPerSec *
+        _flingTauSeconds *
+        (1 - math.exp(-tSeg / _flingTauSeconds));
+    final latitude = 47 + 0.015 * math.sin(t * 1.1);
+    _controller.moveTo(LatLng(latitude: latitude, longitude: longitude),
+        animate: false);
+  }
+
   Future<void> _drive(Duration duration) async {
+    _motionSeconds = duration.inMicroseconds / 1e6;
     _motion.duration = duration;
     await _motion.forward(from: 0);
   }
 
+  Future<void> _runWindow(Duration duration) async {
+    switch (_scenario.effectiveMotion) {
+      case _Motion.none:
+      case _Motion.follow:
+        await Future<void>.delayed(duration);
+      default:
+        await _drive(duration);
+    }
+  }
+
+  void _startFollow() {
+    _stopFollow();
+    _followFixes = 0;
+    // The owned controller's follow request survives detachment (the
+    // MapView honours it on attach), unlike the MapController delegate
+    // path which is dropped while unmounted.
+    _locations.follow();
+    _followFixTimer = Timer.periodic(_followFixInterval, (_) {
+      final i = _followFixes++;
+      _locations.updateLocation(MapLocation(
+          point: LatLng(
+              latitude: 47 + 0.00030 * i + 0.00002 * math.sin(i),
+              longitude: 8 + 0.00022 * i),
+          accuracyMeters: 6 + 2 * math.sin(i * 0.7).abs(),
+          bearing: 40,
+          timestamp: DateTime.now()));
+    });
+  }
+
+  void _stopFollow() {
+    _followFixTimer?.cancel();
+    _followFixTimer = null;
+  }
+
+  Future<void> _clearDiskCache() async {
+    try {
+      if (MapDiskCache.isInitialized) await MapDiskCache.clear();
+    } catch (_) {
+      // A failed clear turns the scenario warm; the report still says
+      // cold=true, so surface it loudly instead of reporting silently.
+      debugPrint('FOSM_BENCHMARK_INVALID disk-cache clear failed');
+    }
+  }
+
   Future<void> _run() async {
+    final viewportSample = BenchmarkViewportSample(View.of(context));
+    _viewportSample = viewportSample;
     final refresh = View.of(context).display.refreshRate;
     debugPrint('FOSM_BENCHMARK_META ${jsonEncode({
           'label': _runLabel,
@@ -164,12 +334,35 @@ class _BenchmarkState extends State<_Benchmark>
           'physicalHeight': View.of(context).physicalSize.height,
           'fractionalZoom': _fractional,
           'devicePixelRatio': View.of(context).devicePixelRatio,
-          'tileSource': 'offline generated 256x256 raster; no HTTP',
+          'tileSource': _net.inert
+              ? 'offline generated 256x256 raster; no HTTP'
+              : 'offline generated 256x256 raster through simulated '
+                  'network ${_net.describe()}',
           'warmupSeconds': _warmup.inSeconds,
           'sampleSeconds': _sample.inSeconds,
+          'schedulerPaced': !_unpaced,
+          'loadMode': _load,
+          'coldMode': _cold,
+          'net': _net.describe(),
         })}');
-    for (final scenario in (_resize ? _resizeScenarios : _scenarios)) {
+    final scenarios =
+        _resize ? _resizeScenarios : (_load ? _loadScenarios : _scenarios);
+    for (final scenario in scenarios) {
       _scenario = scenario;
+      _stopFollow();
+      _net.reset();
+      final cold = scenario.cold || _cold;
+      if (cold) {
+        // Unmount the old map first: its state is disposed, so nothing
+        // can load from or write to storage while it is cleared. (An
+        // earlier shape of this sequence swapped the key while the old
+        // map stayed mounted — see the review history in
+        // docs/performance/results-scheduler-ios.md for the leaked-tile
+        // artifact that caused.)
+        setState(() => _mapMounted = false);
+        await WidgetsBinding.instance.endOfFrame;
+        await _clearDiskCache();
+      }
       _controller.setZoom(10, animate: false);
       _controller.moveTo(_center, animate: false);
       final span = scenario.dense ? 0.16 : 4.0;
@@ -200,46 +393,74 @@ class _BenchmarkState extends State<_Benchmark>
                   color: Colors.blue,
                   strokeWidth: 4)
             ];
-      setState(() {});
-      await WidgetsBinding.instance.endOfFrame;
+      if (scenario.motion == _Motion.follow) _startFollow();
       // Synchronization signal for external drivers (resize scripts):
       // warmup starts now, sampling starts [BENCHMARK_SAMPLE_START].
       debugPrint('FOSM_BENCHMARK_SCENARIO ${scenario.name} '
-          'warmupSeconds=${_warmup.inSeconds} sampleSeconds=${_sample.inSeconds}');
-      if (scenario.idle) {
-        // No scripted motion: the external resize driver produces the
-        // frames. Give it the same warmup/sample schedule.
-        await Future<void>.delayed(_warmup);
-      } else {
-        await _drive(_warmup);
+          'warmupSeconds=${cold ? 0 : _warmup.inSeconds} '
+          'sampleSeconds=${_sample.inSeconds} motion=${scenario.effectiveMotion.name} cold=$cold');
+      void armRecording() {
+        _timings.clear();
+        viewportSample.start();
+        _coverageSamples.clear();
+        _coverageWindowMs = 0;
+        _coverageClock = scenario.coverage ? (Stopwatch()..start()) : null;
+        if (scenario.coverage) _chainCoverageSample();
+        _recording = true;
+        debugPrint('FOSM_BENCHMARK_SAMPLE_START ${scenario.name}');
       }
-      // Profile mode batches frame reports. Drain warmup reports before sampling.
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-      final rssBefore = ProcessInfo.currentRss;
-      _timings.clear();
-      _lastViewportKey = null;
-      _viewportChanges = 0;
-      _viewportSizes.clear();
-      _recording = true;
-      debugPrint('FOSM_BENCHMARK_SAMPLE_START ${scenario.name}');
-      if (scenario.idle) {
-        await Future<void>.delayed(_sample);
+
+      final int rssBefore;
+      if (cold) {
+        // Arm recording *before* mounting the replacement: its first load
+        // frame — grid build, fetch issuance, early arrivals — is then
+        // the first frame of the measured window, so no cold work escapes
+        // it. Controller calls above were dropped while unmounted; the
+        // widget parameters already hold the scenario's start pose, and
+        // the fresh generation key guarantees a fresh map state.
+        if (!mounted) return;
+        rssBefore = ProcessInfo.currentRss;
+        armRecording();
+        setState(() {
+          _mapMounted = true;
+          _mapGeneration++;
+        });
+        await WidgetsBinding.instance.endOfFrame;
       } else {
-        await _drive(_sample);
+        setState(() {});
+        await WidgetsBinding.instance.endOfFrame;
+        // Warm scenarios drive/settle through warmup as before; the
+        // follow scenario's fixes (started above) flow through warmup.
+        await _runWindow(_warmup);
+        // Profile mode batches frame reports. Drain warmup reports before
+        // sampling.
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        if (!mounted) return;
+        rssBefore = ProcessInfo.currentRss;
+        armRecording();
       }
-      await Future<void>.delayed(const Duration(milliseconds: 400));
+      await _runWindow(_sample);
+      if (!cold) {
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+      }
+      if (!mounted) return;
       _recording = false;
+      viewportSample.stop();
+      final coverageClock = _coverageClock;
+      coverageClock?.stop();
+      _coverageWindowMs = coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
+      _coverageClock = null;
       debugPrint('FOSM_BENCHMARK_SAMPLE_END ${scenario.name}');
       // A resize scenario whose viewport never changed measured nothing:
       // a mistimed external driver produced zero frames (resize_idle) or
       // camera-only frames (resize_motion). Report it as invalid rather
       // than as perfect-looking numbers.
-      final resized = _viewportChanges > 0;
-      final valid = !_resize || resized;
+      final resized = viewportSample.changes > 0;
+      final valid = !_resize || (resized && _timings.isNotEmpty);
       if (!valid) {
-        debugPrint('FOSM_BENCHMARK_INVALID ${scenario.name}: no viewport '
-            'change during sampling — the external resize driver did not '
-            'run, or ran outside the SAMPLE_START/SAMPLE_END window');
+        debugPrint('FOSM_BENCHMARK_INVALID ${scenario.name}: no sampled '
+            'frames or viewport change during sampling — check the external '
+            'resize driver and SAMPLE_START/SAMPLE_END window');
       }
       final uiMs = _timings
           .map((f) => f.buildDuration.inMicroseconds / 1000)
@@ -256,10 +477,16 @@ class _BenchmarkState extends State<_Benchmark>
             'scenario': scenario.name,
             'frames': _timings.length,
             'valid': valid,
-            'viewportChanges': _viewportChanges,
-            'viewportSizes': _viewportSizes.toList(),
+            'viewportChanges': viewportSample.changes,
+            'viewportSizes': viewportSample.sizes.toList(),
             'markers': scenario.markers,
             'routePoints': scenario.routePoints,
+            'motion': scenario.effectiveMotion.name,
+            'cold': cold,
+            'schedulerPaced': !_unpaced,
+            'net': _net.describe(),
+            'network': _net.stats(),
+            if (scenario.coverage) 'coverage': _coverageReport(),
             'uiP50Ms': percentile(uiMs, 0.5),
             'uiP95Ms': percentile(uiMs, 0.95),
             'uiP99Ms': percentile(uiMs, 0.99),
@@ -283,32 +510,119 @@ class _BenchmarkState extends State<_Benchmark>
             'rssBeforeBytes': rssBefore,
             'rssAfterBytes': ProcessInfo.currentRss,
           })}');
+      _stopFollow();
     }
     debugPrint('FOSM_BENCHMARK_DONE $_runLabel');
   }
 
+  /// Chained post-frame callback: samples coverage once per rendered
+  /// frame while recording, then re-arms itself. Stops with recording.
+  void _chainCoverageSample() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_recording || _coverageClock == null) return;
+      final coverage = _controller.tileCoverage;
+      if (coverage != null) {
+        _coverageSamples.add([
+          _coverageClock!.elapsedMilliseconds.toDouble(),
+          coverage.coveredFraction,
+          coverage.sharpFraction,
+        ]);
+      }
+      _chainCoverageSample();
+    });
+  }
+
+  /// Derived coverage metrics plus a downsampled series (at most 72
+  /// points; parallel arrays of elapsed ms, covered and sharp fractions).
+  Map<String, Object?> _coverageReport() {
+    final samples = _coverageSamples;
+    int? firstWhereMs(bool Function(List<double> s) test) {
+      for (final s in samples) {
+        if (test(s)) return s[0].round();
+      }
+      return null;
+    }
+
+    var sharpMin = 1.0;
+    for (final s in samples) {
+      if (s[2] < sharpMin) sharpMin = s[2];
+    }
+    final step = samples.length <= 72 ? 1 : (samples.length / 72).ceil();
+    final seriesMs = <int>[];
+    final seriesCovered = <double>[];
+    final seriesSharp = <double>[];
+    for (var i = 0; i < samples.length; i += step) {
+      seriesMs.add(samples[i][0].round());
+      seriesCovered.add(_round4(samples[i][1]));
+      seriesSharp.add(_round4(samples[i][2]));
+    }
+    if (samples.isNotEmpty &&
+        (seriesMs.isEmpty || seriesMs.last != samples.last[0].round())) {
+      seriesMs.add(samples.last[0].round());
+      seriesCovered.add(_round4(samples.last[1]));
+      seriesSharp.add(_round4(samples.last[2]));
+    }
+    return {
+      'samples': samples.length,
+      'firstCoveredMs': firstWhereMs((s) => s[1] > 0),
+      'allCoveredMs': firstWhereMs((s) => s[1] >= 1),
+      'allSharpMs': firstWhereMs((s) => s[2] >= 1),
+      'minSharpFraction': _round4(sharpMin),
+      // Window-integrated means: each sample holds until the next (with
+      // boundary extension to the recording-window ends), so arms
+      // publishing at different frame frequencies — or a still map whose
+      // frames stop early — compare coverage over the *whole* window.
+      'meanCoveredFraction':
+          _round4OrNull(coverageMeanOverWindow(samples, 1, _coverageWindowMs)),
+      'meanSharpFraction':
+          _round4OrNull(coverageMeanOverWindow(samples, 2, _coverageWindowMs)),
+      'sharpFractionEnd': samples.isEmpty ? null : _round4(samples.last[2]),
+      'seriesMs': seriesMs,
+      'seriesCovered': seriesCovered,
+      'seriesSharp': seriesSharp,
+    };
+  }
+
+  static double? _round4OrNull(double? v) => v == null ? null : _round4(v);
+
+  static double _round4(double v) => (v * 10000).round() / 10000;
+
   @override
   void dispose() {
+    _recording = false;
+    _viewportSample?.stop();
+    _stopFollow();
     WidgetsBinding.instance.removeTimingsCallback(_onTimings);
     _motion.dispose();
     _markers.dispose();
+    _locations.dispose();
     _controller.dispose();
     super.dispose();
   }
 
+  Future<Uint8List> _instantTile(int z, int x, int y) async => _tile;
+
   @override
   Widget build(BuildContext context) => Scaffold(
-          body: MapView(
-        latLng: _center,
-        zoom: 10,
-        enableFractionalZoom: _fractional,
-        controller: _controller,
-        markers: _markers,
-        markerClusterOptions:
-            _scenario.clustered ? const MarkerClusterOptions() : null,
-        polylines: _routes,
-        showScaleBar: true,
-        showZoomControls: false,
-        tileFetcher: (_, __, ___) async => _tile,
-      ));
+      body: _mapMounted
+          ? KeyedSubtree(
+              key: ValueKey<int>(_mapGeneration),
+              child: MapView(
+                latLng: _center,
+                zoom: 10,
+                enableFractionalZoom: _fractional || _load,
+                controller: _controller,
+                locationController: _load ? _locations : null,
+                markers: _markers,
+                markerClusterOptions:
+                    _scenario.clustered ? const MarkerClusterOptions() : null,
+                polylines: _routes,
+                showScaleBar: true,
+                showZoomControls: false,
+                tileFetcher: _net.wrap(_instantTile),
+              ))
+          // While unmounted (cold scenarios clearing storage) the map
+          // subtree is absent entirely — its state is disposed, so no
+          // loads or writes can race the clear.
+          : const SizedBox.expand());
 }
