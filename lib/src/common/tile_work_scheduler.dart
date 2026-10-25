@@ -13,6 +13,13 @@ import '../api/tile_source.dart' show TileDecodeAborted;
 /// allowance: work resuming after [idleResetInterval] starts a fresh slice
 /// and idle image lanes accept submissions without waiting another frame.
 class TileWorkScheduler {
+  /// Compile-time kill switch for measurement A/B runs:
+  /// `--dart-define=fosm.unpaced=true` makes every [MapView] leave its
+  /// tile work unpaced (the pre-scheduler behaviour) with everything else
+  /// in the binary identical — the before/after comparison then changes
+  /// only the feature under test. Never ship a build with this enabled.
+  static const bool disabledByDefine = bool.fromEnvironment('fosm.unpaced');
+
   TileWorkScheduler({
     this.budget = const Duration(milliseconds: 2),
     this.maxImageStartsPerFrame = 2,

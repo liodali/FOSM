@@ -22,6 +22,7 @@ import 'package:fosm/src/api/tile_source.dart';
 import 'package:fosm/src/api/map_load_state.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
+import 'package:fosm/src/common/tile_coverage.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/common/memory_attribution.dart';
@@ -571,7 +572,8 @@ class _MapViewState extends State<MapView>
         MapControllerDelegate,
         FractionalMapControllerDelegate,
         LocationMapControllerDelegate,
-        MapMemoryDelegate {
+        MapMemoryDelegate,
+        MapCoverageDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -651,7 +653,11 @@ class _MapViewState extends State<MapView>
 
   void _pauseLocationFollowing() => widget.locationController?.pause();
 
-  final TileWorkScheduler _tileWorkScheduler = TileWorkScheduler();
+  /// Shared cooperative pacing for this map's tile work, or `null` under
+  /// the measurement-only `fosm.unpaced` define (unpaced pre-scheduler
+  /// behaviour). See [TileWorkScheduler.disabledByDefine].
+  final TileWorkScheduler? _tileWorkScheduler =
+      TileWorkScheduler.disabledByDefine ? null : TileWorkScheduler();
 
   /// Cancels the opt-in periodic memory-attribution logger
   /// (`--dart-define=fosm.traceMemory=true`), null when disabled.
@@ -1013,7 +1019,7 @@ class _MapViewState extends State<MapView>
     _memoryTraceCancel?.call();
     _memoryTraceCancel = null;
     widget.locationController?.removeListener(_onLocationChanged);
-    _tileWorkScheduler.dispose();
+    _tileWorkScheduler?.dispose();
     _stopFractionalAnimation();
     _cancelZoomFallbackTimer();
     _zoomFallback?.dispose();
@@ -1069,6 +1075,15 @@ class _MapViewState extends State<MapView>
         preparedLabelTiles: _vectorRuntime?.labelOverlayPreparedTiles,
         preparedLabels: _vectorRuntime?.labelOverlayPreparedLabels,
       );
+
+  /// Point-in-time strict-viewport coverage of this map. Exposed through
+  /// [MapController.tileCoverage] for workload captures. Cells painted by
+  /// the per-region zoom fallback count as covered (not blank), while
+  /// sharp still requires the cell's own current-zoom image.
+  @override
+  FosmTileCoverage get tileCoverage =>
+      _tileManager?.coverage(isFallbackCovered: _zoomFallback?.coversCell) ??
+      const FosmTileCoverage.empty();
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;
