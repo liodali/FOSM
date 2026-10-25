@@ -10,6 +10,7 @@ import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
+import 'package:fosm/src/common/tile_coverage.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
@@ -426,6 +427,46 @@ class TileManager with CacheTiles {
 
   /// Number of strict-viewport grid cells (including off-world rows).
   int get visibleTileCount => _visibleHorizontalCount * _visibleVerticalCount;
+
+  /// Point-in-time strict-viewport coverage for workload measurement:
+  /// which cells show imagery — their own published image, or fallback
+  /// imagery when [isFallbackCovered] says a cell has it — and which
+  /// retain their own current-zoom image (sharp), ignoring off-world
+  /// rows and padding.
+  FosmTileCoverage coverage(
+      {bool Function(String cellKey)? isFallbackCovered}) {
+    if (_visibleHorizontalCount <= 0 || _visibleVerticalCount <= 0) {
+      return const FosmTileCoverage.empty();
+    }
+    final n = 1 << zoom;
+    var visible = 0;
+    var covered = 0;
+    var sharp = 0;
+    for (var h = 0; h < _visibleHorizontalCount; h++) {
+      final row = (h + tilePadding) * verticalTileCount;
+      for (var v = 0; v < _visibleVerticalCount; v++) {
+        final listIndex = row + tilePadding + v;
+        if (listIndex >= _renderTiles.length) continue;
+        final tile = _renderTiles[listIndex];
+        if (tile.latIndex < 0 || tile.latIndex >= n) continue;
+        visible++;
+        // Non-promoting probe: a measurement getter must not refresh LRU
+        // positions and thereby perturb the eviction behaviour it watches.
+        if (_memoryCache.containsKey(tile.index)) {
+          sharp++;
+          covered++;
+        } else if (tile.sourceTile != null ||
+            (isFallbackCovered?.call(tile.index) ?? false)) {
+          // Published into the grid but not (yet) retained at the
+          // current-zoom key, or covered by zoom-fallback imagery — the
+          // cell shows something, but not its own sharp tile.
+          covered++;
+        }
+      }
+    }
+    return FosmTileCoverage(
+        visibleCells: visible, coveredCells: covered, sharpCells: sharp);
+  }
 
   /// Strict (un-padded) viewport grid dimensions last computed by
   /// [calculate]. Exposed for the per-region zoom-fallback coverage,

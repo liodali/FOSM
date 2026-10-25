@@ -28,5 +28,6 @@ export 'src/common/disk_tile_cache.dart'
     show MapDiskCacheOptions, MapDiskCacheStats;
 export 'src/common/memory_attribution.dart';
 export 'src/common/rendered_tile_cache.dart' show RenderedTileCacheStats;
+export 'src/common/tile_coverage.dart';
 export 'src/vector/style/style_loader.dart'
     show VectorMapStyle, openFreeMapLiberty;

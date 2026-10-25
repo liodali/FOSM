@@ -102,6 +102,12 @@ class ZoomFallbackCoverage {
   /// Whether any cell currently has fallback coverage.
   bool get hasRegions => _regions.isNotEmpty;
 
+  /// Whether [cellKey] currently shows fallback imagery. A region exists
+  /// only while its source images are retained (it pins them for its
+  /// lifetime), and suspension/clear drops regions outright — so presence
+  /// is exactly "this cell is painted with fallback imagery now".
+  bool coversCell(String cellKey) => _regions.containsKey(cellKey);
+
   /// Monotonic change token for `shouldRepaint`.
   int get version => _version;
 

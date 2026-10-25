@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show EdgeInsets;
 
 import '../common/memory_attribution.dart';
+import '../common/tile_coverage.dart';
 import 'geo_point.dart';
 import 'lat_lng_bounds.dart';
 import 'marker.dart';
@@ -59,6 +60,14 @@ abstract class LocationMapControllerDelegate {
 abstract class MapMemoryDelegate {
   /// Point-in-time attribution of the attached map's retained memory.
   FosmMemoryAttribution get memoryAttribution;
+}
+
+/// Exposes the strict-viewport coverage of the attached map for workload
+/// captures: which visible cells published imagery and which show their
+/// own current-zoom (sharp) image.
+abstract class MapCoverageDelegate {
+  /// Point-in-time coverage of the attached map's strict viewport.
+  FosmTileCoverage get tileCoverage;
 }
 
 /// Programmatic control surface for a [MapView].
@@ -138,6 +147,19 @@ class MapController extends ChangeNotifier {
     final delegate = _delegate;
     return delegate is MapMemoryDelegate
         ? (delegate as MapMemoryDelegate).memoryAttribution
+        : null;
+  }
+
+  /// Point-in-time strict-viewport coverage of the attached map, or
+  /// `null` when detached.
+  ///
+  /// Sample per frame during captured workloads to record time to
+  /// first/all covered cells, sharp-coverage time and blank fraction
+  /// over time; see [FosmTileCoverage] for what each counter means.
+  FosmTileCoverage? get tileCoverage {
+    final delegate = _delegate;
+    return delegate is MapCoverageDelegate
+        ? (delegate as MapCoverageDelegate).tileCoverage
         : null;
   }
 
