@@ -132,10 +132,12 @@ flutter run --profile --start-paused -d macos \
     done ) &
   ```
 
-  The harness samples the viewport (physical size and DPR) with every
-  recorded frame and reports `viewportChanges`, `viewportSizes` and a
-  `valid` flag per scenario. A mistimed driver — zero resize during the
-  window — yields `valid: false` and a `FOSM_BENCHMARK_INVALID` line:
+  The harness captures the initial viewport (physical size and DPR) before
+  `SAMPLE_START`, then tracks `didChangeMetrics` events independently of
+  batched frame-timing reports. It reports `viewportChanges`, `viewportSizes`
+  (including the initial size) and a `valid` flag per scenario. A sample
+  without a viewport change or recorded frames yields `valid: false` and a
+  `FOSM_BENCHMARK_INVALID` line:
   `resize_idle` then has no frames at all (percentiles report 0) and
   `resize_motion` measures camera motion only. Discard invalid lines
   instead of treating them as results.
