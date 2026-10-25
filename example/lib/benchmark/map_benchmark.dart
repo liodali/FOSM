@@ -98,6 +98,12 @@ class _BenchmarkState extends State<_Benchmark>
   _Scenario _scenario = _scenarios.first;
   List<MapPolyline> _routes = const [];
 
+  /// Viewport key (`WxH@DPR`) last seen while sampling. Resize scenarios
+  /// are valid only if the external driver actually changed it.
+  String? _lastViewportKey;
+  int _viewportChanges = 0;
+  final Set<String> _viewportSizes = {};
+
   @override
   void initState() {
     super.initState();
@@ -107,7 +113,22 @@ class _BenchmarkState extends State<_Benchmark>
   }
 
   void _onTimings(List<ui.FrameTiming> frames) {
-    if (_recording) _timings.addAll(frames);
+    if (!_recording) return;
+    _timings.addAll(frames);
+    _trackViewport();
+  }
+
+  /// Samples the implicit view's metrics with each recorded frame so a
+  /// resize that produced frames can never be missed.
+  void _trackViewport() {
+    final view = ui.PlatformDispatcher.instance.views.first;
+    final key = '${view.physicalSize.width}'
+        'x${view.physicalSize.height}@${view.devicePixelRatio}';
+    if (_lastViewportKey != null && key != _lastViewportKey) {
+      _viewportChanges++;
+    }
+    _lastViewportKey = key;
+    _viewportSizes.add(key);
   }
 
   void _move() {
@@ -181,6 +202,10 @@ class _BenchmarkState extends State<_Benchmark>
             ];
       setState(() {});
       await WidgetsBinding.instance.endOfFrame;
+      // Synchronization signal for external drivers (resize scripts):
+      // warmup starts now, sampling starts [BENCHMARK_SAMPLE_START].
+      debugPrint('FOSM_BENCHMARK_SCENARIO ${scenario.name} '
+          'warmupSeconds=${_warmup.inSeconds} sampleSeconds=${_sample.inSeconds}');
       if (scenario.idle) {
         // No scripted motion: the external resize driver produces the
         // frames. Give it the same warmup/sample schedule.
@@ -192,7 +217,11 @@ class _BenchmarkState extends State<_Benchmark>
       await Future<void>.delayed(const Duration(milliseconds: 400));
       final rssBefore = ProcessInfo.currentRss;
       _timings.clear();
+      _lastViewportKey = null;
+      _viewportChanges = 0;
+      _viewportSizes.clear();
       _recording = true;
+      debugPrint('FOSM_BENCHMARK_SAMPLE_START ${scenario.name}');
       if (scenario.idle) {
         await Future<void>.delayed(_sample);
       } else {
@@ -200,6 +229,18 @@ class _BenchmarkState extends State<_Benchmark>
       }
       await Future<void>.delayed(const Duration(milliseconds: 400));
       _recording = false;
+      debugPrint('FOSM_BENCHMARK_SAMPLE_END ${scenario.name}');
+      // A resize scenario whose viewport never changed measured nothing:
+      // a mistimed external driver produced zero frames (resize_idle) or
+      // camera-only frames (resize_motion). Report it as invalid rather
+      // than as perfect-looking numbers.
+      final resized = _viewportChanges > 0;
+      final valid = !_resize || resized;
+      if (!valid) {
+        debugPrint('FOSM_BENCHMARK_INVALID ${scenario.name}: no viewport '
+            'change during sampling — the external resize driver did not '
+            'run, or ran outside the SAMPLE_START/SAMPLE_END window');
+      }
       final uiMs = _timings
           .map((f) => f.buildDuration.inMicroseconds / 1000)
           .toList()
@@ -214,6 +255,9 @@ class _BenchmarkState extends State<_Benchmark>
             'label': _runLabel,
             'scenario': scenario.name,
             'frames': _timings.length,
+            'valid': valid,
+            'viewportChanges': _viewportChanges,
+            'viewportSizes': _viewportSizes.toList(),
             'markers': scenario.markers,
             'routePoints': scenario.routePoints,
             'uiP50Ms': percentile(uiMs, 0.5),

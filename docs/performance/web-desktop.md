@@ -106,18 +106,39 @@ flutter run --profile --start-paused -d macos \
   runs `resize_idle` (static camera — frames come only from window
   resizing) and `resize_motion` (camera motion while resizing). Drive
   the resize from outside the app so the harness measures real window
-  pipeline cost:
+  pipeline cost, and synchronize on the printed markers:
+  `FOSM_BENCHMARK_SCENARIO <name>` announces a scenario (with its
+  warmup/sample seconds), `FOSM_BENCHMARK_SAMPLE_START/END <name>`
+  brackets the recording window — the driver should resize only inside
+  that window:
 
   ```sh
-  # macOS: alternate between two sizes every ~250 ms while the
-  # resize scenarios sample (6 s each)
-  osascript -e 'tell application "System Events" to repeat 12 times
-    tell application id "your.bundle.id" to set bounds of window 1 to {0, 0, 1280, 800}
-    delay 0.25
-    tell application id "your.bundle.id" to set bounds of window 1 to {0, 0, 1920, 1200}
-    delay 0.25
-  end repeat'
+  flutter run --profile -d macos -t lib/benchmark/map_benchmark.dart \
+    --dart-define=BENCHMARK_RESIZE=true \
+    --dart-define=BENCHMARK_LABEL=desktop-resize > /tmp/fosm-desktop.log 2>&1 &
+
+  # Driver: for each scenario, wait for its sampling window, then
+  # alternate between two window sizes for its duration (6 s).
+  ( for scenario in resize_idle resize_motion; do
+      while ! grep -q "FOSM_BENCHMARK_SAMPLE_START $scenario" /tmp/fosm-desktop.log; do
+        sleep 0.1
+      done
+      for i in $(seq 12); do
+        osascript -e 'tell application id "your.bundle.id" to set bounds of window 1 to {0, 0, 1280, 800}'
+        sleep 0.25
+        osascript -e 'tell application id "your.bundle.id" to set bounds of window 1 to {0, 0, 1920, 1200}'
+        sleep 0.25
+      done
+    done ) &
   ```
+
+  The harness samples the viewport (physical size and DPR) with every
+  recorded frame and reports `viewportChanges`, `viewportSizes` and a
+  `valid` flag per scenario. A mistimed driver — zero resize during the
+  window — yields `valid: false` and a `FOSM_BENCHMARK_INVALID` line:
+  `resize_idle` then has no frames at all (percentiles report 0) and
+  `resize_motion` measures camera motion only. Discard invalid lines
+  instead of treating them as results.
 
 - **High-DPI / large viewports**: run the standard scenarios on each
   display (Retina vs external 1×) and with the window maximized; the
