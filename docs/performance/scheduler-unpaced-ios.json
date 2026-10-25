@@ -1,0 +1,214 @@
+{
+  "baseCommit": "cd5652dee9c8c20816087c5058cc6e09b4f13efc",
+  "implementation": "fosm.unpaced=true (pre-scheduler arm)",
+  "runs": 1,
+  "metadata": {
+    "label": "unpaced",
+    "mode": "profile",
+    "os": "ios",
+    "osVersion": "Version 27.0.1 (Build 24A446)",
+    "refreshHz": 60.0,
+    "physicalWidth": 1125.0,
+    "physicalHeight": 2436.0,
+    "fractionalZoom": false,
+    "devicePixelRatio": 3.0,
+    "tileSource": "offline generated 256x256 raster; no HTTP",
+    "warmupSeconds": 2,
+    "sampleSeconds": 6,
+    "schedulerPaced": false,
+    "loadMode": false,
+    "coldMode": false,
+    "net": {
+      "delayMs": 0,
+      "kbps": 0,
+      "dropEvery": 0
+    }
+  },
+  "scenarios": [
+    {
+      "label": "unpaced",
+      "scenario": "markers_10000",
+      "frames": 361,
+      "valid": true,
+      "viewportChanges": 0,
+      "viewportSizes": [
+        "1125.0x2436.0@3.0"
+      ],
+      "markers": 10000,
+      "routePoints": 0,
+      "motion": "loop",
+      "cold": false,
+      "schedulerPaced": false,
+      "net": {
+        "delayMs": 0,
+        "kbps": 0,
+        "dropEvery": 0
+      },
+      "network": {
+        "requests": 0,
+        "failures": 0,
+        "bytesServed": 0
+      },
+      "uiP50Ms": 4.873,
+      "uiP95Ms": 5.891,
+      "uiP99Ms": 6.399,
+      "uiMaxMs": 7.002,
+      "rasterP50Ms": 0.592,
+      "rasterP95Ms": 0.893,
+      "rasterP99Ms": 1.05,
+      "rasterMaxMs": 1.273,
+      "framesOver16_67Ms": 0,
+      "framesOverDisplayBudget": 0,
+      "rssBeforeBytes": 86441984,
+      "rssAfterBytes": 94617600
+    },
+    {
+      "label": "unpaced",
+      "scenario": "visible_markers_1000",
+      "frames": 361,
+      "valid": true,
+      "viewportChanges": 0,
+      "viewportSizes": [
+        "1125.0x2436.0@3.0"
+      ],
+      "markers": 1000,
+      "routePoints": 0,
+      "motion": "loop",
+      "cold": false,
+      "schedulerPaced": false,
+      "net": {
+        "delayMs": 0,
+        "kbps": 0,
+        "dropEvery": 0
+      },
+      "network": {
+        "requests": 0,
+        "failures": 0,
+        "bytesServed": 0
+      },
+      "uiP50Ms": 4.299,
+      "uiP95Ms": 5.276,
+      "uiP99Ms": 5.737,
+      "uiMaxMs": 10.183,
+      "rasterP50Ms": 1.731,
+      "rasterP95Ms": 1.791,
+      "rasterP99Ms": 1.991,
+      "rasterMaxMs": 3.087,
+      "framesOver16_67Ms": 0,
+      "framesOverDisplayBudget": 0,
+      "rssBeforeBytes": 92176384,
+      "rssAfterBytes": 93847552
+    },
+    {
+      "label": "unpaced",
+      "scenario": "route_50000",
+      "frames": 361,
+      "valid": true,
+      "viewportChanges": 0,
+      "viewportSizes": [
+        "1125.0x2436.0@3.0"
+      ],
+      "markers": 0,
+      "routePoints": 50000,
+      "motion": "loop",
+      "cold": false,
+      "schedulerPaced": false,
+      "net": {
+        "delayMs": 0,
+        "kbps": 0,
+        "dropEvery": 0
+      },
+      "network": {
+        "requests": 0,
+        "failures": 0,
+        "bytesServed": 0
+      },
+      "uiP50Ms": 1.998,
+      "uiP95Ms": 2.262,
+      "uiP99Ms": 2.769,
+      "uiMaxMs": 6.46,
+      "rasterP50Ms": 1.77,
+      "rasterP95Ms": 1.946,
+      "rasterP99Ms": 2.075,
+      "rasterMaxMs": 4.153,
+      "framesOver16_67Ms": 0,
+      "framesOverDisplayBudget": 0,
+      "rssBeforeBytes": 96927744,
+      "rssAfterBytes": 92323840
+    },
+    {
+      "label": "unpaced",
+      "scenario": "clusters_10000",
+      "frames": 359,
+      "valid": true,
+      "viewportChanges": 0,
+      "viewportSizes": [
+        "1125.0x2436.0@3.0"
+      ],
+      "markers": 10000,
+      "routePoints": 0,
+      "motion": "loop",
+      "cold": false,
+      "schedulerPaced": false,
+      "net": {
+        "delayMs": 0,
+        "kbps": 0,
+        "dropEvery": 0
+      },
+      "network": {
+        "requests": 0,
+        "failures": 0,
+        "bytesServed": 0
+      },
+      "uiP50Ms": 4.178,
+      "uiP95Ms": 8.249,
+      "uiP99Ms": 12.968,
+      "uiMaxMs": 20.486,
+      "rasterP50Ms": 0.548,
+      "rasterP95Ms": 0.73,
+      "rasterP99Ms": 0.818,
+      "rasterMaxMs": 1.703,
+      "framesOver16_67Ms": 1,
+      "framesOverDisplayBudget": 1,
+      "rssBeforeBytes": 117391360,
+      "rssAfterBytes": 108871680
+    },
+    {
+      "label": "unpaced",
+      "scenario": "mixed_camera",
+      "frames": 361,
+      "valid": true,
+      "viewportChanges": 0,
+      "viewportSizes": [
+        "1125.0x2436.0@3.0"
+      ],
+      "markers": 1000,
+      "routePoints": 10000,
+      "motion": "loop",
+      "cold": false,
+      "schedulerPaced": false,
+      "net": {
+        "delayMs": 0,
+        "kbps": 0,
+        "dropEvery": 0
+      },
+      "network": {
+        "requests": 0,
+        "failures": 0,
+        "bytesServed": 0
+      },
+      "uiP50Ms": 3.204,
+      "uiP95Ms": 4.344,
+      "uiP99Ms": 4.609,
+      "uiMaxMs": 7.343,
+      "rasterP50Ms": 1.591,
+      "rasterP95Ms": 1.849,
+      "rasterP99Ms": 1.958,
+      "rasterMaxMs": 2.464,
+      "framesOver16_67Ms": 0,
+      "framesOverDisplayBudget": 0,
+      "rssBeforeBytes": 116113408,
+      "rssAfterBytes": 119177216
+    }
+  ]
+}

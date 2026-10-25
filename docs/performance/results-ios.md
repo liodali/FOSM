@@ -6,6 +6,12 @@ with Metal/Impeller, iOS 27.0.1, a 60 Hz display and DPR 3. The candidate record
 1125 × 2436 physical pixels. The original baseline binary did not record numeric
 viewport dimensions, so viewport equivalence was not independently logged.
 
+**Update (2026-10-25):** the [scheduler A/B comparison](results-scheduler-ios.md)
+on the same device supersedes these runs for the pacing decision: warm parity,
+equal cold-load coverage latency at identical request volume, memory never
+worse, and frame-tail differences within single-run noise — no regression,
+with no tail claim made without repeat runs.
+
 Each scenario used two seconds of warmup and six seconds of sampled motion,
 with reporting queues drained between phases. These are short offline-raster
 samples, not production-style, low-end-device, thermal, or long-session tests.
