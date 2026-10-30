@@ -9,6 +9,9 @@ void main() {
   late Process server;
   late Uri base;
   final client = HttpClient();
+  final markerDir = Directory.systemTemp
+      .createTempSync('marker-sink-test')
+      .path;
 
   setUpAll(() async {
     // Reserve an ephemeral port, release it, and hand it to the server.
@@ -22,6 +25,8 @@ void main() {
       '127.0.0.1',
       '--port',
       '$port',
+      '--marker-log-dir',
+      markerDir,
     ]);
     base = Uri.parse('http://127.0.0.1:$port');
     final deadline = DateTime.now().add(const Duration(seconds: 60));
@@ -42,6 +47,7 @@ void main() {
     client.close(force: true);
     server.kill();
     await server.exitCode;
+    Directory(markerDir).deleteSync(recursive: true);
   });
 
   Future<(HttpClientResponse, List<int>)> get(String path) async {
@@ -53,6 +59,35 @@ void main() {
   }
 
   group('vector payload server', () {
+    test('/log sink appends posted payloads per label', () async {
+      // The browser capture relies on the app POSTing whole payload
+      // lines: marker files must accumulate in posted order and reject
+      // unsafe labels.
+      Future<HttpClientResponse> postLog(String label, String body) async {
+        final request = await client
+            .postUrl(base.resolve('/log?label=$label'));
+        request.add(utf8.encode(body));
+        await request.flush();
+        return request.close();
+      }
+
+      final first =
+          await postLog('r1', 'FOSM_BENCHMARK_META {"label":"r1"}');
+      final second = await postLog(
+          'r1', 'FOSM_BENCHMARK_RESULT {"label":"r1","valid":true}');
+      expect(first.statusCode, 204);
+      expect(second.statusCode, 204);
+      final bad = await postLog('../escape', 'nope');
+      expect(bad.statusCode, 400);
+      final file = File('$markerDir/markers-r1.log');
+      final text = file.readAsStringSync();
+      expect(text.contains('FOSM_BENCHMARK_META {"label":"r1"}'), isTrue);
+      expect(
+          text.contains('FOSM_BENCHMARK_RESULT {"label":"r1","valid":true}'),
+          isTrue);
+      expect(File('$markerDir/markers-escape.log').existsSync(), isFalse);
+    });
+
     test('styles advertise the tile template on the request host',
         () async {
       final (response, bytes) = await get('/style-a.json');

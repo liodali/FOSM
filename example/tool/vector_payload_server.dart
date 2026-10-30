@@ -11,6 +11,10 @@
 //
 // Then run the app with
 //   --dart-define=BENCHMARK_VECTOR_BASE=http://<server-ip>:8787
+// (and --dart-define=BENCHMARK_MARKER_URL=http://<server-ip>:8787/log
+// for browser runs, where app stdout cannot reach the flutter console;
+// markers POST to /log and the server appends them to a per-label file
+// under --marker-log-dir).
 //
 // The app never talks to this tool beyond HTTP; payloads are a pure
 // function of (z, x, y, profile, seed), so payload identity is the
@@ -20,6 +24,7 @@
 //   GET /style-a.json, /style-b.json   style variants a/b
 //   GET /tiles/{z}/{x}/{y}.mvt         synthetic MVT (?profile=|&seed=)
 //   GET /raster/{z}/{x}/{y}.png        raster control tile
+//   POST /log?label=<label>            benchmark marker sink (browser)
 //   GET /healthz                       liveness probe
 
 import 'dart:io';
@@ -33,6 +38,7 @@ Future<void> main(List<String> arguments) async {
   var port = 8787;
   var profile = BenchProfile.denseCity;
   var seed = BenchPayloads.defaultSeed;
+  var markerLogDir = '';
   for (var i = 0; i < arguments.length; i++) {
     switch (arguments[i]) {
       case '--host':
@@ -45,6 +51,8 @@ Future<void> main(List<String> arguments) async {
             : BenchProfile.denseCity;
       case '--seed':
         seed = int.parse(arguments[++i]);
+      case '--marker-log-dir':
+        markerLogDir = arguments[++i];
     }
   }
 
@@ -68,10 +76,52 @@ Future<void> main(List<String> arguments) async {
   await for (final request in server) {
     try {
       final path = request.uri.pathSegments;
+      if (request.method == 'OPTIONS') {
+        request.response
+          ..statusCode = 204
+          ..headers.set('Access-Control-Allow-Origin', '*')
+          ..headers
+              .set('Access-Control-Allow-Headers', request.headers.value(
+                      'Access-Control-Request-Headers') ??
+                  '*');
+        await request.response.close();
+        continue;
+      }
       if (request.uri.path == '/healthz') {
         request.response
           ..statusCode = 200
+          ..headers.set('Access-Control-Allow-Origin', '*')
           ..write('ok');
+        await request.response.close();
+        continue;
+      }
+      if (request.uri.path == '/log') {
+        // Browser marker sink: the app cannot print to a console worth
+        // relaying under flutter_tools' --disable-extensions Chrome, so
+        // it POSTs payload lines here; one file per benchmark label.
+        final label = request.uri.queryParameters['label'];
+        if (markerLogDir.isEmpty ||
+            label == null ||
+            label.isEmpty ||
+            !RegExp(r'^[A-Za-z0-9._-]+$').hasMatch(label)) {
+          request.response
+            ..statusCode = 400
+            ..headers.set('Access-Control-Allow-Origin', '*');
+          await request.response.close();
+          continue;
+        }
+        final dir = Directory(markerLogDir)..createSync(recursive: true);
+        final sink = File('${dir.path}/markers-$label.log')
+            .openWrite(mode: FileMode.append);
+        final body = await request.fold<List<int>>(
+            <int>[], (buffer, chunk) => buffer..addAll(chunk));
+        sink.add(body);
+        sink.add(const [10]); // separators per POST
+        await sink.flush();
+        await sink.close();
+        request.response
+          ..statusCode = 204
+          ..headers.set('Access-Control-Allow-Origin', '*');
         await request.response.close();
         continue;
       }
@@ -121,7 +171,9 @@ Future<void> main(List<String> arguments) async {
         }
       }
 
-      request.response.statusCode = 404;
+      request.response
+        ..statusCode = 404
+        ..headers.set('Access-Control-Allow-Origin', '*');
       await request.response.close();
     } catch (error) {
       stderr.writeln('request failed: $error');
@@ -141,6 +193,9 @@ Future<void> _respond(
     ..statusCode = 200
     ..headers.set(HttpHeaders.contentTypeHeader, contentType)
     ..headers.set('Cache-Control', 'no-store')
+    // Browser runs load tiles/styles cross-origin (dwds serves the app
+    // from its own port); native clients ignore the header.
+    ..headers.set('Access-Control-Allow-Origin', '*')
     ..contentLength = body.length;
   await request.response.addStream(Stream.value(body).cast<List<int>>());
   await request.response.close();
