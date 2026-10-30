@@ -2,7 +2,11 @@
 // marker lines into the structured raw-report format used under
 // docs/performance. Library so tests can drive it directly; the CLI in
 // tool/parse_benchmark_log.dart reads files and prints the report.
+// Kilobyte payloads arrive as chunked continuation lines
+// (FOSM_BENCHMARK_CHUNK/_END) and are reassembled here.
 import 'dart:convert';
+
+import 'log_lines.dart';
 
 /// Result of parsing one capture log.
 class BenchmarkLogParse {
@@ -17,6 +21,10 @@ class BenchmarkLogParse {
   /// exported report as if they were measurements.
   int skippedInvalid = 0;
 
+  /// Payload lines skipped because the JSON could not be reassembled
+  /// (truncated or lost chunks). They must not silently vanish.
+  int skippedMalformed = 0;
+
   /// Whether the run reached its `FOSM_BENCHMARK_DONE` completion marker.
   bool hasDone = false;
 }
@@ -26,30 +34,36 @@ class BenchmarkLogParse {
 /// wherever they appear in a line.
 BenchmarkLogParse parseBenchmarkLog(String text) {
   final parse = BenchmarkLogParse();
-  for (final line in text.split('\n')) {
-    var cleaned = line;
-    const flutterPrefix = 'flutter: ';
-    final flutterAt = cleaned.indexOf(flutterPrefix);
-    if (flutterAt >= 0) {
-      cleaned = cleaned.substring(flutterAt + flutterPrefix.length);
-    }
+  final lines = text.split('\n');
+  for (var index = 0; index < lines.length; index++) {
+    final cleaned = stripConsolePrefix(lines[index]);
     const meta = 'FOSM_BENCHMARK_META ';
     const result = 'FOSM_BENCHMARK_RESULT ';
     const done = 'FOSM_BENCHMARK_DONE ';
     if (cleaned.contains(meta)) {
-      parse.metadata =
-          (jsonDecode(cleaned.substring(cleaned.indexOf(meta) + meta.length))
-                  as Map)
-              .cast<String, dynamic>();
+      final collected = collectPayloadLines(
+          lines, index, cleaned.substring(cleaned.indexOf(meta) + meta.length));
+      index += collected.linesConsumed;
+      try {
+        parse.metadata = (jsonDecode(collected.text) as Map)
+            .cast<String, dynamic>();
+      } on FormatException {
+        parse.skippedMalformed++;
+      }
     } else if (cleaned.contains(result)) {
-      final scenario = (jsonDecode(
-                  cleaned.substring(cleaned.indexOf(result) + result.length))
-              as Map)
-          .cast<String, dynamic>();
-      if (scenario['valid'] == false) {
-        parse.skippedInvalid++;
-      } else {
-        parse.scenarios.add(scenario);
+      final collected = collectPayloadLines(lines, index,
+          cleaned.substring(cleaned.indexOf(result) + result.length));
+      index += collected.linesConsumed;
+      try {
+        final scenario = (jsonDecode(collected.text) as Map)
+            .cast<String, dynamic>();
+        if (scenario['valid'] == false) {
+          parse.skippedInvalid++;
+        } else {
+          parse.scenarios.add(scenario);
+        }
+      } on FormatException {
+        parse.skippedMalformed++;
       }
     } else if (cleaned.contains(done)) {
       parse.hasDone = true;

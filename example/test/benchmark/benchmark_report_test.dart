@@ -4,8 +4,11 @@ import 'package:flutter_test/flutter_test.dart';
 String _meta([String extra = '']) =>
     'FOSM_BENCHMARK_META {"label":"x","schedulerPaced":true$extra}';
 
-String _result(String scenario, {Object? valid}) => 'FOSM_BENCHMARK_RESULT '
-    '{"label":"x","scenario":"$scenario"${valid == null ? '' : ',"valid":$valid'}}';
+String _result(String scenario,
+        {Object? valid, String extra = ''}) =>
+    'FOSM_BENCHMARK_RESULT '
+    '{"label":"x","scenario":"$scenario"$extra'
+    '${valid == null ? '' : ',"valid":$valid'}}';
 
 void main() {
   test('coverage thresholds use exact first crossings and preserve misses', () {
@@ -49,6 +52,50 @@ void main() {
         'Running build hooks...Running build hooks...${_meta()}');
     expect(parse.metadata, isNotNull);
     expect(parse.metadata!['label'], 'x');
+  });
+
+  test('chunked payloads are reassembled across lines', () {
+    // Console relays truncate long lines, so the app rides payloads out
+    // as FOSM_BENCHMARK_CHUNK continuations.
+    final parse = parseBenchmarkLog([
+      _meta(),
+      'flutter: FOSM_BENCHMARK_RESULT {"label":"x","scenario":"big",'
+          '"coverage":{"meanSharpFraction":0.5,',
+      'flutter: FOSM_BENCHMARK_CHUNK "allSharpMs":1234,"samples":10},',
+      'flutter: FOSM_BENCHMARK_CHUNK "valid":true}',
+      'flutter: FOSM_BENCHMARK_CHUNK_END',
+      'flutter: FOSM_BENCHMARK_DONE x',
+    ].join('\n'));
+    expect(parse.scenarios, hasLength(1));
+    final row = parse.scenarios.single;
+    expect(row['scenario'], 'big');
+    expect((row['coverage'] as Map)['allSharpMs'], 1234);
+    expect(row['valid'], isTrue);
+    expect(parse.hasDone, isTrue);
+    expect(parse.skippedMalformed, 0);
+  });
+
+  test('single-line payloads still parse next to chunked ones', () {
+    final parse = parseBenchmarkLog([
+      _meta(),
+      _result('small'),
+      _result('big', extra: ',"uiP50Ms":1.5'),
+      'FOSM_BENCHMARK_DONE x',
+    ].join('\n'));
+    expect(parse.scenarios.map((s) => s['scenario']), ['small', 'big']);
+    expect(parse.skippedMalformed, 0);
+  });
+
+  test('lost chunks surface as skippedMalformed, not a crash', () {
+    final parse = parseBenchmarkLog([
+      _meta(),
+      'flutter: FOSM_BENCHMARK_RESULT {"label":"x","scenario":"broken",',
+      'flutter: FOSM_BENCHMARK_CHUNK {"label":not json',
+      'flutter: FOSM_BENCHMARK_DONE x',
+    ].join('\n'));
+    expect(parse.scenarios, isEmpty);
+    expect(parse.skippedMalformed, 1);
+    expect(parse.hasDone, isTrue);
   });
 
   test('invalid results are skipped, valid ones kept', () {
