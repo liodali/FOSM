@@ -177,8 +177,10 @@ dart run tool/extract_vector_stages.dart OUT OUT/stages
 ## Manual reproduction
 
 ```sh
-# Terminal 1 — payload server (LAN IP for device runs):
-cd example && dart run tool/vector_payload_server.dart --host 0.0.0.0 --port 8787
+# Terminal 1 — payload server (LAN IP for device runs; the server also
+# hosts the browser marker sink at POST /log with --marker-log-dir):
+cd example && dart run tool/vector_payload_server.dart --host 0.0.0.0 --port 8787 \
+  --marker-log-dir ../docs/performance/vector-render-improvement/raw/browser
 
 # Terminal 2 — app (profile mode only):
 cd example && flutter run --profile --start-paused -d DEVICE_ID \
@@ -189,6 +191,23 @@ cd example && flutter run --profile --start-paused -d DEVICE_ID \
 
 The example app permits cleartext to local network hosts for this server
 (`NSAllowsLocalNetworking` on iOS, `usesCleartextTraffic` on Android).
+
+Capture scripts (full rounds, parse steps included):
+
+```sh
+# device: clean×3, spans×2, trace×1 (trace saves the worker timeline)
+cd example && zsh tool/capture_vector_baseline.sh DEVICE_ID \
+  ../docs/performance/vector-render-improvement/raw LAN_IP 3 2 1
+
+# browser (Chrome, separate report): builds two profile web apps, serves
+# them statically, drives Chrome directly and captures via the marker
+# sink; native debug extension/~the flutter run chrome path is unusable
+# (flutter_tools starts Chrome with --disable-extensions, so app prints
+# cannot be relayed):
+cd example && zsh tool/capture_vector_baseline_web.sh \
+  ../docs/performance/vector-render-improvement/raw/browser \
+  http://LAN_IP:8787 2 2 8787
+```
 
 ## Deliverable checklist (plan-01 acceptance)
 
@@ -214,3 +233,12 @@ Timeline snapshot merging preserves phase, async identity, process, scope and
 correlation arguments using canonical full-event JSON. First-sharp and
 95%-covered/sharp crossings use the complete sample series before reduction.
 These corrections require new captures; existing raw files are historical.
+
+Round-2 captures (2026-10-30, same day) satisfy these requirements —
+device numbers in `baseline-iphone.md` supersede the round-1 artifacts
+under `raw/round1/`, and the browser capture (`baseline-browser.md`)
+runs on the marker-sink transport because flutter_tools' Chrome cannot
+host a debug connection (`--disable-extensions`). Kilobyte payload lines
+ride out chunked (`FOSM_BENCHMARK_CHUNK`/`_END`) and parsers reassemble
+them (`lib/benchmark/log_lines.dart`); the app also posts whole lines to
+the `/log` sink when `BENCHMARK_MARKER_URL` is defined (web runs).
