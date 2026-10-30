@@ -3,6 +3,7 @@
 Measured comparison: [physical iPhone profile results](results-ios.md).
 Scheduler A/B (single binary, `fosm.unpaced` arm): [results](results-scheduler-ios.md).
 Matched Flutter/MapCore vector workload tooling: [native comparison](native-comparison.md) (device comparison pending).
+Vector-render baseline & attribution harness (plan 01, captures pending): [vector-render-improvement](vector-render-improvement/README.md).
 
 The frame-pacing change introduces a shared 2 ms cooperative allowance for
 vector recording and label preparation, plus bounded raster/vector image
