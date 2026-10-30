@@ -2,6 +2,8 @@
 
 Inspected 2026-10-18. Static source analysis only; no native-versus-Flutter device benchmark was run for this review. No rendering or package code was changed.
 
+Follow-up 2026-10-25: plans 03, 06 and 08 have since implemented camera/membership separation, marker indexing and per-region fallback. The current Swift wrapper uses local `bounds` for child layout and its root lock now pins `spm.2`. The candidates below describe the original inspection. Matched Flutter/native vector-camera drivers and their gates are in the [native comparison guide](native-comparison.md); device comparison remains open.
+
 The strongest transferable design is a retained map scene: camera motion reuses loaded textures and geometry, background work prepares replacements, and graphics setup is paced separately. FOSM already uses Flutter's GPU renderer; switching from Dart to C++ alone does not establish a performance win. The likely opportunities are reducing UI-isolate work during motion and making tile replacement visually continuous.
 
 ## Source identity
