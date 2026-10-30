@@ -28,6 +28,11 @@
 
 import 'package:fosm/fosm.dart' show VectorSpan;
 
+// "No sample yet" sentinel for stage windows: a large-but-dart2js-safe
+// power of two (the full int64 maximum is not exactly representable as a
+// JavaScript number and fails web compilation).
+const _beforeAnySampleUs = 1 << 62;
+
 const List<String> _asyncEvents = [
   'fetch',
   'queueWait',
@@ -137,7 +142,7 @@ Map<String, Object?> _attemptRow(
   if (existing is Map<String, Object?>) return existing;
   final created = <String, Object?>{
     'attempt': attempt,
-    'startUs': 0x7fffffffffffffff,
+    'startUs': _beforeAnySampleUs,
     'endUs': 0,
   };
   attempts[attempt] = created;
@@ -202,7 +207,7 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
   final stage = existingStage is Map<String, Object?>
       ? existingStage
       : stages[group] = <String, Object?>{
-          'startUs': 0x7fffffffffffffff,
+          'startUs': _beforeAnySampleUs,
           'endUs': 0,
           'totalUs': 0,
           'n': 0,

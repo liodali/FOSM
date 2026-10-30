@@ -30,25 +30,39 @@
 // per-tile stage sums). Add fosm.traceVector=true for the DevTools
 // timeline arm (worker isolate included); final user-visible numbers must
 // come from a clean arm with both defines off.
+//
+// Payload markers go through print(), not debugPrint(): debugPrint
+// word-wraps at ~1 KB, which splits kilobyte JSON payloads mid-string and
+// breaks the line-oriented log parsers. print() is never wrapped.
+// ignore_for_file: avoid_print
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
-import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fosm/fosm.dart';
 
+import 'host_identity.dart';
+import 'payload_out.dart';
+import 'process_memory.dart';
 import 'vector_payloads.dart';
 import 'vector_stage_report.dart';
 import 'benchmark_report.dart'
     show coverageMeanOverWindow, coverageThresholdTimings;
 
-const _runLabel =
-    String.fromEnvironment('BENCHMARK_LABEL', defaultValue: 'vector-baseline');
+const _encodedRunLabel =
+    String.fromEnvironment('BENCHMARK_LABEL', defaultValue: '');
+
+/// Run label: the dart-define on native runs, or the `?label=` query
+/// parameter on the web build (one build serves several reps by URL).
+final String _runLabel = _encodedRunLabel.isNotEmpty
+    ? _encodedRunLabel
+    : (Uri.base.queryParameters['label'] ?? 'web-baseline');
 
 /// Base URL of the payload server (scheme + host + port only; never a
 /// credential-bearing URL — the trace/report payloads exclude it too).
@@ -157,9 +171,42 @@ const _returnFromSeconds = 6.0;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Web captures cannot rely on `--start-paused` (the DWDS debug
+  // extension never connects on a plain launch), so browser runs give
+  // the capture tool time to attach by delaying the run: the capture
+  // script passes BENCHMARK_ATTACH_DELAY_MS. Native captures start
+  // paused and resume over the service protocol.
+  const attachDelayMs =
+      int.fromEnvironment('BENCHMARK_ATTACH_DELAY_MS', defaultValue: 0);
+  if (attachDelayMs > 0) {
+    await Future<void>.delayed(Duration(milliseconds: attachDelayMs));
+  }
+  // Canary for web captures: land in the sink before [initMap], because
+  // a hang there otherwise looks identical to a page never running.
+  const encodedSink = String.fromEnvironment('BENCHMARK_MARKER_URL');
+  if (encodedSink.isNotEmpty) {
+    unawaited(Dio().post<void>(
+      encodedSink,
+      queryParameters: {'label': _runLabel},
+      data: 'FOSM_BENCHMARK_ENTRY main-entered',
+    ));
+  }
   if (!kProfileMode) throw StateError('Run this benchmark with --profile.');
-  await initMap();
-  runApp(const MaterialApp(home: _VectorBenchmark()));
+  // Every unhandled app error becomes a marker payload: the browser
+  // runs have no visible console (the capture reads the sink), so a
+  // silent exception must reach the capture file to stay diagnosable.
+  await runZonedGuarded(() async {
+    await initMap();
+    runApp(const MaterialApp(home: _VectorBenchmark()));
+  }, (error, stack) {
+    final sink = String.fromEnvironment('BENCHMARK_MARKER_URL');
+    if (sink.isEmpty) return;
+    unawaited(Dio().post<void>(
+      sink,
+      queryParameters: {'label': _runLabel},
+      data: 'FOSM_BENCHMARK_RUN_ERROR $error\n$stack',
+    ));
+  });
 }
 
 class _VectorBenchmark extends StatefulWidget {
@@ -168,6 +215,62 @@ class _VectorBenchmark extends StatefulWidget {
   @override
   State<_VectorBenchmark> createState() => _VectorBenchmarkState();
 }
+
+/// Maximum bytes of one payload line. The device console relay truncates
+/// longer lines around 1 KB (round-2 captures lost the tail of every
+/// kilobyte payload), so payloads ride out in chunked continuation lines
+/// that the log parsers reassemble.
+const _payloadLineLimit = 900;
+
+/// Emits `marker payload` as one line when it fits the safe line size,
+/// or as continuation chunks otherwise:
+///   `marker {first chunk}`
+///   `FOSM_BENCHMARK_CHUNK {chunk} ...`
+///   `FOSM_BENCHMARK_CHUNK_END`
+/// Short markers (SCENARIO/SAMPLE_*/DONE) are below the limit and print
+/// directly with [print], which is never wrapped.
+void _payloadPrint(String marker, String payload) {
+  if (payload.length <= _payloadLineLimit) {
+    payloadOut('$marker $payload');
+    return;
+  }
+  var offset = 0;
+  while (offset < payload.length) {
+    final end = math.min(offset + _payloadLineLimit, payload.length);
+    payloadOut(
+        '${offset == 0 ? '$marker ' : 'FOSM_BENCHMARK_CHUNK '}${payload.substring(offset, end)}');
+    offset = end;
+  }
+  payloadOut('FOSM_BENCHMARK_CHUNK_END');
+}
+
+/// Emits one benchmark payload line: printed as chunk-safe console
+/// lines and, when a marker sink URL is defined (browser captures),
+/// POSTed whole to it — the chrome launch cannot relay app prints, and
+/// the sink only appends, so ordering rides the awaited calls.
+Future<void> _emitPayload(String marker, String payload) async {
+  _payloadPrint(marker, payload);
+  final sink = _markerSinkUrl;
+  if (sink.isEmpty) return;
+  try {
+    await Dio().post<void>(sink,
+        queryParameters: {'label': _runLabel}, data: '$marker $payload');
+  } catch (_) {
+    // Never fail the capture because of the sink; the console keeps
+    // every line.
+  }
+}
+
+/// Marker sink URL (browser captures): when set, every payload is also
+/// POSTed there as one whole line, because the flutter_tools Chrome has
+/// `--disable-extensions` and app prints cannot be relayed reliably.
+/// Falls back to the `?sink=` query parameter so one web build serves
+/// several reps with different sinks.
+final String _markerSinkUrl = (() {
+  final defined = const String.fromEnvironment('BENCHMARK_MARKER_URL');
+  if (defined.isNotEmpty) return defined;
+  return Uri.base.queryParameters['sink'] ?? '';
+})();
 
 class _VectorBenchmarkState extends State<_VectorBenchmark>
     with SingleTickerProviderStateMixin {
@@ -324,7 +427,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     try {
       if (MapDiskCache.isInitialized) await MapDiskCache.clear();
     } catch (_) {
-      debugPrint('FOSM_BENCHMARK_INVALID disk-cache clear failed');
+      _emitPayload('FOSM_BENCHMARK_INVALID', 'disk-cache clear failed');
     }
   }
 
@@ -385,12 +488,12 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     final view = View.of(context);
     final refresh = view.display.refreshRate;
     final styleUrlBase = '$_base/style-$_styleVariant.json';
-    debugPrint('FOSM_BENCHMARK_META ${jsonEncode({
+    await _emitPayload('FOSM_BENCHMARK_META', jsonEncode({
           'label': _runLabel,
           'harness': 'vector-baseline',
           'mode': 'profile',
-          'os': Platform.operatingSystem,
-          'osVersion': Platform.operatingSystemVersion,
+          'os': osName(),
+          'osVersion': osVersion(),
           'refreshHz': refresh,
           'physicalWidth': view.physicalSize.width,
           'physicalHeight': view.physicalSize.height,
@@ -407,10 +510,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           'schedulerPaced': true,
           'spans': VectorSpanLog.enabled,
           'timeline': const bool.fromEnvironment('fosm.traceVector'),
-        })}');
+        }));
 
-    for (final scenario in _scenarios) {
-      _scenario = scenario;
+    for (final scenario in _scenarios) {      _scenario = scenario;
       _styleVariant = 'a';
       _styleSwitchTimer?.cancel();
       _styleSwitchTimer = null;
@@ -440,7 +542,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         }
       }
 
-      debugPrint('FOSM_BENCHMARK_SCENARIO ${scenario.name} '
+      await _emitPayload('FOSM_BENCHMARK_SCENARIO',
+          '${scenario.name} '
           'motion=${scenario.motion.name} '
           'cacheState=${scenario.cacheState.name} '
           'source=${scenario.source.name} startZoom=${scenario.startZoom} '
@@ -463,7 +566,11 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _chainCoverageSample();
         _recording = true;
         _timelineMark('sampleStart.${scenario.name}');
-        debugPrint('FOSM_BENCHMARK_SAMPLE_START ${scenario.name}');
+        // armRecording is synchronous (the sampling chain starts here);
+        // the marker rides out without the arm's timing depending on a
+        // sink POST.
+        unawaited(_emitPayload(
+            'FOSM_BENCHMARK_SAMPLE_START', scenario.name));
       }
 
       final sample = Duration(seconds: _sampleSeconds);
@@ -471,7 +578,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         // Arm before mounting: the replacement's first load frame is the
         // first measured frame (cold and warm-bytes loads alike).
         if (!mounted) return;
-        rssBefore = ProcessInfo.currentRss;
+        rssBefore = processRssBytes();
         armRecording();
         setState(() {
           _mapMounted = true;
@@ -481,7 +588,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       } else {
         await Future<void>.delayed(const Duration(milliseconds: 400));
         if (!mounted) return;
-        rssBefore = ProcessInfo.currentRss;
+        rssBefore = processRssBytes();
         armRecording();
         // A settled static map renders no frames on its own, which would
         // leave the window without a single coverage sample. Force one
@@ -516,7 +623,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       _coverageWindowMs = coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
       _coverageClock = null;
       _timelineMark('sampleEnd.${scenario.name}');
-      debugPrint('FOSM_BENCHMARK_SAMPLE_END ${scenario.name}');
+      await _emitPayload('FOSM_BENCHMARK_SAMPLE_END', scenario.name);
 
       final uiMs = _timings
           .map((f) => f.buildDuration.inMicroseconds / 1000)
@@ -529,7 +636,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       double percentile(List<double> values, double p) =>
           values.isEmpty ? 0 : values[((values.length - 1) * p).round()];
 
-      debugPrint('FOSM_BENCHMARK_RESULT ${jsonEncode({
+      await _emitPayload('FOSM_BENCHMARK_RESULT', jsonEncode({
             'label': _runLabel,
             'harness': 'vector-baseline',
             'scenario': scenario.name,
@@ -573,19 +680,21 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'peakParsedTiles': _peakParsedTiles,
             'peakPreparedLabels': _peakPreparedLabels,
             'rssBeforeBytes': rssBefore,
-            'rssAfterBytes': ProcessInfo.currentRss,
-          })}');
+            'rssAfterBytes': processRssBytes(),
+          }));
 
       if (VectorSpanLog.enabled) {
-        debugPrint('FOSM_BENCHMARK_VECTOR_STAGES ${jsonEncode(
-          buildVectorStageReport(
-            VectorSpanLog.take(),
-            dropped: VectorSpanLog.dropped,
-          ),
-        )}');
+        await _emitPayload(
+            'FOSM_BENCHMARK_VECTOR_STAGES',
+            jsonEncode(
+              buildVectorStageReport(
+                VectorSpanLog.take(),
+                dropped: VectorSpanLog.dropped,
+              ),
+            ));
       }
     }
-    debugPrint('FOSM_BENCHMARK_DONE $_runLabel');
+    await _emitPayload('FOSM_BENCHMARK_DONE', _runLabel);
   }
 
   /// Chained post-frame sampler: one row per rendered frame while
