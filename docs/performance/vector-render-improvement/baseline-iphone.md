@@ -1,5 +1,12 @@
 # Plan 01 — vector-render baseline, iPhone
 
+> Historical capture: the 2026-10-30 review corrections change native fetch
+> tracing, timeline event deduplication and the strict warm-parsed workload.
+> `vector_warm_parsed_return` below is a retained-image return pan, not a
+> warm-parsed/cold-images baseline. New captures are required for the corrected
+> `vector_warm_parsed_static` scenario and exact first/95%-sharp timings.
+> Do not use this report to mark those corrected acceptance checks complete.
+
 First measured baseline for the vector pipeline under the harness in this
 directory. Captured 2026-10-30 from `example/tool/capture_vector_baseline.sh`
 (device `00008101-000518663C78001E`, wireless). Raw logs and parsed reports

@@ -16,10 +16,9 @@
 //   warmBytesColdParsed   unmount → arm → remount (no disk clear): fresh
 //                         runtime (empty parsed/rendered caches), tiles
 //                         re-read from disk bytes.
-//   warmParsedColdImages  mounted, settled → dropRebuildableCaches()
-//                         (disk bytes + parsed tiles survive, rendered
-//                         images flushed) → pan aside → arm → return pan
-//                         re-renders from warm parsed data.
+//   warmParsedColdImages  mounted, settled → arm → evict all rendered
+//                        images including fallback/snapshot pins → reload
+//                        the same viewport; parsed data/bytes stay warm.
 //   warmRendered          mounted, settled (all caches warm) → arm.
 //
 // A raster control pair runs the same camera path through the raster
@@ -45,7 +44,8 @@ import 'package:fosm/fosm.dart';
 
 import 'vector_payloads.dart';
 import 'vector_stage_report.dart';
-import 'benchmark_report.dart' show coverageMeanOverWindow;
+import 'benchmark_report.dart'
+    show coverageMeanOverWindow, coverageThresholdTimings;
 
 const _runLabel =
     String.fromEnvironment('BENCHMARK_LABEL', defaultValue: 'vector-baseline');
@@ -74,7 +74,12 @@ const _center = LatLng(latitude: 47, longitude: 8);
 enum _Motion { none, fling, pinch, returnPan, returnFrom }
 
 /// How each scenario's cache state is established (see file comment).
-enum _CacheState { coldBytes, warmBytesColdParsed, warmParsedColdImages, warmRendered }
+enum _CacheState {
+  coldBytes,
+  warmBytesColdParsed,
+  warmParsedColdImages,
+  warmRendered
+}
 
 enum _Source { vector, raster }
 
@@ -102,7 +107,8 @@ class _Scenario {
 const _scenarios = [
   // Raster control: same camera paths through the raster pipeline.
   _Scenario('raster_control_static', source: _Source.raster),
-  _Scenario('raster_control_fling', source: _Source.raster, motion: _Motion.fling),
+  _Scenario('raster_control_fling',
+      source: _Source.raster, motion: _Motion.fling),
   // Cold bytes: full pipeline from network bytes.
   _Scenario('vector_cold_static'),
   _Scenario('vector_cold_fling', motion: _Motion.fling),
@@ -116,9 +122,9 @@ const _scenarios = [
   // Warm bytes, fresh runtime: disk-hit loads with cold parsed data.
   _Scenario('vector_warm_bytes_static',
       cacheState: _CacheState.warmBytesColdParsed),
-  // Warm parsed, flushed images: return pan re-renders from parsed cache.
-  _Scenario('vector_warm_parsed_return',
-      cacheState: _CacheState.warmParsedColdImages, motion: _Motion.returnFrom),
+  // Warm parsed, cold images: reload the settled viewport after arming.
+  _Scenario('vector_warm_parsed_static',
+      cacheState: _CacheState.warmParsedColdImages),
   // Style reload cost with warm disk bytes.
   _Scenario('vector_style_switch',
       cacheState: _CacheState.warmRendered, styleSwitch: true),
@@ -393,7 +399,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           'payloadProfile': _profileName,
           'payloadSeed': _seed,
           'payloadServer': Uri.parse(_base).authority,
-          'styleUrlPath': '/style-<variant>.json ($styleUrlBase mounted at start)',
+          'styleUrlPath':
+              '/style-<variant>.json ($styleUrlBase mounted at start)',
           'sourceMaxZoom': 14,
           'sampleSeconds': _sampleSeconds,
           'settleSeconds': _settleSeconds,
@@ -427,20 +434,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _controller.setZoom(scenario.startZoom, animate: false);
         _controller.moveTo(_center, animate: false);
         settled = await _settle(Duration(seconds: _settleSeconds));
-        if (scenario.cacheState == _CacheState.warmParsedColdImages) {
-          // Flush rendered images and memory bytes; disk bytes, parsed
-          // tiles and prepared labels survive. Images protected by the
-          // visible grid survive the first drop, so pan aside, settle,
-          // and drop again — the origin pose's images are evictable by
-          // then and really leave the cache, making the return pan
-          // re-render from warm parsed data instead of cache reuse.
-          _controller.dropRebuildableCaches();
-          _controller.moveTo(
-              LatLng(latitude: 47, longitude: 8 + _returnFromOffsetDeg),
-              animate: false);
-          settled = await _settle(Duration(seconds: _settleSeconds));
-          _controller.dropRebuildableCaches();
-          await Future<void>.delayed(const Duration(milliseconds: 120));
+        if (scenario.cacheState == _CacheState.warmParsedColdImages &&
+            !settled) {
+          throw StateError('Warm-parsed capture requires a settled viewport');
         }
       }
 
@@ -491,6 +487,12 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         // leave the window without a single coverage sample. Force one
         // rebuild so the sampler records a t≈0 baseline row.
         setState(() {});
+      }
+
+      if (scenario.cacheState == _CacheState.warmParsedColdImages) {
+        // Arm first: every re-render belongs to the measured window. Keep
+        // the exact settled viewport so its parsed source tiles remain warm.
+        _controller.dropRebuildableCaches(includeVisibleImages: true);
       }
 
       if (scenario.styleSwitch) {
@@ -564,8 +566,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                         f.rasterDuration.inMicroseconds) >
                     1000000 / refresh)
                 .length,
-            'coverage': _coverageReport(
-                vector: scenario.source == _Source.vector),
+            'coverage':
+                _coverageReport(vector: scenario.source == _Source.vector),
             'peakRenderedBytes': _peakRenderedBytes,
             'peakEstimatedTotalBytes': _peakEstimatedTotalBytes,
             'peakParsedTiles': _peakParsedTiles,
@@ -576,11 +578,11 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
 
       if (VectorSpanLog.enabled) {
         debugPrint('FOSM_BENCHMARK_VECTOR_STAGES ${jsonEncode(
-              buildVectorStageReport(
-                VectorSpanLog.take(),
-                dropped: VectorSpanLog.dropped,
-              ),
-            )}');
+          buildVectorStageReport(
+            VectorSpanLog.take(),
+            dropped: VectorSpanLog.dropped,
+          ),
+        )}');
       }
     }
     debugPrint('FOSM_BENCHMARK_DONE $_runLabel');
@@ -619,8 +621,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             _peakPreparedLabels = math.max(_peakPreparedLabels, labels);
           }
           final labelReady = _scenario.source == _Source.vector
-              ? _labelReadyFraction(
-                  coverage, _controller.labelPreparedTileKeys)
+              ? _labelReadyFraction(coverage, _controller.labelPreparedTileKeys)
               : 1.0;
           _coverageSamples.add([
             nowMs,
@@ -671,17 +672,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     }
     // First-sharp and 95% timings come from the full-resolution samples,
     // never from the downsampled series.
-    int? firstSharpMs;
-    int? covered95Ms;
-    int? sharp95Ms;
-    for (final s in samples) {
-      if (firstSharpMs == null && s[2] > 0) firstSharpMs = s[0].round();
-      if (covered95Ms == null && s[1] >= 0.95) covered95Ms = s[0].round();
-      if (sharp95Ms == null && s[2] >= 0.95) sharp95Ms = s[0].round();
-      if (firstSharpMs != null && covered95Ms != null && sharp95Ms != null) {
-        break;
-      }
-    }
+    final thresholds = coverageThresholdTimings(samples);
     var lastLabelChangeMs = 0;
     for (var i = 0; i < samples.length; i++) {
       if (i == 0 || samples[i][3] != samples[i - 1][3]) {
@@ -711,8 +702,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     }
 
     // Newly exposed regions: cells first seen after the first sample.
-    final firstSampleMs =
-        samples.isEmpty ? double.infinity : samples.first[0];
+    final firstSampleMs = samples.isEmpty ? double.infinity : samples.first[0];
     final newToSharp = <double>[];
     var newlyExposed = 0;
     var newlyExposedSharp = 0;
@@ -724,14 +714,12 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       newlyExposedSharp++;
       newToSharp.add(sharpAt - seenMs);
     });
-    double mean(Iterable<double> values) => values.isEmpty
-        ? 0
-        : values.reduce((a, b) => a + b) / values.length;
+    double mean(Iterable<double> values) =>
+        values.isEmpty ? 0 : values.reduce((a, b) => a + b) / values.length;
 
     final step = samples.length <= 72 ? 1 : (samples.length / 72).ceil();
-    List<double> column(int index) => [
-          for (var i = 0; i < samples.length; i += step) samples[i][index]
-        ];
+    List<double> column(int index) =>
+        [for (var i = 0; i < samples.length; i += step) samples[i][index]];
     final seriesMs = [
       for (var i = 0; i < samples.length; i += step) samples[i][0].round()
     ];
@@ -749,9 +737,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       'emptyGridFrames': _emptyGridFrames,
       'firstCoveredMs': firstWhereMs((s) => s[1] > 0),
       'allCoveredMs': firstWhereMs((s) => s[1] >= 1),
-      'firstSharpMs': firstSharpMs,
-      'covered95Ms': covered95Ms,
-      'sharp95Ms': sharp95Ms,
+      ...thresholds,
       'allSharpMs': firstWhereMs((s) => s[2] >= 1),
       'minSharpFraction': _round4(sharpMin),
       'meanCoveredFraction':
@@ -818,9 +804,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                         styleUrl: '$_base/style-$_styleVariant.json',
                       )
                     : null,
-                tileFetcher: _scenario.source == _Source.raster
-                    ? _rasterTile
-                    : null,
+                tileFetcher:
+                    _scenario.source == _Source.raster ? _rasterTile : null,
                 showScaleBar: true,
                 showZoomControls: false,
               ))

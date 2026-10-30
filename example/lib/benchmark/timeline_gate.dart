@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 // Validates a saved VM timeline against the benchmark's scenario
 // markers, so a capture gate can prove *per-scenario* coverage instead
 // of a global duration that any late tail of events satisfies.
@@ -50,12 +52,7 @@ class TimelineScenarioMark {
         styleSwitch;
     if (coldLike) return const ['parse', 'parseWait', 'record', 'toImage'];
     if (cacheState == 'warmParsedColdImages') {
-      // The flush drops only unpinned imagery, and zoom-fallback pins
-      // cover recently visited cells — so this scenario may legitimately
-      // reuse retained imagery instead of re-rendering. Pipeline events
-      // are therefore not required; the report reads the
-      // newly-exposed/sharp metrics for what actually re-rendered.
-      return const [];
+      return const ['record', 'toImage'];
     }
     return const [];
   }
@@ -113,9 +110,8 @@ TimelineScenarioMark? parseScenarioMarkLine(String line) {
 /// boundary markers, and each required pipeline event must occur inside
 /// its window. Requirements: vector `coldBytes`/`warmBytesColdParsed`
 /// and style-switch scenarios need the full critical path including
-/// worker `parse`; `warmParsedColdImages` and fully-warm/raster
-/// scenarios have no required events (retention and fallback pins may
-/// legitimately serve the window).
+/// worker `parse`; `warmParsedColdImages` requires recording and image creation; fully-warm
+/// and raster scenarios require only boundaries.
 List<ScenarioGateResult> validateTimelineAgainstScenarios(
   List<TimelineScenarioMark> scenarios,
   List<Map<String, dynamic>> events,
@@ -166,6 +162,20 @@ List<ScenarioGateResult> validateTimelineAgainstScenarios(
         failures.add('no fosm.vector.$required events inside the window');
       }
     }
+    if (scenario.source == 'vector' &&
+        scenario.cacheState == 'warmParsedColdImages') {
+      final parses = events
+          .where((event) =>
+              event['name'] == 'fosm.vector.parse' &&
+              event['ts'] is num &&
+              (event['ts'] as num) >= from &&
+              (event['ts'] as num) <= to)
+          .length;
+      counts['parse'] = parses;
+      if (parses > 0) {
+        failures.add('warm-parsed scenario performed fresh parses');
+      }
+    }
     results.add(ScenarioGateResult(
       scenario: scenario,
       windowFound: true,
@@ -174,4 +184,20 @@ List<ScenarioGateResult> validateTimelineAgainstScenarios(
     ));
   }
   return results;
+}
+
+/// Stable identity for repeated VM timeline snapshots. Preserve all event
+/// fields (including phase, async id/id2, scope and correlation arguments).
+/// Canonical map order makes equivalent JSON snapshots deduplicate.
+String timelineEventSignature(Map<String, dynamic> event) {
+  Object? canonical(Object? value) {
+    if (value is Map) {
+      final keys = value.keys.cast<String>().toList()..sort();
+      return {for (final key in keys) key: canonical(value[key])};
+    }
+    if (value is List) return value.map(canonical).toList();
+    return value;
+  }
+
+  return jsonEncode(canonical(event));
 }

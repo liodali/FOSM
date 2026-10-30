@@ -5,6 +5,44 @@ import 'package:example/benchmark/timeline_gate.dart';
 Map<String, dynamic> _event(String name, int ts) => {'name': name, 'ts': ts};
 
 void main() {
+  test('timeline dedup preserves phases, async ids and correlation', () {
+    final event = <String, dynamic>{
+      'name': 'record',
+      'ts': 1,
+      'tid': 2,
+      'pid': 3,
+      'ph': 'b',
+      'id': 'a',
+      'args': {'attempt': 'r1.0'}
+    };
+    final variants = [
+      event,
+      {...event, 'ph': 'e'},
+      {...event, 'id': 'b'},
+      {...event, 'pid': 4},
+      {
+        ...event,
+        'id2': {'local': 'x'}
+      },
+      {
+        ...event,
+        'args': {'attempt': 'r1.1'}
+      }
+    ];
+    expect(variants.map(timelineEventSignature).toSet(), hasLength(6));
+    expect(
+        timelineEventSignature({
+          'ts': 1,
+          'name': 'record',
+          'args': {'b': 2, 'a': 1}
+        }),
+        timelineEventSignature({
+          'args': {'a': 1, 'b': 2},
+          'name': 'record',
+          'ts': 1
+        }));
+  });
+
   group('parseScenarioMarkLine', () {
     test('extracts name, cache state, source and style switch', () {
       final mark = parseScenarioMarkLine(
@@ -27,7 +65,9 @@ void main() {
       TimelineScenarioMark mark(String cacheState,
               {bool styleSwitch = false, String source = 'vector'}) =>
           TimelineScenarioMark(
-              name: 's', cacheState: cacheState, source: source,
+              name: 's',
+              cacheState: cacheState,
+              source: source,
               styleSwitch: styleSwitch);
 
       expect(mark('coldBytes').requiredEvents,
@@ -38,7 +78,8 @@ void main() {
           contains('parse'));
       // Warm-parsed re-renders may be served by retention and fallback
       // pins, so no pipeline events are required.
-      expect(mark('warmParsedColdImages').requiredEvents, isEmpty);
+      expect(mark('warmParsedColdImages').requiredEvents,
+          unorderedEquals(['record', 'toImage']));
       // Fully warm and raster scenarios have no required pipeline events.
       expect(mark('warmRendered').requiredEvents, isEmpty);
       expect(mark('coldBytes', source: 'raster').requiredEvents, isEmpty);
@@ -46,12 +87,13 @@ void main() {
   });
 
   group('validateTimelineAgainstScenarios', () {
-    test('accepts a cold scenario with the full critical path in-window',
-        () {
+    test('accepts a cold scenario with the full critical path in-window', () {
       final results = validateTimelineAgainstScenarios([
         const TimelineScenarioMark(
-            name: 'cold', cacheState: 'coldBytes',
-            source: 'vector', styleSwitch: false),
+            name: 'cold',
+            cacheState: 'coldBytes',
+            source: 'vector',
+            styleSwitch: false),
       ], [
         _event('fosm.benchmark.sampleStart.cold', 1000),
         _event('fosm.vector.parseWait', 1100),
@@ -67,11 +109,15 @@ void main() {
     test('rejects required events that fall outside the window', () {
       final results = validateTimelineAgainstScenarios([
         const TimelineScenarioMark(
-            name: 'cold', cacheState: 'coldBytes',
-            source: 'vector', styleSwitch: false),
+            name: 'cold',
+            cacheState: 'coldBytes',
+            source: 'vector',
+            styleSwitch: false),
         const TimelineScenarioMark(
-            name: 'warm', cacheState: 'warmRendered',
-            source: 'vector', styleSwitch: false),
+            name: 'warm',
+            cacheState: 'warmRendered',
+            source: 'vector',
+            styleSwitch: false),
       ], [
         // An earlier scenario's parse does not count for 'cold'.
         _event('fosm.benchmark.sampleStart.cold', 1000),
@@ -94,8 +140,10 @@ void main() {
     test('fails scenarios without capture boundaries', () {
       final results = validateTimelineAgainstScenarios([
         const TimelineScenarioMark(
-            name: 'missing', cacheState: 'coldBytes',
-            source: 'vector', styleSwitch: false),
+            name: 'missing',
+            cacheState: 'coldBytes',
+            source: 'vector',
+            styleSwitch: false),
       ], [
         _event('fosm.benchmark.sampleStart.missing', 1000),
         // No sampleEnd: the recorder stopped early.
@@ -106,25 +154,48 @@ void main() {
       expect(results.single.failures.single, contains('sampleEnd'));
     });
 
-    test('warm-parsed scenarios may legitimately reuse retained imagery',
-        () {
+    test('warm-parsed scenarios reject retained imagery without rendering', () {
       final results = validateTimelineAgainstScenarios([
         const TimelineScenarioMark(
-            name: 'wp', cacheState: 'warmParsedColdImages',
-            source: 'vector', styleSwitch: false),
+            name: 'wp',
+            cacheState: 'warmParsedColdImages',
+            source: 'vector',
+            styleSwitch: false),
       ], [
         _event('fosm.benchmark.sampleStart.wp', 100),
         _event('fosm.benchmark.sampleEnd.wp', 400),
       ]);
-      expect(results.single.ok, isTrue,
-          reason: 'fallback pins and retention may serve the whole window');
+      expect(results.single.ok, isFalse);
+      expect(results.single.failures, hasLength(2));
+    });
+
+    test('warm-parsed requires rendering and rejects fresh parses', () {
+      const scenario = TimelineScenarioMark(
+          name: 'wp',
+          cacheState: 'warmParsedColdImages',
+          source: 'vector',
+          styleSwitch: false);
+      final events = [
+        _event('fosm.benchmark.sampleStart.wp', 100),
+        _event('fosm.vector.record', 200),
+        _event('fosm.vector.toImage', 300),
+        _event('fosm.benchmark.sampleEnd.wp', 400),
+      ];
+      expect(validateTimelineAgainstScenarios([scenario], events).single.ok,
+          isTrue);
+      final cold = validateTimelineAgainstScenarios(
+          [scenario], [...events, _event('fosm.vector.parse', 150)]).single;
+      expect(cold.ok, isFalse);
+      expect(cold.failures.single, contains('fresh parses'));
     });
 
     test('style-switch scenarios require the reload parse', () {
       final results = validateTimelineAgainstScenarios([
         const TimelineScenarioMark(
-            name: 'sw', cacheState: 'warmRendered',
-            source: 'vector', styleSwitch: true),
+            name: 'sw',
+            cacheState: 'warmRendered',
+            source: 'vector',
+            styleSwitch: true),
       ], [
         _event('fosm.benchmark.sampleStart.sw', 100),
         _event('fosm.vector.record', 200),

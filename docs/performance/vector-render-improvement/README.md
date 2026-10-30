@@ -51,7 +51,7 @@ clear because cold states unmount the map (disposed state) first:
 |---|---|
 | `coldBytes` | unmount map → clear persistent disk cache → **arm recording** → mount fresh map (generation-keyed). The replacement's first load frame is the first measured frame. |
 | `warmBytesColdParsed` | unmount → **arm** → remount (no disk clear): fresh runtime (empty parsed/rendered/memory-byte caches); tiles re-read from disk bytes. |
-| `warmParsedColdImages` | mounted, settled → `MapController.dropRebuildableCaches()` (memory bytes + non-protected rendered images dropped; disk bytes, parsed tiles and labels survive) → pan aside, settle → **arm** → one-shot return pan re-renders from warm parsed data. |
+| `warmParsedColdImages` | mounted, settled at the exact target viewport → **arm** → `MapController.dropRebuildableCaches(includeVisibleImages: true)` releases snapshot/fallback pins and evicts all rendered images, then immediately reloads the same viewport. Parsed tiles, memory/disk bytes and labels survive. The gate requires `record` + `toImage` and rejects fresh `parse` events. |
 | `warmRendered` | mounted, settled (allSharp, no loads, labels stable ×5 frames) → **arm**. |
 
 `settled:false` in a result line means the settle phase timed out — treat
@@ -63,7 +63,7 @@ that run's warm claims accordingly; never silently read it as warm.
 `vector_cold_fling`, `vector_cold_return`, `vector_cold_pinch`,
 `vector_cold_overzoom` (z16 over z14 sources), `vector_warm_static`,
 `vector_warm_fling`, `vector_warm_bytes_static`,
-`vector_warm_parsed_return`, `vector_style_switch` (a→b at window half).
+`vector_warm_parsed_static`, `vector_style_switch` (a→b at window half).
 
 Every result line carries UI/raster p50/p95/p99/max, frames over 16.67 ms
 and over the display's actual budget, per-frame coverage series
@@ -120,7 +120,7 @@ sampleEnd.<scenario>` boundary markers on the timeline clock, every
 scenario must show both boundaries, and each scenario's cache state must
 show its required pipeline events — cold-like and style-switch scenarios
 require worker `parse` events; `warmParsedColdImages` requires
-`record`+`toImage` but parsing may legitimately be skipped (cache hits);
+`record`+`toImage` and rejects fresh worker `parse` events (parsed data must stay warm);
 fully-warm and raster scenarios require only the boundaries. A coarse
 global window-span check (≥80%) guards against late arming. Failures
 exit with code 3; the saved file records the per-scenario gate numbers.
@@ -199,3 +199,18 @@ missed frames at the actual refresh rate, stale work, peak/settled memory,
 and explicit unreachable-coverage declarations. Plan-01 task checkboxes
 are ticked only from these captures — unit tests verify the harness, not
 the measurements.
+
+## Review corrections — 2026-10-30
+
+The strict warm-parsed capture now uses a stationary image reload after the
+recording window opens. Older `vector_warm_parsed_return` results measured
+retained-image return pans and do not satisfy this cache state. Repeat the
+changed scenario before comparing parse-free rendering cost. The workload
+hook requires settled presentations; active jobs cause StateError.
+
+Fetch tracing now lives around the common TileManager resource request,
+including native HTTP-isolate downloads, with one span per shared download.
+Timeline snapshot merging preserves phase, async identity, process, scope and
+correlation arguments using canonical full-event JSON. First-sharp and
+95%-covered/sharp crossings use the complete sample series before reduction.
+These corrections require new captures; existing raw files are historical.

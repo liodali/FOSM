@@ -112,3 +112,21 @@ double? coverageMeanOverWindow(
   if (total <= 0) return samples.first[index];
   return weighted / total;
 }
+
+/// First threshold crossings on the full-resolution [time, covered, sharp]
+/// series. Missing crossings stay null (never inferred from a reduced series).
+Map<String, int?> coverageThresholdTimings(List<List<double>> samples) {
+  int? firstSharp;
+  int? covered95;
+  int? sharp95;
+  for (final sample in samples) {
+    if (sample[2] > 0) firstSharp ??= sample[0].round();
+    if (sample[1] >= 0.95) covered95 ??= sample[0].round();
+    if (sample[2] >= 0.95) sharp95 ??= sample[0].round();
+  }
+  return {
+    'firstSharpMs': firstSharp,
+    'covered95Ms': covered95,
+    'sharp95Ms': sharp95
+  };
+}

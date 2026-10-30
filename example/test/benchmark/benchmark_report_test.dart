@@ -8,6 +8,26 @@ String _result(String scenario, {Object? valid}) => 'FOSM_BENCHMARK_RESULT '
     '{"label":"x","scenario":"$scenario"${valid == null ? '' : ',"valid":$valid'}}';
 
 void main() {
+  test('coverage thresholds use exact first crossings and preserve misses', () {
+    expect(
+        coverageThresholdTimings([
+          [0, 0, 0],
+          [7, 0.95, 0.1],
+          [9, 0.5, 0.05],
+          [11, 1, 0.95],
+          [12, 1, 1],
+        ]),
+        {'firstSharpMs': 7, 'covered95Ms': 7, 'sharp95Ms': 11});
+    expect(
+        coverageThresholdTimings([
+          [0, 0, 0],
+          [8, 0.9, 0.2]
+        ]),
+        {'firstSharpMs': 8, 'covered95Ms': null, 'sharp95Ms': null});
+    expect(coverageThresholdTimings([]),
+        {'firstSharpMs': null, 'covered95Ms': null, 'sharp95Ms': null});
+  });
+
   test('parses metadata and results across lines', () {
     final parse = parseBenchmarkLog([
       'Launching…',

@@ -36,9 +36,9 @@ Future<void> main(List<String> arguments) async {
     }
   }
   if (positional.length != 1) {
-    stderr.writeln(
-        'Usage: dart run tool/capture_benchmark.dart FLUTTER_RUN_LOG '
-        '[--timeline FILE]');
+    stderr
+        .writeln('Usage: dart run tool/capture_benchmark.dart FLUTTER_RUN_LOG '
+            '[--timeline FILE]');
     exitCode = 64;
     return;
   }
@@ -110,9 +110,7 @@ Future<void> main(List<String> arguments) async {
       // correlation arguments: distinct events can share name, ts, tid
       // and duration (begin/end pairs of overlapping async spans), and
       // collapsing them would break event pairing and attribution.
-      final signature = '${event['name']}|${event['ts']}|${event['ph']}|'
-          '${event['tid']}|${event['pid']}|${event['dur']}|${event['id']}|'
-          '${jsonEncode(event['args'])}';
+      final signature = timelineEventSignature(event);
       if (seenSignatures.add(signature)) {
         timelineSegments.add(event);
       }
@@ -220,9 +218,8 @@ Future<void> main(List<String> arguments) async {
       final parseWaitEvents = count('parseWait');
       final recordEvents = count('record');
       final toImageEvents = count('toImage');
-      final vectorEvents = events
-          .where((e) => '${e['name']}'.startsWith('fosm.vector.'))
-          .length;
+      final vectorEvents =
+          events.where((e) => '${e['name']}'.startsWith('fosm.vector.')).length;
 
       // Coarse global check: the timeline must span most of the run
       // (guards against late arming or an early recorder stop). The
@@ -276,8 +273,7 @@ Future<void> main(List<String> arguments) async {
                   'windowFound': result.windowFound,
                   'requiredEventCounts': result.counts,
                   'ok': result.ok,
-                  if (result.failures.isNotEmpty)
-                    'failures': result.failures,
+                  if (result.failures.isNotEmpty) 'failures': result.failures,
                 },
             ],
           },
@@ -294,13 +290,13 @@ Future<void> main(List<String> arguments) async {
       final failures = <String>[
         if (scenarios.isEmpty)
           'no FOSM_BENCHMARK_SCENARIO lines captured — cannot validate '
-          'scenario coverage',
+              'scenario coverage',
         for (final result in scenarioResults)
           if (!result.ok)
             '${result.scenario.name}: ${result.failures.join('; ')}',
         if (coverageRatio < 0.8)
           'timeline covers only ${(coverageRatio * 100).toStringAsFixed(0)}% '
-          'of the benchmark window',
+              'of the benchmark window',
       ];
       if (failures.isNotEmpty) {
         stderr.writeln('timeline capture gate failed: ${failures.join('; ')}');
