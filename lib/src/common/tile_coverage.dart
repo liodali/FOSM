@@ -10,11 +10,39 @@
 /// covered but not sharp while zoom-fallback imagery stands in for a
 /// missing current-zoom tile; a cell that is neither shows the
 /// checkerboard placeholder (blank).
+///
+/// Two coverage granularities are reported because they answer different
+/// questions and can diverge at partial viewport-edge cells:
+///
+/// - **Cell-count coverage** (`coveredFraction`/`sharpFraction`): the
+///   fraction of visible grid *cells*, each weighted equally however much
+///   of the viewport it intersects. Cheap and stable, but a single huge
+///   partial cell counts the same as a sliver.
+/// - **Pixel-area coverage** (`coveredAreaFraction`/`sharpAreaFraction`):
+///   the fraction of visible *viewport pixels* behind covered/sharp cells,
+///   weighting each cell by its intersection with the viewport rectangle.
+///
+/// Cell identities (`visibleCellIds`/`coveredCellIds`/`sharpCellIds`) are
+/// the grid cell keys — namespaced in vector mode, so a style switch
+/// presents an entirely new cell set. Harnesses use them to distinguish
+/// cells newly exposed during motion from cells that were visible all
+/// along: time-to-sharp is only meaningful per exposure.
+///
+/// An empty grid (no layout yet, or no valid visible cells) reports the
+/// count fractions as 1 so a not-yet-started map never looks 100% blank;
+/// `visibleCells == 0` is the explicit signal to skip the sample rather
+/// than read the fractions.
 class FosmTileCoverage {
   const FosmTileCoverage({
     required this.visibleCells,
     required this.coveredCells,
     required this.sharpCells,
+    this.visibleCellIds = const <String>{},
+    this.coveredCellIds = const <String>{},
+    this.sharpCellIds = const <String>{},
+    this.visibleAreaPx = 0,
+    this.coveredAreaPx = 0,
+    this.sharpAreaPx = 0,
   })  : assert(visibleCells >= 0),
         assert(coveredCells >= 0 && coveredCells <= visibleCells),
         assert(sharpCells >= 0 && sharpCells <= visibleCells);
@@ -24,7 +52,13 @@ class FosmTileCoverage {
   const FosmTileCoverage.empty()
       : visibleCells = 0,
         coveredCells = 0,
-        sharpCells = 0;
+        sharpCells = 0,
+        visibleCellIds = const <String>{},
+        coveredCellIds = const <String>{},
+        sharpCellIds = const <String>{},
+        visibleAreaPx = 0,
+        coveredAreaPx = 0,
+        sharpAreaPx = 0;
 
   /// Strict-viewport cells with a valid world row. Off-world rows (poles)
   /// and padding cells are excluded — they can never load imagery.
@@ -36,6 +70,26 @@ class FosmTileCoverage {
 
   /// Visible cells with a retained current-zoom rendered image.
   final int sharpCells;
+
+  /// Identities of the visible cells (namespaced grid keys in vector
+  /// mode). Empty when the producer does not track them.
+  final Set<String> visibleCellIds;
+
+  /// Identities of the covered cells (subset of [visibleCellIds]).
+  final Set<String> coveredCellIds;
+
+  /// Identities of the sharp cells (subset of [coveredCellIds]).
+  final Set<String> sharpCellIds;
+
+  /// Viewport pixels behind valid visible cells (the pixel-area coverage
+  /// denominator). Partial edge cells contribute their intersecting area.
+  final double visibleAreaPx;
+
+  /// Viewport pixels behind covered cells.
+  final double coveredAreaPx;
+
+  /// Viewport pixels behind sharp cells.
+  final double sharpAreaPx;
 
   int get missingCells => visibleCells - coveredCells;
 
@@ -49,13 +103,25 @@ class FosmTileCoverage {
   bool get allSharp => visibleCells == 0 || sharpCells >= visibleCells;
 
   /// Fraction of valid visible cells with any imagery (own or fallback);
-  /// 1 for an empty grid. `1 - coveredFraction` is the blank fraction.
+  /// 1 for an empty grid. `1 - coveredFraction` is the blank cell
+  /// fraction.
   double get coveredFraction =>
       visibleCells == 0 ? 1 : coveredCells / visibleCells;
 
   /// Fraction of valid visible cells with sharp imagery; 1 for an empty
-  /// grid. `1 - sharpFraction` counts blank plus fallback-covered area.
-  double get sharpFraction => visibleCells == 0 ? 1 : sharpCells / visibleCells;
+  /// grid. `1 - sharpFraction` counts blank plus fallback-covered cells.
+  double get sharpFraction =>
+      visibleCells == 0 ? 1 : sharpCells / visibleCells;
+
+  /// Fraction of visible viewport pixels behind covered cells; 1 for an
+  /// empty grid (mirrors [coveredFraction]'s convention).
+  double get coveredAreaFraction =>
+      visibleAreaPx == 0 ? 1 : coveredAreaPx / visibleAreaPx;
+
+  /// Fraction of visible viewport pixels behind sharp cells; 1 for an
+  /// empty grid.
+  double get sharpAreaFraction =>
+      visibleAreaPx == 0 ? 1 : sharpAreaPx / visibleAreaPx;
 
   @override
   String toString() =>

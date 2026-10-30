@@ -41,6 +41,7 @@ class FosmMemoryAttribution {
     this.rasterTileBytes,
     this.preparedLabelTiles,
     this.preparedLabels,
+    this.labelJobsOutstanding,
   });
 
   /// Rendered (decoded) tile images, split into protected and evictable.
@@ -98,6 +99,13 @@ class FosmMemoryAttribution {
   /// Prepared labels (text/halo painter pairs) across those tiles, or
   /// `null` in raster mode.
   final int? preparedLabels;
+
+  /// Label-preparation work still outstanding (queued jobs plus the
+  /// active preparation), or `null` in raster mode. A stable
+  /// [preparedLabels] count alone does not prove preparation finished —
+  /// a batch can be mid-flight without changing the cached count; this
+  /// counter reaching zero is what settles.
+  final int? labelJobsOutstanding;
 
   /// Estimated retained bytes across all buckets with a meaningful
   /// estimate: rendered images, compressed bytes, parsed tiles, raster

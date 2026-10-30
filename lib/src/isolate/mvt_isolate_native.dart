@@ -124,9 +124,15 @@ class MvtIsolate {
   /// tile. Each call uses a one-shot [ReceivePort] for its reply,
   /// matching the [HttpIsolate] pattern. The future completes with
   /// [VectorTileCancelled] when [dispose] runs before the reply lands.
+  ///
+  /// [traceTile]/[traceAttempt] correlate the worker's `parse` timeline
+  /// events with the requesting attempt (the decode future is shared by
+  /// over-zoom siblings — the first requester's attempt is attached).
   Future<DecodedVectorTile> decode(
     Uint8List bytes, {
     Set<String>? sourceLayers,
+    String? traceTile,
+    String? traceAttempt,
   }) {
     if (!_ready) {
       throw StateError('MvtIsolate not ready — call spawn() first');
@@ -145,8 +151,12 @@ class MvtIsolate {
             .completeError(response is String ? response : 'Unknown error');
       }
     });
-    VectorTrace.sync('parseDispatch',
-        () => _sendPort!.send([responsePort.sendPort, bytes, sourceLayers]));
+    VectorTrace.sync(
+        'parseDispatch',
+        () => _sendPort!
+            .send([responsePort.sendPort, bytes, sourceLayers, traceTile, traceAttempt]),
+        tile: traceTile,
+        attempt: traceAttempt);
     return completer.future;
   }
 
@@ -187,6 +197,10 @@ class MvtIsolate {
   // ── Isolate entry point (runs on the background thread) ─────────────
 
   static void _entryPoint(SendPort mainSendPort) {
+    // Timeline events stay on (the trace arm reads them through the VM
+    // timeline); the span log is disabled here so undrained worker-side
+    // spans cannot accumulate isolate memory nobody reads.
+    VectorSpanLog.enabled = false;
     final receivePort = ReceivePort();
     mainSendPort.send(receivePort.sendPort);
 
@@ -195,11 +209,15 @@ class MvtIsolate {
       final replyPort = parts[0] as SendPort;
       final bytes = parts[1] as Uint8List;
       final sourceLayers = parts[2] as Set<String>?;
+      final traceTile = parts.length > 3 ? parts[3] as String? : null;
+      final traceAttempt = parts.length > 4 ? parts[4] as String? : null;
 
       try {
         final decoded = VectorTrace.sync(
-            'parse', () => decodeVectorTile(bytes, sourceLayers: sourceLayers));
-        VectorTrace.sync('parseReply', () => replyPort.send(decoded));
+            'parse', () => decodeVectorTile(bytes, sourceLayers: sourceLayers),
+            tile: traceTile, attempt: traceAttempt);
+        VectorTrace.sync('parseReply', () => replyPort.send(decoded),
+            tile: traceTile, attempt: traceAttempt);
       } catch (e) {
         replyPort.send(e.toString());
       }

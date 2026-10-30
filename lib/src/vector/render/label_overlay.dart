@@ -65,6 +65,13 @@ class LabelOverlay {
   /// Tiles with cached prepared labels (public attribution surface).
   int get preparedTiles => _prepared.length;
 
+  /// Identities (`z/x/y`) of tiles whose label preparation completed —
+  /// including tiles that prepared successfully with *zero* labels, so a
+  /// completed no-label tile is distinct from one that was never
+  /// prepared. Harnesses use this to prove label readiness for a
+  /// viewport instead of relying on stable prepared counts.
+  Set<String> get preparedTileKeys => _prepared.keys.toSet();
+
   /// Prepared labels (text/halo painter pairs) across all cached tiles.
   int get preparedLabels {
     var total = 0;
@@ -342,6 +349,7 @@ class LabelOverlay {
     int x,
     int y, {
     bool Function()? isRelevant,
+    String? traceAttempt,
     Duration yieldBudget = const Duration(milliseconds: 4),
     Future<void> Function()? yieldControl,
   }) async {
@@ -365,6 +373,8 @@ class LabelOverlay {
           yieldBudget: yieldBudget,
           yieldControl: yieldControl,
         ),
+        tile: key,
+        attempt: traceAttempt,
       );
       if (_stale(isRelevant)) throw const TileDecodeAborted();
       return;
@@ -388,6 +398,8 @@ class LabelOverlay {
           yieldBudget: yieldBudget,
           yieldControl: yieldControl,
         ),
+        tile: key,
+        attempt: traceAttempt,
       );
       if (_stale(isRelevant)) throw const TileDecodeAborted();
       // Lay out text/halo painters *before* the batch becomes
@@ -401,6 +413,8 @@ class LabelOverlay {
           yieldBudget: yieldBudget,
           yieldControl: yieldControl,
         ),
+        tile: key,
+        attempt: traceAttempt,
       );
       if (_stale(isRelevant)) throw const TileDecodeAborted();
     } catch (_) {

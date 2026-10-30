@@ -5,6 +5,7 @@ import '../common/memory_attribution.dart';
 import '../common/tile_coverage.dart';
 import 'geo_point.dart';
 import 'lat_lng_bounds.dart';
+import 'map_load_state.dart';
 import 'marker.dart';
 import 'marker_manager.dart';
 import 'map_location_controller.dart';
@@ -68,6 +69,28 @@ abstract class MapMemoryDelegate {
 abstract class MapCoverageDelegate {
   /// Point-in-time coverage of the attached map's strict viewport.
   FosmTileCoverage get tileCoverage;
+}
+
+/// Optional workload-capture capability implemented by MapView: cache-state
+/// control and loading attribution for measurement harnesses.
+abstract class MapWorkloadDelegate {
+  /// Drops the rebuildable in-memory tile caches: the compressed byte cache
+  /// and rendered images not protected by the live grid. The persistent
+  /// disk cache, parsed vector tiles, prepared labels, load state and
+  /// failure tracking survive, so the next frames re-render from warm
+  /// parsed data and disk bytes.
+  void dropRebuildableCaches();
+
+  /// Current loading progress for the attached map's viewport, or `null`
+  /// when detached. Failures listed here declare unreachable coverage
+  /// (failed requests) instead of silently missing tiles.
+  MapLoadState? get loadState;
+
+  /// Logical tiles (`z/x/y`) whose label preparation completed for the
+  /// attached vector map, including tiles that prepared successfully
+  /// with zero labels. Empty in raster mode; an empty set for a detached
+  /// map.
+  Set<String> get labelPreparedTileKeys;
 }
 
 /// Programmatic control surface for a [MapView].
@@ -161,6 +184,45 @@ class MapController extends ChangeNotifier {
     return delegate is MapCoverageDelegate
         ? (delegate as MapCoverageDelegate).tileCoverage
         : null;
+  }
+
+  /// Drops the attached map's rebuildable in-memory tile caches (compressed
+  /// bytes and non-protected rendered images) while keeping the disk cache,
+  /// parsed vector tiles and prepared labels — a no-op when detached or
+  /// when the map does not support it.
+  ///
+  /// Workload harnesses use this to measure a warm-parsed/cold-images
+  /// render pass; the equivalent user-visible trigger is a system
+  /// memory-pressure notification.
+  void dropRebuildableCaches() {
+    final delegate = _delegate;
+    if (delegate is MapWorkloadDelegate) {
+      (delegate as MapWorkloadDelegate).dropRebuildableCaches();
+    }
+  }
+
+  /// Point-in-time loading progress for the attached map's viewport
+  /// (including tile failures), or `null` when detached.
+  MapLoadState? get loadState {
+    final delegate = _delegate;
+    return delegate is MapWorkloadDelegate
+        ? (delegate as MapWorkloadDelegate).loadState
+        : null;
+  }
+
+  /// Logical tiles (`z/x/y`) whose label preparation completed for the
+  /// attached vector map — including tiles that prepared successfully
+  /// with zero labels — or an empty set when detached or in raster mode.
+  ///
+  /// Workload harnesses use this to prove label readiness for a viewport
+  /// (every sharp cell's tile present) instead of relying on stable
+  /// prepared counts, which a temporarily empty preparation queue can
+  /// satisfy while other visible tiles have not queued their work yet.
+  Set<String> get labelPreparedTileKeys {
+    final delegate = _delegate;
+    return delegate is MapWorkloadDelegate
+        ? (delegate as MapWorkloadDelegate).labelPreparedTileKeys
+        : const <String>{};
   }
 
   /// Follow/recenter on the latest supplied location; waits if no fix exists.

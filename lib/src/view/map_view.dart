@@ -573,7 +573,8 @@ class _MapViewState extends State<MapView>
         FractionalMapControllerDelegate,
         LocationMapControllerDelegate,
         MapMemoryDelegate,
-        MapCoverageDelegate {
+        MapCoverageDelegate,
+        MapWorkloadDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -1074,6 +1075,7 @@ class _MapViewState extends State<MapView>
         rasterTileBytes: _vectorRuntime?.rasterTileBytes,
         preparedLabelTiles: _vectorRuntime?.labelOverlayPreparedTiles,
         preparedLabels: _vectorRuntime?.labelOverlayPreparedLabels,
+        labelJobsOutstanding: _vectorRuntime?.labelJobsOutstanding,
       );
 
   /// Point-in-time strict-viewport coverage of this map. Exposed through
@@ -1084,6 +1086,24 @@ class _MapViewState extends State<MapView>
   FosmTileCoverage get tileCoverage =>
       _tileManager?.coverage(isFallbackCovered: _zoomFallback?.coversCell) ??
       const FosmTileCoverage.empty();
+
+  /// Drops rebuildable in-memory caches for workload captures (see
+  /// [MapController.dropRebuildableCaches]): the compressed byte cache and
+  /// non-protected rendered images. Disk bytes, parsed vector tiles,
+  /// prepared labels and load state survive.
+  @override
+  void dropRebuildableCaches() => _tileManager?.handleMemoryPressure();
+
+  /// Loading progress for this map's viewport, including failures.
+  @override
+  MapLoadState? get loadState => _tileManager?.loadState;
+
+  /// Logical tiles (`z/x/y`) whose label preparation completed for the
+  /// attached vector map, including tiles that prepared with zero
+  /// labels. Empty in raster mode.
+  @override
+  Set<String> get labelPreparedTileKeys =>
+      _vectorRuntime?.labelOverlayPreparedTileKeys ?? const <String>{};
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;

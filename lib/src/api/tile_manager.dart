@@ -22,6 +22,10 @@ import 'package:fosm/src/isolate/http_isolate.dart'
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_source.dart';
 import 'package:fosm/src/api/map_load_state.dart';
+// Span-log only (publication markers): vector_trace imports nothing from
+// this library, so the dependency direction stays acyclic.
+import 'package:fosm/src/vector/render/vector_trace.dart'
+    show VectorSpanLog, VectorTrace;
 
 // ─── Tile manager ────────────────────────────────────────────────────────────
 
@@ -432,16 +436,32 @@ class TileManager with CacheTiles {
   /// which cells show imagery — their own published image, or fallback
   /// imagery when [isFallbackCovered] says a cell has it — and which
   /// retain their own current-zoom image (sharp), ignoring off-world
-  /// rows and padding.
+  /// rows and padding. Reports cell identities and pixel-area-weighted
+  /// fractions beside the cell counts so harnesses can distinguish
+  /// cell-count coverage from visible pixel area and track cells newly
+  /// exposed during motion.
   FosmTileCoverage coverage(
       {bool Function(String cellKey)? isFallbackCovered}) {
     if (_visibleHorizontalCount <= 0 || _visibleVerticalCount <= 0) {
       return const FosmTileCoverage.empty();
     }
     final n = 1 << zoom;
+    final tileW = renderedTileWidth;
+    final tileH = renderedTileHeight;
+    // Strict-viewport origin within the padded grid: the grid anchors
+    // were rebased onto the padded origin by [calculate], so the first
+    // strict cell sits `tilePadding` cells in.
+    final gridLeft = leftColumnTilesCanvasX + tilePadding * tileW;
+    final gridTop = topRowTilesCanvasY + tilePadding * tileH;
     var visible = 0;
     var covered = 0;
     var sharp = 0;
+    var visibleArea = 0.0;
+    var coveredArea = 0.0;
+    var sharpArea = 0.0;
+    final visibleIds = <String>{};
+    final coveredIds = <String>{};
+    final sharpIds = <String>{};
     for (var h = 0; h < _visibleHorizontalCount; h++) {
       final row = (h + tilePadding) * verticalTileCount;
       for (var v = 0; v < _visibleVerticalCount; v++) {
@@ -450,22 +470,48 @@ class TileManager with CacheTiles {
         final tile = _renderTiles[listIndex];
         if (tile.latIndex < 0 || tile.latIndex >= n) continue;
         visible++;
+        visibleIds.add(tile.index);
+        // Pixel-area weight: this cell's intersection with the viewport
+        // rectangle ([0, width] × [0, height] in canvas coordinates).
+        final cellLeft = gridLeft + h * tileW;
+        final cellTop = gridTop + v * tileH;
+        final overlapW =
+            (cellLeft + tileW).clamp(0.0, width) - cellLeft.clamp(0.0, width);
+        final overlapH =
+            (cellTop + tileH).clamp(0.0, height) - cellTop.clamp(0.0, height);
+        final area = overlapW * overlapH;
+        visibleArea += area;
         // Non-promoting probe: a measurement getter must not refresh LRU
         // positions and thereby perturb the eviction behaviour it watches.
         if (_memoryCache.containsKey(tile.index)) {
           sharp++;
           covered++;
+          sharpIds.add(tile.index);
+          coveredIds.add(tile.index);
+          sharpArea += area;
+          coveredArea += area;
         } else if (tile.sourceTile != null ||
             (isFallbackCovered?.call(tile.index) ?? false)) {
           // Published into the grid but not (yet) retained at the
           // current-zoom key, or covered by zoom-fallback imagery — the
           // cell shows something, but not its own sharp tile.
           covered++;
+          coveredIds.add(tile.index);
+          coveredArea += area;
         }
       }
     }
     return FosmTileCoverage(
-        visibleCells: visible, coveredCells: covered, sharpCells: sharp);
+      visibleCells: visible,
+      coveredCells: covered,
+      sharpCells: sharp,
+      visibleCellIds: visibleIds,
+      coveredCellIds: coveredIds,
+      sharpCellIds: sharpIds,
+      visibleAreaPx: visibleArea,
+      coveredAreaPx: coveredArea,
+      sharpAreaPx: sharpArea,
+    );
   }
 
   /// Strict (un-padded) viewport grid dimensions last computed by
@@ -1627,7 +1673,7 @@ class TileManager with CacheTiles {
         image.dispose();
         return _DecodeOutcome.aborted;
       }
-      _complete(job.key, Tile(image, job.key, job.y, job.x));
+      _complete(job, Tile(image, job.key, job.y, job.x));
       return _DecodeOutcome.ok;
     } on TileDecodeAborted {
       // Stale work stopped itself before parse/render/toImage. Keep any
@@ -1691,7 +1737,10 @@ class TileManager with CacheTiles {
   /// requests for the same resource. Over-zoom siblings and wrapped-X
   /// duplicates await one in-flight future instead of downloading once per
   /// logical slot; the first caller supplies the coordinates the fetcher
-  /// resolves.
+  /// resolves. The download is wrapped in the `fetch` span (tile + canonical
+  /// resource id) so native HttpIsolate downloads are attributed exactly
+  /// like the fetcher-closure path; joining siblings await the shared
+  /// future without their own span.
   Future<Uint8List> _fetchResource(_LoadJob job) {
     final resource = job.resourceKey;
     final existing = _resourceFetches[resource];
@@ -1702,7 +1751,9 @@ class TileManager with CacheTiles {
     // the logical slots that await this resource.
     final completer = Completer<Uint8List>();
     _resourceFetches[resource] = completer.future;
-    _fetchBytes(job.z, job.x, job.y).then(
+    VectorTrace.async('fetch', () => _fetchBytes(job.z, job.x, job.y),
+            tile: '${job.z}/${job.x}/${job.y}', source: resource)
+        .then(
       (bytes) {
         // Publish the bytes to the shared memory cache *before* clearing the
         // in-flight entry. A slot enqueued while the first logical decoder is
@@ -1777,7 +1828,13 @@ class TileManager with CacheTiles {
     return pending.result.future;
   }
 
-  void _complete(String key, Tile tile) {
+  /// Publishes a decoded tile into the grid. Marks the publication in the
+  /// span log (`publish`) with the logical tile — the end of the fetch →
+  /// parse → record → image critical path — only when the image actually
+  /// becomes visible in the render set (a tile that left the viewport, or
+  /// one whose slot already holds an image, publishes nothing).
+  void _complete(_LoadJob job, Tile tile) {
+    final key = job.key;
     _loadFailures.remove(key);
     _failedUntil.remove(key);
     _retryTimers.remove(key)?.cancel();
@@ -1793,6 +1850,9 @@ class TileManager with CacheTiles {
 
     _renderTiles[i] = tile.copyWithImage(image);
     _contentRevision++;
+    final tileId = '${job.z}/${job.x}/${job.y}';
+    VectorSpanLog.mark('publish',
+        tile: tileId, attempt: VectorSpanLog.claimDecodeAttempt(tileId));
     _scheduleTileNotification();
   }
 

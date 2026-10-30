@@ -56,6 +56,32 @@ void main() {
       expect(coverage.missingCells, 0);
       expect(coverage.sharpMissingCells, 0);
     });
+
+    test('pixel-area fractions weight cells by viewport intersection', () {
+      // Two cells: one full 256×256, one half-width sliver (128×256).
+      const coverage = FosmTileCoverage(
+        visibleCells: 2,
+        coveredCells: 1,
+        sharpCells: 1,
+        visibleAreaPx: 256 * 256 + 128 * 256,
+        coveredAreaPx: 128 * 256,
+        sharpAreaPx: 128 * 256,
+      );
+      // Cell-count coverage says half; pixel-area says a third.
+      expect(coverage.coveredFraction, 0.5);
+      expect(coverage.coveredAreaFraction, closeTo(1 / 3, 1e-9));
+      expect(coverage.sharpAreaFraction, closeTo(1 / 3, 1e-9));
+    });
+
+    test('empty grid keeps the full-fraction convention for areas', () {
+      const coverage = FosmTileCoverage.empty();
+      expect(coverage.visibleAreaPx, 0);
+      expect(coverage.coveredAreaFraction, 1);
+      expect(coverage.sharpAreaFraction, 1);
+      expect(coverage.visibleCellIds, isEmpty);
+      expect(coverage.coveredCellIds, isEmpty);
+      expect(coverage.sharpCellIds, isEmpty);
+    });
   });
 
   group('TileManager.coverage', () {
@@ -148,6 +174,73 @@ void main() {
 
         await _settleSharp(manager);
         expect(manager.coverage().allSharp, isTrue);
+      });
+    });
+
+    test('coverage reports cell identities and pixel-area weights',
+        () async {
+      await _real(() async {
+        // 300px viewport at 256px cells: the trailing column/row are
+        // partial, so pixel-area coverage and cell-count coverage have
+        // different denominators in principle.
+        final manager = TileManager.init(
+          width: 300,
+          height: 300,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 5,
+          fetcher: (z, x, y) async => fakeTilePng,
+          tilePadding: 0,
+          preloadAdjacentZoom: false,
+        );
+        addTearDown(manager.dispose);
+
+        manager.calculate();
+        await _settleSharp(manager);
+
+        final coverage = manager.coverage();
+        expect(coverage.visibleCellIds.length, coverage.visibleCells);
+        expect(coverage.sharpCellIds.length, coverage.sharpCells);
+        expect(coverage.coveredCellIds,
+            containsAll(coverage.sharpCellIds),
+            reason: 'sharp cells are a subset of covered cells');
+        // Every visible cell is 256px wide; a 300px viewport clips the
+        // last column and row, so the pixel-area denominator is smaller
+        // than cellCount × 256².
+        expect(coverage.visibleAreaPx,
+            lessThan(coverage.visibleCells * 256.0 * 256));
+        expect(coverage.visibleAreaPx,
+            greaterThan(coverage.visibleCells * 128.0 * 128));
+        // Fully sharp grid: both granularities reach 1.
+        expect(coverage.coveredAreaFraction, 1);
+        expect(coverage.sharpAreaFraction, 1);
+
+        // Partial coverage: pixel-area fraction matches the gated cells'
+        // viewport share, not their count share.
+        final gated = _GatedFetcher();
+        final partialManager = TileManager.init(
+          width: 300,
+          height: 300,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 5,
+          fetcher: gated.call,
+          tilePadding: 0,
+          preloadAdjacentZoom: false,
+        );
+        addTearDown(partialManager.dispose);
+        partialManager.calculate();
+        final evenCells = partialManager.renderTiles
+            .where((t) => t.lngIndex.isEven)
+            .toList();
+        while (partialManager.coverage().coveredCells !=
+            partialManager.coverage().visibleCells - evenCells.length) {
+          await Future<void>.delayed(Duration.zero);
+        }
+        final partial = partialManager.coverage();
+        expect(partial.coveredAreaFraction, lessThan(1));
+        expect(partial.coveredAreaFraction, greaterThan(0));
+        expect(partial.coveredCellIds.length, partial.coveredCells);
+
+        gated.released.complete();
       });
     });
 

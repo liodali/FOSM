@@ -50,6 +50,20 @@ class VectorTileRuntime {
   final LoadedVectorStyle loaded;
   final String namespace;
 
+  /// Span-log identity of this runtime instance (`r3`): runtime #3.
+  ///
+  /// Attempts are namespaced by runtime because tile coordinates alone
+  /// cannot identify a rendering attempt — return pans, retries and style
+  /// switches reuse coordinates. Each style load/remount creates a new
+  /// runtime and therefore a fresh attempt sequence, so attempt ids stay
+  /// unambiguous across the whole capture.
+  late final String traceId = 'r${_runtimeSequence++}';
+
+  static int _runtimeSequence = 1;
+
+  /// Monotonic decode-attempt counter for [traceId]-prefixed attempt ids.
+  int _attemptSequence = 0;
+
   /// Whether to use the platform's asynchronous parse path: a persistent
   /// worker on native or cooperative chunking on web. Set to `false` in
   /// tests that require fully synchronous parsing.
@@ -175,6 +189,12 @@ class VectorTileRuntime {
   /// needed.
   int get labelOverlayPreparedLabels => _labelOverlay?.preparedLabels ?? 0;
 
+  /// Label-preparation work still outstanding: queued jobs plus the
+  /// active preparation. A stable [labelOverlayPreparedTiles] count alone
+  /// does not prove preparation finished — this counter is what settles.
+  int get labelJobsOutstanding =>
+      _labelQueue.length + (_activeLabelPrep ? 1 : 0);
+
   /// Optional stale-work predicate set by [TileManager]. When it returns
   /// `false` for a logical tile, an in-progress decode aborts with
   /// [TileDecodeAborted] before the next expensive stage (parse, style
@@ -253,7 +273,13 @@ class VectorTileRuntime {
 
   /// Tile fetcher for [TileManager]: returns raw MVT bytes for a logical
   /// tile, transparently over-zooming to the source's max zoom.
-  TileFetcher get fetcher => (z, x, y) async {
+  ///
+  /// Download attribution lives in the tile manager's `fetch` span (it
+  /// wraps the canonical resource path — native HttpIsolate downloads
+  /// included), so this closure stays uninstrumented; a byte-cache or
+  /// disk hit never reaches it either. Over-zoom siblings and wrapped-X
+  /// duplicates share one download through [_fetchShared].
+  TileFetcher get fetcher => (z, x, y) {
         final source = vectorSource;
         return _fetchShared(source.urlFor(z, x, y));
       };
@@ -275,24 +301,45 @@ class VectorTileRuntime {
   /// source tile, and rasterizes the logical 256px tile image. Jobs pass
   /// through a demand-aware concurrency gate to keep frames responsive.
   TileDecoder get decoder => (bytes, z, x, y) =>
-      _gated(z, x, y, () => _decodeAndRender(bytes, z, x, y));
+      _gated(z, x, y, (attempt) => _decodeAndRender(bytes, z, x, y, attempt));
 
-  Future<T> _gated<T>(int z, int x, int y, Future<T> Function() job) async {
+  Future<T> _gated<T>(
+      int z, int x, int y, Future<T> Function(String attempt) job) async {
+    // The attempt id is assigned at gate entry — before queueing — so the
+    // queueWait span and every later stage of this rendering attempt
+    // share one id even when the tile scrolled away mid-queue.
+    final attempt = '$traceId.${_attemptSequence++}';
+    final tile = '$z/$x/$y';
+    final queuedAt = VectorSpanLog.nowUs();
     while (_activeDecodes >= _maxConcurrentDecodes && !_disposed) {
       // A tile that scrolled away while queued must not occupy the lane.
-      if (!_isRelevant(z, x, y)) throw const TileDecodeAborted();
+      if (!_isRelevant(z, x, y)) {
+        VectorSpanLog.mark('staleAbort', tile: tile, attempt: attempt);
+        throw const TileDecodeAborted();
+      }
       _pruneStaleWaiters();
       final waiter = _DecodeWaiter(z, x, y);
       _decodeWaiters.add(waiter);
       await waiter.completer.future;
       // Released by [dispose] or [releaseNext]: if the tile went stale while
       // waiting, drop out before spending any CPU.
-      if (!_isRelevant(z, x, y)) throw const TileDecodeAborted();
+      if (!_isRelevant(z, x, y)) {
+        VectorSpanLog.mark('staleAbort', tile: tile, attempt: attempt);
+        throw const TileDecodeAborted();
+      }
     }
     if (_disposed) throw const TileDecodeAborted();
     _activeDecodes++;
+    // Elapsed from gate entry to slot acquisition, including the relevance
+    // rechecks. Span-log only (no timeline event) because it wraps the
+    // queue, not work; kind `async` — never sum as CPU.
+    if (VectorSpanLog.enabled) {
+      VectorSpanLog.record(
+          'queueWait', tile, queuedAt, VectorSpanLog.nowUs() - queuedAt,
+          attempt: attempt);
+    }
     if (debugDecodeOrder.length > 4096) debugDecodeOrder.clear();
-    debugDecodeOrder.add('$z/$x/$y');
+    debugDecodeOrder.add(tile);
     try {
       await debugOnDecodeStarted?.call(z, x, y);
       if (kIsWeb) {
@@ -302,7 +349,7 @@ class VectorTileRuntime {
         await Future<void>.delayed(Duration.zero);
         await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      return await job();
+      return await job(attempt);
     } finally {
       _activeDecodes--;
       // A pressure flush waits for the presentation lane to go idle so no
@@ -365,12 +412,13 @@ class VectorTileRuntime {
 
   /// Queues label preparation for [z]/[x]/[y] after its base image has been
   /// published. Deduplicated so a tile re-decoded while its labels are still
-  /// queued does not prepare twice.
-  void _scheduleLabels(int z, int x, int y) {
+  /// queued does not prepare twice. [attempt] ties the label spans to the
+  /// decode attempt that published the base image.
+  void _scheduleLabels(int z, int x, int y, String attempt) {
     if (_disposed) return;
     final key = '$z/$x/$y';
     if (!_labelQueued.add(key)) return;
-    _labelQueue.add(_LabelJob(z, x, y, key));
+    _labelQueue.add(_LabelJob(z, x, y, key, attempt));
     _pumpLabels();
   }
 
@@ -415,6 +463,7 @@ class VectorTileRuntime {
         job.x,
         job.y,
         isRelevant: () => _isRelevant(job.z, job.x, job.y),
+        traceAttempt: job.attempt,
         yieldBudget: workScheduler == null
             ? const Duration(milliseconds: 4)
             : Duration.zero,
@@ -440,26 +489,48 @@ class VectorTileRuntime {
   /// [TileDecodeAborted], which [TileManager] treats as a stale (non-failing)
   /// outcome so bytes are retained for a later pan.
   Future<ui.Image> _decodeAndRender(
-      Uint8List bytes, int z, int x, int y) async {
+      Uint8List bytes, int z, int x, int y, String attempt) async {
+    final tile = '$z/$x/$y';
     try {
-      return await _decodeAndRenderInner(bytes, z, x, y);
+      final image =
+          await _decodeAndRenderInner(bytes, z, x, y, attempt, tile);
+      // Note the attempt so the tile manager's `publish` marker (which
+      // runs after this future resolves, across the decoder API) can
+      // carry the identity of the decode whose image is being placed.
+      VectorSpanLog.noteDecodeAttempt(tile, attempt);
+      return image;
     } on VectorTileCancelled {
+      // Stale work stopped itself before an expensive stage. Mark it so
+      // workload captures can count wasted presentations per attempt.
+      VectorSpanLog.mark('staleAbort', tile: tile, attempt: attempt);
       throw const TileDecodeAborted();
     }
   }
 
   Future<ui.Image> _decodeAndRenderInner(
-      Uint8List bytes, int z, int x, int y) async {
+    Uint8List bytes,
+    int z,
+    int x,
+    int y,
+    String attempt,
+    String tile,
+  ) async {
     if (_disposed) throw StateError('runtime disposed');
     _checkRelevant(z, x, y);
     final source = vectorSource;
     try {
       final coord = source.resolve(z, x, y);
+      // Identity of the source tile feeding this attempt: over-zoom
+      // siblings share one source (and one parse), so `parseWait` spans
+      // of different logical tiles correlate through this id.
+      final sourceTile = '$coord';
       final ParsedVectorTile parsed;
       try {
         parsed = _parsedTileFor(coord) ??
-            await VectorTrace.async(
-                'parseWait', () => _parseAndStoreDedup(bytes, coord, z, x, y));
+            await VectorTrace.async('parseWait',
+                () => _parseAndStoreDedup(bytes, coord, z, x, y,
+                    attempt: attempt, tile: tile),
+                tile: tile, attempt: attempt, source: sourceTile);
       } on TileDecodeAborted {
         rethrow;
       } on VectorTileCancelled {
@@ -469,8 +540,10 @@ class VectorTileRuntime {
         rethrow;
       } catch (error) {
         // The protobuf payload itself could not be parsed. Report it as a
-        // corrupt payload so the caller invalidates and refetches instead of
+        // corrupt payload so the caller invalidates and refetchs instead of
         // retrying the same bytes forever.
+        VectorSpanLog.mark('payloadInvalid',
+            tile: tile, attempt: attempt, source: sourceTile);
         throw TilePayloadException('$error');
       }
 
@@ -542,7 +615,11 @@ class VectorTileRuntime {
                     ? null
                     : () => workScheduler!
                         .checkpoint(isRelevant: () => _isRelevant(z, x, y)),
-              ));
+                traceAttempt: attempt,
+              ),
+          tile: tile,
+          attempt: attempt,
+          source: sourceTile);
       try {
         // Skip the `toImage` snapshot too if the tile went stale while
         // rendering — it is the single most expensive stage.
@@ -555,8 +632,9 @@ class VectorTileRuntime {
         // `toImage` (the single most expensive stage) for a stale tile.
         _checkRelevant(z, x, y);
         final scheduler = workScheduler;
-        Future<ui.Image> snapshot() =>
-            VectorTrace.async('toImage', () => picture.toImage(256, 256));
+        Future<ui.Image> snapshot() => VectorTrace.async(
+            'toImage', () => picture.toImage(256, 256),
+            tile: tile, attempt: attempt);
         final image = await VectorTrace.async(
             'imageWait',
             () => scheduler == null
@@ -565,12 +643,14 @@ class VectorTileRuntime {
                     snapshot,
                     priority: () => tilePriority?.call(z, x, y) ?? 0,
                     isRelevant: () => _isRelevant(z, x, y),
-                  ));
+                  ),
+            tile: tile,
+            attempt: attempt);
         // Publish the base image immediately. Label preparation runs on a
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness
         // never wait for feature scanning and text layout.
-        _scheduleLabels(z, x, y);
+        _scheduleLabels(z, x, y, attempt);
         return image;
       } finally {
         picture.dispose();
@@ -591,6 +671,13 @@ class VectorTileRuntime {
     }
   }
 
+  /// Logical tiles (`z/x/y`) whose label preparation completed —
+  /// including tiles that prepared successfully with zero labels, so a
+  /// completed no-label tile is distinct from one never prepared. Empty
+  /// before the overlay was first needed and in raster mode.
+  Set<String> get labelOverlayPreparedTileKeys =>
+      _labelOverlay?.preparedTileKeys ?? const <String>{};
+
   ParsedVectorTile? _parsedTileFor(TileCoord coord) {
     final key = _parsedKey(coord);
     final hit = _parsedTiles.remove(key);
@@ -604,9 +691,11 @@ class VectorTileRuntime {
   /// Deduplicates in-flight parses by resolved source [TileCoord]. When
   /// over-zoom siblings request the same source tile before the first
   /// parse completes, they all share one future (and one decode) instead
-  /// of each spawning their own.
+  /// of each spawning their own. The shared parse's worker spans carry
+  /// the *triggering* attempt's identity (the first requester).
   Future<ParsedVectorTile> _parseAndStoreDedup(
-      Uint8List bytes, TileCoord coord, int z, int x, int y) {
+      Uint8List bytes, TileCoord coord, int z, int x, int y,
+      {required String attempt, required String tile}) {
     final requester = '$z/$x/$y';
     final existing = _inFlightParses[coord];
     if (existing != null) {
@@ -618,6 +707,8 @@ class VectorTileRuntime {
       bytes,
       coord,
       isRelevant: () => _anyRequesterRelevant(coord),
+      traceTile: tile,
+      traceAttempt: attempt,
     );
     _inFlightParses[coord] = future;
     // Remove the in-flight entry once it settles so later cache misses
@@ -659,7 +750,9 @@ class VectorTileRuntime {
   }
 
   Future<ParsedVectorTile> _parseAndStore(Uint8List bytes, TileCoord coord,
-      {bool Function()? isRelevant}) async {
+      {bool Function()? isRelevant,
+      String? traceTile,
+      String? traceAttempt}) async {
     // On native, route through the persistent MVT isolate (one long-lived
     // worker) instead of spawning a fresh `compute()` isolate per tile.
     // On web, or when parseOffThread is false (tests), decode on the
@@ -676,6 +769,8 @@ class VectorTileRuntime {
       decoded = await _mvtIsolate.decode(
         bytes,
         sourceLayers: _sourceLayers,
+        traceTile: traceTile,
+        traceAttempt: traceAttempt,
       );
     } else {
       decoded = await decodeMvtAsync(
@@ -858,7 +953,11 @@ class _LabelJob {
   final int y;
   final String key;
 
-  _LabelJob(this.z, this.x, this.y, this.key);
+  /// Decode attempt id that published the base image, so label spans
+  /// correlate with their attempt.
+  final String attempt;
+
+  _LabelJob(this.z, this.x, this.y, this.key, this.attempt);
 }
 
 /// A logical tile waiting for one of the runtime's presentation slots.

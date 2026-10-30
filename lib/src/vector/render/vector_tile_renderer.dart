@@ -75,6 +75,16 @@ class VectorTileRenderer {
   /// Maximum cooperative work interval before yielding to the event loop.
   static const Duration defaultYieldBudget = Duration(milliseconds: 8);
 
+  /// Logical `z/x/y` of the tile being rendered, set by [renderAsync] so
+  /// trace spans and span-log entries correlate per tile. One renderer
+  /// instance renders one tile.
+  String? _traceTile;
+
+  /// Rendering-attempt id (`<runtimeId>.<sequence>`) supplied by the
+  /// runtime, so nested recording spans correlate with the decode attempt
+  /// that caused them (return pans and retries reuse coordinates).
+  String? _traceAttempt;
+
   /// Renders the tile asynchronously with a time budget on every platform.
   /// Checkpoints exist between layers, features, and geometry batches so a
   /// single dense source layer cannot monopolise the UI isolate.
@@ -98,12 +108,14 @@ class VectorTileRenderer {
     Duration yieldBudget = defaultYieldBudget,
     Future<void> Function()? yieldControl,
     bool Function()? isRelevant,
+    String? traceAttempt,
   }) async {
     final recorder = ui.PictureRecorder();
     final canvas =
         ui.Canvas(recorder, const ui.Rect.fromLTWH(0, 0, tileSize, tileSize));
     final ctx = EvaluationContext(zoom: z.toDouble());
-
+    _traceTile = '$z/$x/$y';
+    _traceAttempt = traceAttempt;
     // Pre-filter: collect only the layers that will actually draw at
     // this zoom. OpenFreeMap Liberty has 111 layers but typically
     // 50-70 are visible at any zoom — skipping invisible ones up-front
@@ -197,8 +209,9 @@ class VectorTileRenderer {
         // scheduler waits. Layer id identifies style-heavy vs geometry-heavy
         // work when inspecting CPU samples inside a recording chunk.
         final iterator = chunks.iterator;
-        while (VectorTrace.enabled
-            ? VectorTrace.sync('recordChunk.${layer.id}', iterator.moveNext)
+        while (VectorTrace.syncSpans
+            ? VectorTrace.sync('recordChunk.${layer.id}', iterator.moveNext,
+                tile: _traceTile, attempt: _traceAttempt)
             : iterator.moveNext()) {
           await maybeYield();
         }
@@ -234,6 +247,7 @@ class VectorTileRenderer {
     final canvas =
         ui.Canvas(recorder, const ui.Rect.fromLTWH(0, 0, tileSize, tileSize));
     final ctx = EvaluationContext(zoom: z.toDouble());
+    _traceTile = '$z/$x/$y';
 
     for (final layer in loaded.style.layers) {
       if (!layer.isVisible) continue;
@@ -497,7 +511,8 @@ class VectorTileRenderer {
     final opacityExpr = layer.paint['line-opacity'];
     final widthExpr = layer.paint['line-width'];
 
-    final cache = _StaticPaintCache(layer, baseCtx);
+    final cache = _StaticPaintCache(layer, baseCtx,
+        traceTile: _traceTile, traceAttempt: _traceAttempt);
     final transform = _transformFor(data, srcZ, z, x, y);
 
     final cap = _strokeCap(cache.raw(baseCtx, layer.layout, 'line-cap'));
@@ -630,7 +645,8 @@ class VectorTileRenderer {
     final data = _sourceData(layer, decoded);
     if (data == null || data.features.isEmpty) return;
 
-    final cache = _StaticPaintCache(layer, baseCtx);
+    final cache = _StaticPaintCache(layer, baseCtx,
+        traceTile: _traceTile, traceAttempt: _traceAttempt);
     final transform = _transformFor(data, srcZ, z, x, y);
 
     final dataDriven = const ['circle-color', 'circle-opacity', 'circle-radius']
@@ -846,6 +862,37 @@ class VectorTileRenderer {
         'bevel' => ui.StrokeJoin.bevel,
         _ => ui.StrokeJoin.miter,
       };
+
+  ui.Color? _styleColor(dynamic expr, EvaluationContext ctx) =>
+      VectorTrace.syncSpans
+          ? VectorTrace.sync('style', () => evaluateColorExpr(expr, ctx),
+              tile: _traceTile, attempt: _traceAttempt)
+          : evaluateColorExpr(expr, ctx);
+
+  double _styleNumber(dynamic expr, EvaluationContext ctx,
+          {required double fallback}) =>
+      VectorTrace.syncSpans
+          ? VectorTrace.sync(
+              'style', () => evaluateNumExpr(expr, ctx, fallback: fallback),
+              tile: _traceTile, attempt: _traceAttempt)
+          : evaluateNumExpr(expr, ctx, fallback: fallback);
+
+  bool _styleFilter(dynamic filter, EvaluationContext ctx) =>
+      VectorTrace.syncSpans
+          ? VectorTrace.sync('style', () => matchesFilter(filter, ctx),
+              tile: _traceTile, attempt: _traceAttempt)
+          : matchesFilter(filter, ctx);
+
+  Iterable<void> _traceChunks(String name, Iterable<void> chunks) =>
+      VectorTrace.syncSpans ? _tracedChunks(name, chunks) : chunks;
+
+  Iterable<void> _tracedChunks(String name, Iterable<void> chunks) sync* {
+    final iterator = chunks.iterator;
+    while (VectorTrace.sync(name, iterator.moveNext,
+        tile: _traceTile, attempt: _traceAttempt)) {
+      yield null;
+    }
+  }
 }
 
 class _FillBatch {
@@ -873,22 +920,31 @@ class _LineBatch {
 /// once per feature.
 class _StaticPaintCache {
   final EvaluationContext baseCtx;
+  final String? traceTile;
+  final String? traceAttempt;
   final Map<String, dynamic> _cache = {};
 
-  _StaticPaintCache(StyleLayer layer, this.baseCtx);
+  _StaticPaintCache(StyleLayer layer, this.baseCtx,
+      {this.traceTile, this.traceAttempt});
 
   dynamic raw(
       EvaluationContext featureCtx, Map<String, dynamic> props, String key) {
     final expr = props[key];
     if (expr == null) return null;
     if (dependsOnProperties(expr)) {
-      return VectorTrace.sync(
-          'style', () => evaluateExpression(expr, featureCtx));
+      return VectorTrace.syncSpans
+          ? VectorTrace.sync('style', () => evaluateExpression(expr, featureCtx),
+              tile: traceTile, attempt: traceAttempt)
+          : evaluateExpression(expr, featureCtx);
+    }
+    if (VectorTrace.syncSpans) {
+      return _cache.putIfAbsent(
+          key,
+          () => VectorTrace.sync('style', () => evaluateExpression(expr, baseCtx),
+              tile: traceTile, attempt: traceAttempt));
     }
     return _cache.putIfAbsent(
-        key,
-        () =>
-            VectorTrace.sync('style', () => evaluateExpression(expr, baseCtx)));
+        key, () => evaluateExpression(expr, baseCtx));
   }
 
   double number(
@@ -916,29 +972,6 @@ class _StaticPaintCache {
 }
 
 // Keep expression spans outside the recursive evaluator: one event per paint
-// value/filter, rather than one event for every expression-tree node.
-ui.Color? _styleColor(dynamic expr, EvaluationContext ctx) =>
-    VectorTrace.enabled
-        ? VectorTrace.sync('style', () => evaluateColorExpr(expr, ctx))
-        : evaluateColorExpr(expr, ctx);
-
-double _styleNumber(dynamic expr, EvaluationContext ctx,
-        {required double fallback}) =>
-    VectorTrace.enabled
-        ? VectorTrace.sync(
-            'style', () => evaluateNumExpr(expr, ctx, fallback: fallback))
-        : evaluateNumExpr(expr, ctx, fallback: fallback);
-
-bool _styleFilter(dynamic filter, EvaluationContext ctx) => VectorTrace.enabled
-    ? VectorTrace.sync('style', () => matchesFilter(filter, ctx))
-    : matchesFilter(filter, ctx);
-
-Iterable<void> _traceChunks(String name, Iterable<void> chunks) =>
-    VectorTrace.enabled ? _tracedChunks(name, chunks) : chunks;
-
-Iterable<void> _tracedChunks(String name, Iterable<void> chunks) sync* {
-  final iterator = chunks.iterator;
-  while (VectorTrace.sync(name, iterator.moveNext)) {
-    yield null;
-  }
-}
+// value/filter, rather than one event for every expression-tree node. The
+// helpers below are instance methods so each span carries the logical tile
+// being rendered (see [_traceTile]).

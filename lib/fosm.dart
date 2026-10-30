@@ -20,7 +20,8 @@ export 'src/api/map_polygon.dart';
 export 'src/api/marker.dart';
 export 'src/api/marker_cluster.dart';
 export 'src/api/marker_manager.dart';
-export 'src/api/tile_source.dart' show TileFetcher, TileDecoder, osmTileFetcher;
+export 'src/api/tile_source.dart'
+    show TileFetcher, TileDecoder, osmTileFetcher, downloadTileBytes;
 export 'src/common/map_event_listener_mixin.dart';
 export 'src/common/utils.dart' show initMap, tileWidth, tileHeight;
 export 'src/common/cache_tile_mixin.dart' show MapDiskCache;
@@ -31,3 +32,4 @@ export 'src/common/rendered_tile_cache.dart' show RenderedTileCacheStats;
 export 'src/common/tile_coverage.dart';
 export 'src/vector/style/style_loader.dart'
     show VectorMapStyle, openFreeMapLiberty;
+export 'src/vector/render/vector_trace.dart' show VectorSpanLog, VectorSpan;
