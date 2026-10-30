@@ -1092,7 +1092,20 @@ class _MapViewState extends State<MapView>
   /// non-protected rendered images. Disk bytes, parsed vector tiles,
   /// prepared labels and load state survive.
   @override
-  void dropRebuildableCaches() => _tileManager?.handleMemoryPressure();
+  void dropRebuildableCaches({bool includeVisibleImages = false}) {
+    final manager = _tileManager;
+    if (includeVisibleImages && manager != null) {
+      if (manager.pendingPresentationCount != 0) {
+        throw StateError(
+            'Wait for tile presentations to settle before reloading');
+      }
+      _clearZoomSnapshot();
+      _clearZoomFallback();
+      manager.reloadRenderedImagesForWorkload();
+    } else {
+      manager?.handleMemoryPressure();
+    }
+  }
 
   /// Loading progress for this map's viewport, including failures.
   @override

@@ -23,8 +23,8 @@ void main() {
 
     test('sync spans record duration, tile, attempt and source', () {
       VectorSpanLog.enabled = true;
-      VectorTrace.sync('style', () {}, tile: '10/1/1',
-          attempt: 'r1.0', source: '10/1/1');
+      VectorTrace.sync('style', () {},
+          tile: '10/1/1', attempt: 'r1.0', source: '10/1/1');
       final spans = VectorSpanLog.take();
       expect(spans, hasLength(1));
       expect(spans.single.event, 'style');
@@ -91,8 +91,17 @@ void main() {
       final tile = '12/6/4';
 
       // Critical-path stages must all be present and correlated by tile.
-      expect(events, containsAll(['queueWait', 'parseWait', 'record', 'imageWait', 'toImage']));
-      for (final stage in ['queueWait', 'parseWait', 'record', 'imageWait', 'toImage']) {
+      expect(
+          events,
+          containsAll(
+              ['queueWait', 'parseWait', 'record', 'imageWait', 'toImage']));
+      for (final stage in [
+        'queueWait',
+        'parseWait',
+        'record',
+        'imageWait',
+        'toImage'
+      ]) {
         expect(
           spans.where((span) => span.event == stage).single.tile,
           tile,
@@ -101,9 +110,8 @@ void main() {
       }
       // Synchronous recording slices carry the tile too.
       expect(
-        spans
-            .any((span) =>
-                span.event.startsWith('recordChunk.') && span.tile == tile),
+        spans.any((span) =>
+            span.event.startsWith('recordChunk.') && span.tile == tile),
         isTrue,
         reason: 'recordChunk spans must carry the logical tile',
       );
@@ -129,10 +137,8 @@ void main() {
       image?.dispose();
 
       final spans = VectorSpanLog.take();
-      final attempts = spans
-          .map((span) => span.attempt)
-          .whereType<String>()
-          .toSet();
+      final attempts =
+          spans.map((span) => span.attempt).whereType<String>().toSet();
       expect(attempts, hasLength(1),
           reason: 'every stage of one decode shares one attempt id');
       final attempt = attempts.single;
@@ -176,8 +182,7 @@ void main() {
           .runAsync(() => runtime.decoder(buildTestTile(), 12, 6, 4));
       second?.dispose();
 
-      final attempts = VectorSpanLog
-          .take()
+      final attempts = VectorSpanLog.take()
           .where((span) => span.event == 'parseWait')
           .map((span) => span.attempt)
           .toSet();
@@ -237,12 +242,76 @@ void main() {
       // The claimed attempt is the one the decode spans recorded.
       final attempt = publishes.first.attempt!;
       expect(
-        VectorSpanLog
-            .take()
+        VectorSpanLog.take()
             .any((span) => span.event == 'toImage' && span.attempt == attempt),
         isTrue,
         reason: 'the publish attempt must match a real decode attempt',
       );
+    });
+
+    testWidgets(
+        'visible image reload records again without parsing or fetching',
+        (tester) async {
+      VectorSpanLog.enabled = true;
+      final runtime = VectorTileRuntime(
+          loaded: buildLoadedStyle(),
+          namespace: 'warm-parsed-reload',
+          parseOffThread: false);
+      var downloads = 0;
+      final manager = TileManager.init(
+          width: 256,
+          height: 256,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 12,
+          fetcher: (z, x, y) async {
+            downloads++;
+            return buildTestTile();
+          },
+          decoder: runtime.decoder,
+          resourceKeyBuilder: (z, x, y) => 'shared',
+          cacheNamespace: runtime.namespace,
+          tilePadding: 0,
+          preloadAdjacentZoom: false);
+      addTearDown(manager.dispose);
+      addTearDown(runtime.dispose);
+      Future<void> settle() async {
+        final timeout = Stopwatch()..start();
+        while ((!manager.visibleTilesReady ||
+                manager.pendingPresentationCount > 0) &&
+            timeout.elapsed < const Duration(seconds: 5)) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      }
+
+      await tester.runAsync(() async {
+        manager.calculate();
+        await settle();
+      });
+      expect(manager.visibleTilesReady, isTrue);
+      final fetches = VectorSpanLog.take().where((s) => s.event == 'fetch');
+      expect(downloads, 1);
+      expect(fetches, hasLength(1), reason: 'trace the shared download once');
+      expect(fetches.single.source, 'warm-parsed-reload|shared');
+      final parsedBefore = runtime.parsedTileCount;
+      final release = manager.retainSnapshot(manager.renderTiles);
+      expect(manager.reloadRenderedImagesForWorkload, throwsStateError);
+      expect(manager.visibleTilesReady, isTrue,
+          reason: 'a rejected pinned reload must leave the live grid intact');
+      release();
+      VectorSpanLog.clear();
+      await tester.runAsync(() async {
+        manager.reloadRenderedImagesForWorkload();
+        expect(manager.visibleTilesReady, isFalse);
+        await settle();
+      });
+      expect(manager.visibleTilesReady, isTrue);
+      expect(runtime.parsedTileCount, parsedBefore);
+      expect(downloads, 1);
+      final spans = VectorSpanLog.take();
+      expect(spans.where((s) => s.event == 'record'), isNotEmpty);
+      expect(spans.where((s) => s.event == 'toImage'), isNotEmpty);
+      expect(spans.where((s) => s.event == 'parseWait' || s.event == 'fetch'),
+          isEmpty);
     });
 
     testWidgets('labels spans carry the tile', (tester) async {
@@ -254,8 +323,7 @@ void main() {
       );
       addTearDown(runtime.dispose);
 
-      await tester
-          .runAsync(() => runtime.decoder(buildTestTile(), 12, 6, 4));
+      await tester.runAsync(() => runtime.decoder(buildTestTile(), 12, 6, 4));
       // Label preparation runs on a deferred single-lane queue after the
       // base image publishes; poll with real delays for it to land.
       await tester.runAsync(() async {
@@ -269,9 +337,8 @@ void main() {
           reason: 'labels must prepare after the base image publishes');
 
       final spans = VectorSpanLog.take();
-      final labelSpans = spans
-          .where((span) => span.event.startsWith('labels.'))
-          .toList();
+      final labelSpans =
+          spans.where((span) => span.event.startsWith('labels.')).toList();
       expect(
         labelSpans.any((span) => span.tile == '12/6/4'),
         isTrue,

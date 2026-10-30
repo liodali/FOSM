@@ -79,7 +79,7 @@ abstract class MapWorkloadDelegate {
   /// disk cache, parsed vector tiles, prepared labels, load state and
   /// failure tracking survive, so the next frames re-render from warm
   /// parsed data and disk bytes.
-  void dropRebuildableCaches();
+  void dropRebuildableCaches({bool includeVisibleImages = false});
 
   /// Current loading progress for the attached map's viewport, or `null`
   /// when detached. Failures listed here declare unreachable coverage
@@ -193,11 +193,16 @@ class MapController extends ChangeNotifier {
   ///
   /// Workload harnesses use this to measure a warm-parsed/cold-images
   /// render pass; the equivalent user-visible trigger is a system
-  /// memory-pressure notification.
-  void dropRebuildableCaches() {
+  /// memory-pressure notification for the default mode.
+  ///
+  /// Set [includeVisibleImages] only for a settled workload capture. This
+  /// releases fallback/snapshot pins and reloads visible imagery while
+  /// preserving parsed vector data. Active presentations cause StateError.
+  void dropRebuildableCaches({bool includeVisibleImages = false}) {
     final delegate = _delegate;
     if (delegate is MapWorkloadDelegate) {
-      (delegate as MapWorkloadDelegate).dropRebuildableCaches();
+      (delegate as MapWorkloadDelegate)
+          .dropRebuildableCaches(includeVisibleImages: includeVisibleImages);
     }
   }
 

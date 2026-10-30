@@ -22,7 +22,7 @@ import 'package:fosm/src/isolate/http_isolate.dart'
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_source.dart';
 import 'package:fosm/src/api/map_load_state.dart';
-// Span-log only (publication markers): vector_trace imports nothing from
+// Fetch tracing and publication markers: vector_trace imports nothing from
 // this library, so the dependency direction stays acyclic.
 import 'package:fosm/src/vector/render/vector_trace.dart'
     show VectorSpanLog, VectorTrace;
@@ -169,6 +169,25 @@ class TileManager with CacheTiles {
     _byteCache.clear();
     _byteCacheSize = 0;
     _memoryCache.flushUnused();
+  }
+
+  /// Workload-only reload of a settled viewport, preserving parsed data
+  /// owned by the vector runtime. The view must release image pins first.
+  void reloadRenderedImagesForWorkload() {
+    if (_disposed) throw StateError('Tile manager disposed');
+    if (pendingPresentationCount != 0) {
+      throw StateError(
+          'Wait for tile presentations to settle before reloading');
+    }
+    if (_memoryCache.hasPinnedImages) {
+      throw StateError('Release image pins before a workload reload');
+    }
+    _renderTiles.clear();
+    _memoryCache.setActiveKeys({});
+    _memoryCache.flushUnused();
+    _calcZoom = -1;
+    calculate();
+    _scheduleTileNotification();
   }
 
   /// Protects cached images held by a zoom snapshot until it is released.

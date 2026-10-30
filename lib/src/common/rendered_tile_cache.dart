@@ -73,6 +73,9 @@ class RenderedTileCache {
   int get bytes => _bytes;
   int get length => _entries.length;
 
+  /// Whether a snapshot/fallback still borrows any image from this cache.
+  bool get hasPinnedImages => _entries.values.any((entry) => entry.pins > 0);
+
   /// Point-in-time attribution of retained images, splitting protected
   /// (active grid + pinned) from evictable memory.
   RenderedTileCacheStats get stats {
