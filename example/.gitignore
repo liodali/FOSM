@@ -46,4 +46,5 @@ app.*.map.json
 *.lock
 macos
 native_mapcore
-/benchmark/
+/benchmark//build/web-clean/
+/build/web-spans/
