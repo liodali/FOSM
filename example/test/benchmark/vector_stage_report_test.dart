@@ -172,5 +172,82 @@ void main() {
       ]);
       expect((report['events'] as Map)['queueWait']!['kind'], 'async');
     });
+
+    test('queue/backlog stages attribute the shared-parse bimodality', () {
+      // A realistic over-zoom flow around one shared source parse:
+      // the trigger pays dispatch + worker backlog + CPU (the reply
+      // piggyback), the sibling joiner waits on the shared future, and
+      // the manager-side stages carry no attempt id.
+      final report = buildVectorStageReport(const [
+        // Manager-side, attempt-less: presentation-lane queue and the
+        // finished image's publication hop.
+        VectorSpan('presentationQueueWait', '10/5/3', 0, 400),
+        VectorSpan('publishWait', '10/5/3', 9800, 30),
+        // Trigger r1.0: gate → main-lane dispatch wait → worker port
+        // backlog → worker CPU → the outer parseWait total wraps all of it.
+        VectorSpan('queueWait', '10/5/3', 400, 120, attempt: 'r1.0'),
+        VectorSpan('parseQueueWait', '10/5/3', 520, 40,
+            attempt: 'r1.0', source: '12/2/1'),
+        VectorSpan('parseHold', '10/5/3', 560, 3000,
+            attempt: 'r1.0', source: '12/2/1'),
+        VectorSpan('parse', '10/5/3', 3560, 250,
+            attempt: 'r1.0', source: '12/2/1'),
+        VectorSpan('parseWait', '10/5/3', 520, 3390,
+            attempt: 'r1.0', source: '12/2/1'),
+        // Joiner r1.1: joins the in-flight shared parse.
+        VectorSpan('queueWait', '10/5/4', 400, 130, attempt: 'r1.1'),
+        VectorSpan('parseSharedWait', '10/5/4', 530, 3480,
+            attempt: 'r1.1', source: '12/2/1'),
+        VectorSpan('parseWait', '10/5/4', 530, 3480,
+            attempt: 'r1.1', source: '12/2/1'),
+      ]);
+
+      final events = report['events'] as Map<String, dynamic>;
+      for (final name in [
+        'parseSharedWait',
+        'parseHold',
+        'parseQueueWait',
+        'presentationQueueWait',
+        'publishWait',
+      ]) {
+        expect(events[name]!['kind'], 'async',
+            reason: '$name is elapsed time including waits');
+      }
+      expect(events['parse']!['kind'], 'sync',
+          reason: 'worker-reported parse CPU is CPU-attributable');
+
+      final tiles = report['tiles'] as Map<String, dynamic>;
+      // The trigger attempt carries worker stats next to its total wait;
+      // the sums must add up: dispatch 40 + backlog 3000 + CPU 250 ≈ the
+      // outer parseWait total (3400 ≈ 3390 ± reply hop).
+      final trigger = (tiles['10/5/3'] as Map)['attempts']['r1.0'];
+      expect(trigger['parseWaitUs'], 3390);
+      expect(trigger['parseQueueWaitUs'], 40);
+      expect(trigger['parseHoldUs'], 3000);
+      expect(trigger['parseCpuUs'], 250);
+      expect(trigger['parseCpuN'], 1);
+      final stages = trigger['stages'] as Map<String, dynamic>;
+      expect((stages['parseHold'] as Map)['totalUs'], 3000);
+      expect((stages['parseHold'] as Map)['sources'], ['12/2/1']);
+      expect((stages['parse'] as Map)['totalUs'], 250);
+
+      // The joiner is visibly a joiner: a separate counter from the
+      // trigger-side parseWait, naming the shared source.
+      final joiner = (tiles['10/5/4'] as Map)['attempts']['r1.1'];
+      expect(joiner['parseSharedWaitUs'], 3480);
+      expect(joiner['parseSharedN'], 1);
+      expect(joiner.containsKey('parseCpuUs'), isFalse,
+          reason: 'the shared CPU lands on the triggering attempt only');
+      expect(joiner['sourceTiles'], ['12/2/1']);
+
+      // Manager-side stages stay attempt-less at tile level.
+      final tile3 = tiles['10/5/3'] as Map<String, dynamic>;
+      final lane = tile3['presentationQueue'] as Map<String, dynamic>;
+      expect(lane['n'], 1);
+      expect(lane['totalUs'], 400);
+      final publish = tile3['publishWait'] as Map<String, dynamic>;
+      expect(publish['n'], 1);
+      expect(publish['totalUs'], 30);
+    });
   });
 }

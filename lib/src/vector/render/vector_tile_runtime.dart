@@ -700,7 +700,12 @@ class VectorTileRuntime {
     final existing = _inFlightParses[coord];
     if (existing != null) {
       (_parseRequesters[coord] ??= <String>{}).add(requester);
-      return existing;
+      // Joining a shared future is exactly what `parseWait` sums hide:
+      // one slow source parse multiplied by every waiting sibling. Record
+      // it separately so the extractor can split trigger from joiner
+      // waits (the outer `parseWait` span still measures the total).
+      return VectorTrace.async('parseSharedWait', () => existing,
+          tile: tile, attempt: attempt, source: '$coord');
     }
     _parseRequesters[coord] = <String>{requester};
     final future = _parseAndStore(
@@ -771,6 +776,7 @@ class VectorTileRuntime {
         sourceLayers: _sourceLayers,
         traceTile: traceTile,
         traceAttempt: traceAttempt,
+        traceSource: '$coord',
       );
     } else {
       decoded = await decodeMvtAsync(

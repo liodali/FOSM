@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
@@ -17,10 +18,15 @@ import 'package:fosm/src/vector/render/vector_trace.dart';
 /// (lists, maps, ints, strings) so it is deep-copied across the isolate
 /// boundary, exactly as `compute()` already does.
 ///
-/// Protocol (main → isolate):
-/// `[SendPort replyPort, Uint8List bytes, Set<String>? sourceLayers]`
-/// Protocol (isolate → main): `DecodedVectorTile` on success, `String`
-/// on error.
+/// Protocol (main → isolate): sendport reply, bytes, `Set<String>?`
+/// sourceLayers, `String?` traceTile, `String?` traceAttempt,
+/// `String?` traceSource, int sentAtUs — the last three feed worker
+/// trace identity and the `parseHold` backlog measurement (same clock
+/// as `fosm.vector.parseDispatch`).
+///
+/// Protocol (isolate → main): a two-element list, the decoded tile plus
+/// the stats piggyback that feeds the main-isolate span log; a bare
+/// `String` on error.
 ///
 /// Input bytes are sent via a normal [SendPort.send] (copy) rather than
 /// [TransferableTypedData] because the same byte buffer is retained by
@@ -57,7 +63,7 @@ class MvtIsolate {
   /// Outstanding decodes by their reply port. [dispose] kills the worker,
   /// so their replies can never arrive — each is completed with
   /// [VectorTileCancelled] and its port closed instead of hanging forever.
-  final Map<ReceivePort, Completer<DecodedVectorTile>> _pending = {};
+  final Map<ReceivePort, _PendingDecode> _pending = {};
 
   bool get isReady => _ready;
 
@@ -128,24 +134,45 @@ class MvtIsolate {
   /// [traceTile]/[traceAttempt] correlate the worker's `parse` timeline
   /// events with the requesting attempt (the decode future is shared by
   /// over-zoom siblings — the first requester's attempt is attached).
+  /// [traceSource] carries the resolved source tile so worker-side
+  /// attribution keeps the shared-parse identity; it also lands in the
+  /// span log with the queue/backlog spans.
+  ///
+  /// Two span-log stages are emitted here (main isolate):
+  /// - `parseQueueWait` — decode-call entry to the actual dispatch send,
+  ///   i.e. main-isolate event-loop delay plus worker spawn handshake.
+  /// - `parseHold` — dispatched to worker parse start (worker-reported
+  ///   backlog inside the serial worker's port queue), piggybacked on the
+  ///   reply along with the worker's measured `parse` CPU.
   Future<DecodedVectorTile> decode(
     Uint8List bytes, {
     Set<String>? sourceLayers,
     String? traceTile,
     String? traceAttempt,
+    String? traceSource,
   }) {
     if (!_ready) {
       throw StateError('MvtIsolate not ready — call spawn() first');
     }
     final responsePort = ReceivePort();
     final completer = Completer<DecodedVectorTile>();
-    _pending[responsePort] = completer;
+    final pending = _PendingDecode(
+      completer,
+      tile: traceTile,
+      attempt: traceAttempt,
+      source: traceSource,
+    );
+    final entryUs = VectorSpanLog.nowUs();
+    _pending[responsePort] = pending;
     responsePort.listen((response) {
       _pending.remove(responsePort);
       responsePort.close();
       if (completer.isCompleted) return;
       if (response is DecodedVectorTile) {
         completer.complete(response);
+      } else if (response is List && response.length == 2) {
+        _emitWorkerStats(pending, response[1]);
+        completer.complete(response[0] as DecodedVectorTile);
       } else {
         completer
             .completeError(response is String ? response : 'Unknown error');
@@ -153,11 +180,54 @@ class MvtIsolate {
     });
     VectorTrace.sync(
         'parseDispatch',
-        () => _sendPort!
-            .send([responsePort.sendPort, bytes, sourceLayers, traceTile, traceAttempt]),
+        () => _sendPort!.send([
+              responsePort.sendPort,
+              bytes,
+              sourceLayers,
+              traceTile,
+              traceAttempt,
+              traceSource,
+              developer.Timeline.now,
+            ]),
         tile: traceTile,
-        attempt: traceAttempt);
+        attempt: traceAttempt,
+        source: traceSource);
+    if (VectorSpanLog.enabled) {
+      VectorSpanLog.record(
+        'parseQueueWait',
+        traceTile,
+        entryUs,
+        VectorSpanLog.nowUs() - entryUs,
+        attempt: traceAttempt,
+        source: traceSource,
+      );
+    }
     return completer.future;
+  }
+
+  /// Emits the per-decode worker stats a reply carries into the span log.
+  /// Both stages are aligned to the reply's receive time: `parse` (worker
+  /// CPU, same identity as the triggering attempt) ends receive; `parseHold`
+  /// (port-queue backlog before the worker reached this message) sits
+  /// before it. Missing keys — a worker that predates the piggyback, or a
+  /// lost clock — emit nothing.
+  static void _emitWorkerStats(_PendingDecode pending, Object? raw) {
+    if (!VectorSpanLog.enabled || raw is! Map) return;
+    final receivedUs = VectorSpanLog.nowUs();
+    final tile = pending.tile;
+    final attempt = pending.attempt;
+    final source = pending.source;
+    final parseUs = raw['parseUs'];
+    if (parseUs is int && parseUs > 0) {
+      VectorSpanLog.record('parse', tile, receivedUs - parseUs, parseUs,
+          attempt: attempt, source: source);
+    }
+    final holdUs = raw['holdUs'];
+    if (holdUs is int && holdUs > 0 && parseUs is int) {
+      VectorSpanLog.record('parseHold', tile, receivedUs - parseUs - holdUs,
+          holdUs,
+          attempt: attempt, source: source);
+    }
   }
 
   /// Kills the isolate and cleans up ports. Safe to call multiple times.
@@ -188,8 +258,8 @@ class MvtIsolate {
     _pending.clear();
     for (final entry in pending.entries) {
       entry.key.close();
-      if (!entry.value.isCompleted) {
-        entry.value.completeError(const VectorTileCancelled());
+      if (!entry.value.completer.isCompleted) {
+        entry.value.completer.completeError(const VectorTileCancelled());
       }
     }
   }
@@ -211,16 +281,54 @@ class MvtIsolate {
       final sourceLayers = parts[2] as Set<String>?;
       final traceTile = parts.length > 3 ? parts[3] as String? : null;
       final traceAttempt = parts.length > 4 ? parts[4] as String? : null;
+      final traceSource = parts.length > 5 ? parts[5] as String? : null;
+      final sentAtUs = parts.length > 6 && parts[6] is int ? parts[6] as int : 0;
+      // How long this message waited in the port queue (or behind the
+      // previous parse) before this listener ran — main dispatched it and
+      // resumed rendering; that wait is invisible to main without this
+      // hop. Measured on the shared VM timeline clock, so main's
+      // parseDispatch timestamp is directly comparable.
+      final holdUs =
+          sentAtUs > 0 ? (developer.Timeline.now - sentAtUs).clamp(0, 1 << 40) : 0;
 
       try {
+        final parseClock = Stopwatch()..start();
         final decoded = VectorTrace.sync(
             'parse', () => decodeVectorTile(bytes, sourceLayers: sourceLayers),
-            tile: traceTile, attempt: traceAttempt);
-        VectorTrace.sync('parseReply', () => replyPort.send(decoded),
-            tile: traceTile, attempt: traceAttempt);
+            tile: traceTile, attempt: traceAttempt, source: traceSource);
+        parseClock.stop();
+        // Reply unravels from the trigger's identity anyway; the stats
+        // piggyback (hold + parse CPU) lets the main isolate record the
+        // side channels it cannot see (port backlog, worker CPU).
+        VectorTrace.sync('parseReply', () {
+          replyPort.send([
+            decoded,
+            <String, Object?>{
+              if (holdUs > 0) 'holdUs': holdUs,
+              'parseUs': parseClock.elapsedMicroseconds,
+            }
+          ]);
+        }, tile: traceTile, attempt: traceAttempt, source: traceSource);
       } catch (e) {
         replyPort.send(e.toString());
       }
     });
   }
+}
+
+/// One outstanding decode and the trace identity to attribute its
+/// reply-carried worker stats (port-queue backlog, worker parse CPU) when
+/// they land on the main-isolate span log.
+class _PendingDecode {
+  const _PendingDecode(
+    this.completer, {
+    this.tile,
+    this.attempt,
+    this.source,
+  });
+
+  final Completer<DecodedVectorTile> completer;
+  final String? tile;
+  final String? attempt;
+  final String? source;
 }

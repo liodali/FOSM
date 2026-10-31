@@ -1483,6 +1483,7 @@ class TileManager with CacheTiles {
         payloadId: _payloadVersion(bytes),
         origin: origin,
         diskKey: diskKey,
+        queuedAtUs: VectorSpanLog.nowUs(),
       ),
     );
     _pumpPresentations();
@@ -1513,6 +1514,20 @@ class TileManager with CacheTiles {
   Future<void> _runPresentation(_PresentJob entry) async {
     var refetch = false;
     _activePresentEntries.add(entry);
+    // The presentation lane is a bounded queue in front of every decode —
+    // attempts only start measuring `queueWait` (the runtime gate) once
+    // their job got through here, so this stretch is otherwise invisible.
+    // Span-log only (wraps a queue, not work), keyed by the logical tile:
+    // no attempt id exists manager-side.
+    if (VectorSpanLog.enabled) {
+      final job = entry.job;
+      VectorSpanLog.record(
+        'presentationQueueWait',
+        '${job.z}/${job.x}/${job.y}',
+        entry.queuedAtUs,
+        VectorSpanLog.nowUs() - entry.queuedAtUs,
+      );
+    }
     try {
       refetch = await _present(entry);
     } finally {
@@ -1681,8 +1696,20 @@ class TileManager with CacheTiles {
                   !_disposed && isTileRelevant(job.z, job.x, job.y),
             )
           : await _decoder(bytes, job.z, job.x, job.y);
+      // Finished image to publication decision (publish into the grid /
+      // dispose-drop). Span closes right before the outcome is returned.
+      // Attempt-less: the `publish` marker claims the decode attempt.
+      final publishStartUs = VectorSpanLog.nowUs();
+      final tileId = '${job.z}/${job.x}/${job.y}';
+      void closePublishSpan() {
+        if (VectorSpanLog.enabled) {
+          VectorSpanLog.record('publishWait', tileId, publishStartUs,
+              VectorSpanLog.nowUs() - publishStartUs);
+        }
+      }
       if (_disposed) {
         image.dispose();
+        closePublishSpan();
         return _DecodeOutcome.aborted;
       }
       // The camera may have moved while decoding. In vector mode padding is
@@ -1690,9 +1717,11 @@ class TileManager with CacheTiles {
       // padding ring must not publish an image or repaint.
       if (!isTileRelevant(job.z, job.x, job.y)) {
         image.dispose();
+        closePublishSpan();
         return _DecodeOutcome.aborted;
       }
       _complete(job, Tile(image, job.key, job.y, job.x));
+      closePublishSpan();
       return _DecodeOutcome.ok;
     } on TileDecodeAborted {
       // Stale work stopped itself before parse/render/toImage. Keep any
@@ -2277,12 +2306,18 @@ class _PresentJob {
   /// legacy record that is migrated after a successful decode.
   final String? diskKey;
 
-  const _PresentJob({
+  /// Span-log timestamp of when this job was queued for the presentation
+  /// lane; `_runPresentation` closes the `presentationQueueWait` span
+  /// over it (asset-lane wait that no other stage currently sees).
+  final int queuedAtUs;
+
+  _PresentJob({
     required this.job,
     required this.bytes,
     required this.payloadId,
     required this.origin,
     this.diskKey,
+    required this.queuedAtUs,
   });
 }
 

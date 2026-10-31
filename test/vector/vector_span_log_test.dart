@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -188,6 +190,79 @@ void main() {
           .toSet();
       expect(attempts, hasLength(2),
           reason: 'tile coordinates repeat across retries; attempts do not');
+    });
+
+    testWidgets(
+        'over-zoom siblings join a shared parse; the worker piggyback '
+        'reports queue hold and CPU', (tester) async {
+      VectorSpanLog.enabled = true;
+      final previousOverride =
+          VectorTileRuntime.debugMaxConcurrentDecodesOverride;
+      VectorTileRuntime.debugMaxConcurrentDecodesOverride = 4;
+      addTearDown(() {
+        VectorTileRuntime.debugMaxConcurrentDecodesOverride = previousOverride;
+      });
+
+      // The whole worker-path decode must live inside one real-async
+      // envelope: testWidgets' fake zone cannot groom microtasks while
+      // `runAsync` is parked, and a real isolate reply delivers outside
+      // it — an await chain that crosses the reply would stall forever.
+      await tester.runAsync(() async {
+        final runtime = VectorTileRuntime(
+          loaded: buildLoadedStyle(),
+          namespace: 'span-shared-parse',
+          parseOffThread: true,
+        );
+        addTearDown(runtime.dispose);
+        // Real-async time for the constructor-started spawn handshake.
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+
+        // Two z13 tiles both resolve to source 12/3/2 (fixture maxZoom
+        // is 12): the second decode joins the first's in-flight parse.
+        // The trigger is parked in its worker reply await when the
+        // sibling starts, so the join is deterministic.
+        final trigger = runtime.decoder(buildTestTile(), 13, 6, 4);
+        unawaited(trigger);
+        final joiner = runtime.decoder(buildTestTile(), 13, 7, 4);
+        final first = await trigger.timeout(const Duration(seconds: 20));
+        final second = await joiner.timeout(const Duration(seconds: 20));
+        first?.dispose();
+        second?.dispose();
+      });
+
+      final spans = VectorSpanLog.take();
+      // Attempt ids come out in assignment order: the trigger is rX.0.
+      final triggerAttempt =
+          spans.firstWhere((span) => span.event == 'queueWait').attempt!;
+      final joins = spans.where((span) => span.event == 'parseSharedWait');
+      expect(joins, hasLength(1),
+          reason: 'the sibling joining an in-flight parse is a joiner');
+      expect(joins.single.attempt, isNot(triggerAttempt),
+          reason: 'the joiner carries its own attempt id');
+      expect(joins.single.source, '12/3/2',
+          reason: 'the join names the shared source tile, not its logical one');
+      expect(spans.where((span) => span.event == 'parseWait'), hasLength(2),
+          reason: 'the outer parseWait still wraps trigger and joiner');
+
+      // Worker-side stats exist on the persistent-worker path (parse
+      // CPU and the port-queue hold, both keyed to the *triggering*
+      // attempt — the sibling's join never touches them).
+      final queueWaits =
+          spans.where((span) => span.event == 'parseQueueWait').toList();
+      expect(queueWaits, hasLength(1),
+          reason: "the trigger's dispatch is measured entry-to-send");
+      expect(queueWaits.single.attempt, triggerAttempt);
+      expect(queueWaits.single.source, '12/3/2');
+      final cpu = spans
+          .where((span) => span.event == 'parse' && span.attempt != null);
+      expect(cpu, isNotEmpty,
+          reason: 'worker parse CPU is piggybacked per triggering attempt');
+      expect(cpu.single.attempt, triggerAttempt);
+      expect(cpu.single.source, '12/3/2');
+      for (final hold in spans.where((span) => span.event == 'parseHold')) {
+        expect(hold.attempt, triggerAttempt);
+        expect(hold.source, '12/3/2');
+      }
     });
 
     testWidgets('publish marks the end of the critical path', (tester) async {

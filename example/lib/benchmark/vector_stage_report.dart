@@ -7,10 +7,14 @@
 //   `parseDispatch`, `parseReply`, `labels.paint`) wrap synchronous
 //   closures: their durations are CPU-attributable per slice and safe to
 //   sum within an event.
-// - Async spans (`fetch`, `queueWait`, `parseWait`, `record`, `imageWait`,
-//   `toImage`, `labels.build`, `labels.layout`) measure elapsed time
-//   including waits and scheduler queues; they may overlap and must never
-//   be summed as CPU.
+// - Async spans (`fetch`, `queueWait`, `parseWait`, `parseSharedWait`,
+//   `parseHold`, `parseQueueWait`, `presentationQueueWait`, `publishWait`,
+//   `record`, `imageWait`, `toImage`, `labels.build`, `labels.layout`)
+//   measure elapsed time including waits and scheduler queues; they may
+//   overlap and must never be summed as CPU.
+// - `parse` arrives from the isolate reply piggyback (worker-measured
+//   decode CPU) and stays CPU-attributable per slice; it lands in the
+//   sync class here.
 // - Markers (`staleAbort`, `payloadInvalid`, `publish`) are zero-duration
 //   events.
 //
@@ -37,6 +41,11 @@ const List<String> _asyncEvents = [
   'fetch',
   'queueWait',
   'parseWait',
+  'parseSharedWait',
+  'parseHold',
+  'parseQueueWait',
+  'presentationQueueWait',
+  'publishWait',
   'record',
   'imageWait',
   'toImage',
@@ -168,7 +177,11 @@ void _accumulate(Map<String, Object?> row, VectorSpan span) {
     return;
   }
   // Attempt-less stages: fetches run per tile-manager job (before any
-  // decode attempt exists); worker hand-offs are not per-tile costs.
+  // decode attempt exists), the presentation lane queues jobs for the
+  // bounded concurrency slot, and the publish hop shows the finished
+  // image's trip to the render set (or its drop). Worker hand-offs
+  // (`parseHold`, `parseQueueWait`, `parseSharedWait`) carry attempt ids
+  // of their triggering attempt and aggregate above.
   switch (name) {
     case 'fetch':
       final fetch = row.putIfAbsent(
@@ -179,6 +192,17 @@ void _accumulate(Map<String, Object?> row, VectorSpan span) {
       if (source != null) {
         _addUnique(fetch, 'sources', source);
       }
+    case 'presentationQueueWait':
+      final lane = row.putIfAbsent('presentationQueue',
+          () => <String, Object?>{}) as Map<String, Object?>;
+      lane['totalUs'] = ((lane['totalUs'] as int?) ?? 0) + span.durationUs;
+      lane['n'] = ((lane['n'] as int?) ?? 0) + 1;
+    case 'publishWait':
+      final publish = row.putIfAbsent('publishWait',
+          () => <String, Object?>{}) as Map<String, Object?>;
+      publish['totalUs'] =
+          ((publish['totalUs'] as int?) ?? 0) + span.durationUs;
+      publish['n'] = ((publish['n'] as int?) ?? 0) + 1;
     case 'publish':
       row['publishN'] = ((row['publishN'] as int?) ?? 0) + 1;
   }
@@ -233,6 +257,20 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
     case 'parseWait':
       row['parseWaitUs'] = ((row['parseWaitUs'] as int?) ?? 0) + span.durationUs;
       row['parseN'] = ((row['parseN'] as int?) ?? 0) + 1;
+    case 'parseSharedWait':
+      row['parseSharedWaitUs'] =
+          ((row['parseSharedWaitUs'] as int?) ?? 0) + span.durationUs;
+      row['parseSharedN'] = ((row['parseSharedN'] as int?) ?? 0) + 1;
+    case 'parseHold':
+      row['parseHoldUs'] = ((row['parseHoldUs'] as int?) ?? 0) + span.durationUs;
+    case 'parseQueueWait':
+      row['parseQueueWaitUs'] =
+          ((row['parseQueueWaitUs'] as int?) ?? 0) + span.durationUs;
+    case 'parse':
+      // Worker-reported decode CPU (reply piggyback), landing per
+      // triggering attempt.
+      row['parseCpuUs'] = ((row['parseCpuUs'] as int?) ?? 0) + span.durationUs;
+      row['parseCpuN'] = ((row['parseCpuN'] as int?) ?? 0) + 1;
     case 'record':
       row['recordUs'] = ((row['recordUs'] as int?) ?? 0) + span.durationUs;
     case 'imageWait':

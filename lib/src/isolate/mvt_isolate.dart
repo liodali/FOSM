@@ -21,13 +21,14 @@ class MvtIsolate {
 
   /// Decodes [bytes] into a [DecodedVectorTile] on the background
   /// isolate. Throws if the isolate is not ready. [traceTile]/
-  /// [traceAttempt] are accepted for signature parity with the native
-  /// implementation (they only tag timeline events).
+  /// [traceAttempt]/[traceSource] are accepted for signature parity with
+  /// the native implementation (they only tag timeline events).
   Future<DecodedVectorTile> decode(
     Uint8List bytes, {
     Set<String>? sourceLayers,
     String? traceTile,
     String? traceAttempt,
+    String? traceSource,
   }) {
     throw UnsupportedError('MvtIsolate is not available on this platform');
   }
