@@ -41,6 +41,7 @@ cd "$(dirname "$0")/.."
 
 echo "── payload server on ${lan_ip}:${port} (payload identity in server log)"
 dart run tool/vector_payload_server.dart --host 0.0.0.0 --port "$port" \
+  --marker-log-dir "$out" \
   > "$out/payload-server.log" 2>&1 &
 server_pid=$!
 trap 'kill $server_pid 2>/dev/null || true' EXIT
@@ -60,7 +61,8 @@ run_benchmark() {
   flutter run --profile --start-paused -d "$device" \
     -t lib/benchmark/map_vector_benchmark.dart \
     --dart-define=BENCHMARK_LABEL="$label" \
-    --dart-define=BENCHMARK_VECTOR_BASE="$base" "$@" > "$log" 2>&1 &
+    --dart-define=BENCHMARK_VECTOR_BASE="$base" \
+    --dart-define=BENCHMARK_MARKER_URL="$base/log" "$@" > "$log" 2>&1 &
   local flutter_pid=$!
   # Wait for the VM service URL, then subscribe and resume. The trace arm
   # also saves the VM timeline (all isolates — the MVT worker included)
@@ -85,22 +87,44 @@ run_benchmark() {
     > "$out/$label.log" 2>&1
   kill $flutter_pid 2>/dev/null || true
   wait $flutter_pid 2>/dev/null || true
-  grep -c FOSM_BENCHMARK_RESULT "$out/$label.log" | \
+  # The marker sink is the run's data safety net: when the wireless
+  # console relay wedges mid-run (results frozen while the app kept
+  # running), the app's direct POSTs still filled markers-$label.log.
+  # Canonize it when it is more complete than the console copy.
+  local markers="$out/markers-$label.log"
+  if [[ -f "$markers" ]]; then
+    local console_n marker_n
+    console_n=$(grep -cF FOSM_BENCHMARK_RESULT "$out/$label.log" 2>/dev/null || echo 0)
+    marker_n=$(grep -cF FOSM_BENCHMARK_RESULT "$markers" 2>/dev/null || echo 0)
+    if (( marker_n > console_n )); then
+      mv "$markers" "$out/$label.log"
+      echo "   (marker sink was the more complete channel)"
+    else
+      rm -f "$markers"
+    fi
+  fi
+  grep -cF FOSM_BENCHMARK_RESULT "$out/$label.log" | \
     xargs -I{} echo "   {} result lines"
   grep -c FOSM_BENCHMARK_VECTOR_STAGES "$out/$label.log" | \
     xargs -I{} echo "   {} stage lines" || true
 }
 
-for rep in $(seq 1 "$clean_reps"); do
+rep=1
+while [[ $rep -le $clean_reps ]]; do
   run_benchmark "vector-clean-r$rep"
+  rep=$((rep + 1))
 done
-for rep in $(seq 1 "$span_reps"); do
+rep=1
+while [[ $rep -le $span_reps ]]; do
   run_benchmark "vector-spans-r$rep" --dart-define=fosm.vectorSpans=true
+  rep=$((rep + 1))
 done
-for rep in $(seq 1 "$trace_reps"); do
+rep=1
+while [[ $rep -le $trace_reps ]]; do
   run_benchmark "vector-trace-r$rep" \
     --dart-define=fosm.vectorSpans=true --dart-define=fosm.traceVector=true \
     --dart-define=fosm.vectorTraceChunks=false
+  rep=$((rep + 1))
 done
 
 echo "done: $out (parse with parse_benchmark_log + extract_vector_stages)"
