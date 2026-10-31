@@ -131,9 +131,28 @@ Stage semantics ([trace guide](../vector-processing.md)): **sync** spans
 (`recordChunk.*`, `style`, `geometry`, `dash`, `parseDispatch`,
 `parseReply`, `labels.paint`) wrap synchronous closures and are
 CPU-attributable per slice; **async** spans (`fetch`, `queueWait`,
-`parseWait`, `record`, `imageWait`, `toImage`, `labels.build`,
-`labels.layout`) measure elapsed time including waits, may overlap, and
-must never be summed as CPU.
+`parseWait`, `parseSharedWait`, `parseHold`, `parseQueueWait`,
+`presentationQueueWait`, `publishWait`, `record`, `imageWait`, `toImage`,
+`labels.build`, `labels.layout`) measure elapsed time including waits,
+may overlap, and must never be summed as CPU. The worker-reported decode
+CPU returns with the reply piggyback (`parseUs`/`holdUs`) and lands as a
+sync-classified `parse` span under the triggering attempt's identity.
+
+Wait decomposition for cold parses (the pieces of a `parseWait`):
+
+- `parseQueueWait` — decode-call entry to the dispatch send on the main
+  isolate (event-loop delay behind rendering plus worker spawn).
+- `parseHold` — dispatched to worker parse start: the serial worker's
+  port-queue backlog (measured on the shared VM timeline clock, sent
+  back with the reply).
+- `parse` — worker decode CPU (reply piggyback).
+- `parseSharedWait` — a sibling attempt that arrives while another
+  logical tile's parse is still in flight; it waits on the shared
+  future (this is the term that multiplies one slow source parse by
+  every waiting over-zoom sibling, attributed separately from the
+  trigger).
+- The remainder of a trigger's `parseWait` is isolate transport
+  (serialization copy + reply hop).
 
 Identity: tile coordinates alone cannot identify a rendering attempt —
 return pans, retries and style switches reuse them, and shared parses
@@ -144,14 +163,19 @@ serve multiple logical tiles. Every stage span therefore carries:
   assigned at the concurrency-gate entry, so `queueWait` through
   `toImage` and the label lane share one id; fetches run per
   tile-manager job before any attempt starts and aggregate per tile
-  with their source tiles listed);
+  with their source tiles listed; the parse-side queue/backlog/CPU
+  stages carry the *triggering* attempt's id);
 - `source` — the resolved source tile `z/x/y` after over-zoom, so
   over-zoom siblings sharing one parse/download correlate through it.
 
 Zero-duration markers: `staleAbort` (aborted while queued or during
 render), `payloadInvalid` (undecodable bytes), `publish` (the tile
 manager placed the image into the visible grid, carrying the completed
-decode attempt it claims). Timeline events carry the same identity as
+decode attempt it claims). Two adjacent manager stages are attempt-less
+and aggregate per tile like `fetch` does: `presentationQueueWait`
+(queued for the bounded presentation-lane slot; the runtime's
+`queueWait` gate only sees work after this queue) and `publishWait`
+(finished image to the publish-into-grid/drop decision). Timeline events carry the same identity as
 `arguments` (`tile`/`attempt`/`source`) so DevTools captures correlate
 identically, including the worker's `parse`/`parseReply` (a shared parse
 carries the triggering first-requester attempt).

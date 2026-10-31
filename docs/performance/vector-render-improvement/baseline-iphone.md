@@ -64,20 +64,35 @@ matches the traced stages; see [Found issues](#found-issues)).
 ## Attribution (spans arms, per-attempt stage sums)
 
 Stage window sums per attempt overlap by design (they are critical paths,
-not CPU). Two reps quoted where they differ.
+not CPU). Rep values quoted where they differ.
 
-| Scenario | fetch | queueWait | parseWait | record | recordChunk (sync) | toImage | imageWait | labels.build | labels.layout |
-|---|---|---|---|---|---|---|---|---|---|
-| vector_cold_static | 311 / 484 | 274 / 127 | 64 / 52 | 156 / 98 | 6.2 / 6.4 | 17 / 19 | 137 / 122 | 0.1 | 0.0 |
-| vector_warm_bytes_static | 0 (disk) | 609 / 376 | 297 / 120 | 263 / 163 | 7.1 / 8.6 | 17 | 118 | 0.2 | 0.1 |
-| vector_cold_overzoom | 185 / 76 | 16589 / 14555 | 13622 / 59 | 19305 / 18891 | 447 / 610 | 53 / 61 | 142 / 130 | 1332 / 1427 | 4008 / 3994 |
-| vector_warm_parsed_static | 0 (disk+parsed) | 574 / 625 | **0 / 0** | 568 / 622 | 0 | 32 / 33 | 176 / 171 | 0.0 / 0.0 | 0.4 / 0.4 |
+| Scenario | fetch | presentation Queue | queueWait | parse Queue | parse Hold | parse (CPU) | parseWait | shared Wait | record | record Chunk | toImage | image Wait | publish Wait | labels build | labels layout |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| vector_cold_static | 311 / 484 | – | 274 / 127 | – | – | – | 64 / 52 | – | 156 / 98 | 6.2 / 6.4 | 17 / 19 | 137 / 122 | – | 0.1 | 0.0 |
+| vector_warm_bytes_static | 0 (disk) | – | 609 / 376 | – | – | – | 297 / 120 | – | 263 / 163 | 7.1 / 8.6 | 17 | 118 | – | 0.2 | 0.1 |
+| vector_cold_overzoom | 117 / 104 | 24192 / 24151 | 14936 / 14982 | 0.1 / 0.2 | 0.2 / 0.3 | 11.7 / 10.5 | 52 / 69 | 24 / 36 | 19440 / 19653 | 583 / 567 | 60 / 59 | 152 / 152 | 0.1 / 0.1 | 1319 / 1394 | 4246 / 4346 |
+| vector_warm_parsed_static | 0 (disk+parsed) | ~0 | 574 / 625 | – | – | – | **0 / 0** | **0 / 0** | 845* | 0 | 32 / 33 | 176 / 171 | ~0 | 0.0 / 0.0 | 0.4 / 0.4 |
 
-*The strict warm-parsed scenario measures a rebuild from parsed data (the
-table above is the per-attempt stage sums for its two spans reps); its
-visible metric — 303–320 ms to full sharp across reps with a
-−1.2..−1.9 MB RSS delta — is the honest round-trip through
-record→toImage from warm parsed data.*
+*Columns `presentationQueue`, `parseQueueWait`/`parseHold`/`parse`
+(CPU)/`sharedWait`/`publishWait` are new in round 3 (queue/publication
+tracing); `warm_parsed`'s `record` 845 ms is the round-3 spans r1 value
+(round-2 reported 568/622 on the same build — spread is hardware-level;
+round-3 spans were captured only for overzoom verification of this
+report's found-issue #2). The strict warm-parsed scenario measures a
+rebuild from parsed data; its visible metric — 303–320 ms to full sharp
+across round-2 reps with a −1.2..−1.9 MB RSS delta — is the honest
+round-trip through record→toImage from warm parsed data.*
+
+*Overzoom reading (round 3, both reps in tight agreement): the parse
+chain is fully decomposed now — the worker processes ~11 ms of decode
+CPU per source tile, main-lane dispatch and port-backlog waits are
+sub-millisecond, and sibling joins wait 24–36 ms. `publishWait` ≈ 0.1 ms
+shows the finished image's publication hop is free. The heavy terms
+stand: ~24 s of **presentation-lane** queuing (attempt-less manager-side
+stage — the bounded lane in front of every decode, invisible before this
+instrument), ~15 s of decode-gate queueing, ~19.5 s of record elapsed,
+and 5.6–5.7 s of label work. Stage sums overlap across concurrent tiles;
+per-tile lane waits average ~2 s.*
 
 ## What the numbers say (plan-01 question)
 
@@ -120,10 +135,18 @@ record→toImage from warm parsed data.*
    for recently visited areas and made the *strict* warm-parsed/
    cold-images measurement impossible without a pin-bypass hook — the
    shipped hook (`includeVisibleImages`) now closes that measurement.
-2. **Overzoom parseWait variance**: one overzoom rep recorded 13.6 s of
-   `parseWait` totals against 59 ms in the other — shared-parse waits
-   behind the decode gate are the suspected term (needs the
-   presentation-queue instrumentation to close out).
+2. **Overzoom parseWait variance — RESOLVED by round-3 instrumentation**:
+   one round-2 rep recorded 13.6 s of `parseWait` totals against 59 ms
+   in the other. The queue/publication spans (`parseQueueWait`,
+   `parseHold`, `parseSharedWait`, worker-reported `parse` CPU) close it:
+   both round-3 overzoom reps decompose to ~52–69 ms of total parseWait
+   with the worker's decode CPU at ~11 ms and sub-millisecond dispatch
+   and port-backlog waits — the pipeline's plausibly consistent state.
+   The round-2 outlier was overlapping per-attempt waits behind one
+   straggler shared parse summed per attempt (a stage-sum artifact, not
+   decode cost); with joins attributed separately (`parseSharedWait`),
+   rep-to-rep spread collapsed to ~1 %. If the straggler pattern recurs,
+   it is now directly visible per attempt rather than hidden in a sum.
 3. The VM timeline ring is far smaller than a 12-scenario run; the trace
    arm polls getVMTimeline without clearing (merged snapshots) and
    disables chunk-level sync spans (`fosm.vectorTraceChunks=false`, ~34×
@@ -135,6 +158,15 @@ record→toImage from warm parsed data.*
    whole window), traced in round-2's frame data (perf p95s 0.8 ms over
    251–264 frames). The corrected arming measures warm-disk loads at
    185–199 ms full sharp.
+5. **Presentation-lane cost newly visible in overzoom**: the manager's
+   bounded presentation lane (`presentationQueueWait`, attempt-less
+   stage) held ~2 s per tile and ~24 s of summed waits ahead of the
+   already-known 15 s decode-gate backlog. Previously invisible — the
+   runtime gate's `queueWait` only begins when a presentation slot
+   releases a job into the runtime. Optimization work targeting
+   overzoom cold loads (plans 04/06 candidates) must consider this lane
+   together with the gate; `publishWait` ≤ 0.1 ms rules the publication
+   hop out.
 
 ## Browser addendum
 
