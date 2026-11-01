@@ -25,6 +25,11 @@
 # Logs land in OUTPUT_DIR as <label>.log; parse them with
 #   dart run tool/parse_benchmark_log.dart OUT/*.log > OUT/report.json
 #   dart run tool/extract_vector_stages.dart OUT OUT/stages
+# Set BENCHMARK_DASH_DIAGNOSTICS=1 for instrumented dash counts and timings.
+# BENCHMARK_SCENARIO selects one exact scenario; BENCHMARK_DASH_CULL=1
+# enables the experimental dash-culling candidate.
+# BENCHMARK_FIXTURE_DIR and BENCHMARK_FIXTURE_ID select recorded MVT tiles.
+# BENCHMARK_LATITUDE and BENCHMARK_LONGITUDE select the benchmark center.
 set -euo pipefail
 
 device="${1:?device id}"
@@ -35,6 +40,30 @@ span_reps="${5:-2}"
 trace_reps="${6:-1}"
 port=8787
 base="http://${lan_ip}:${port}"
+dash_args=()
+fixture_args=()
+if [[ -n "${BENCHMARK_FIXTURE_DIR:-}" ]]; then
+  : "${BENCHMARK_FIXTURE_ID:?fixture runs require BENCHMARK_FIXTURE_ID}"
+  fixture_args=(--fixture-dir "$BENCHMARK_FIXTURE_DIR")
+  dash_args+=(--dart-define=BENCHMARK_PAYLOAD_IDENTITY="$BENCHMARK_FIXTURE_ID"
+    --dart-define=BENCHMARK_VECTOR_PROFILE=fixture)
+fi
+if [[ "${BENCHMARK_DASH_DIAGNOSTICS:-0}" == 1 ]]; then
+  dash_args+=(--dart-define=fosm.vectorDashDiagnostics=true)
+fi
+if [[ "${BENCHMARK_DASH_CULL:-0}" == 1 ]]; then
+  dash_args+=(--dart-define=fosm.vectorDashCull=true)
+fi
+if [[ -n "${BENCHMARK_SCENARIO:-}" ]]; then
+  dash_args+=(--dart-define=BENCHMARK_SCENARIO="$BENCHMARK_SCENARIO")
+fi
+if [[ -n "${BENCHMARK_LATITUDE:-}" && -n "${BENCHMARK_LONGITUDE:-}" ]]; then
+  dash_args+=(--dart-define=BENCHMARK_LATITUDE="$BENCHMARK_LATITUDE"
+    --dart-define=BENCHMARK_LONGITUDE="$BENCHMARK_LONGITUDE")
+elif [[ -n "${BENCHMARK_LATITUDE:-}" || -n "${BENCHMARK_LONGITUDE:-}" ]]; then
+  echo "BENCHMARK_LATITUDE and BENCHMARK_LONGITUDE must both be set" >&2
+  exit 2
+fi
 
 mkdir -p "$out"
 cd "$(dirname "$0")/.."
@@ -42,6 +71,7 @@ cd "$(dirname "$0")/.."
 echo "── payload server on ${lan_ip}:${port} (payload identity in server log)"
 dart run tool/vector_payload_server.dart --host 0.0.0.0 --port "$port" \
   --marker-log-dir "$out" \
+  "${fixture_args[@]}" \
   > "$out/payload-server.log" 2>&1 &
 server_pid=$!
 trap 'kill $server_pid 2>/dev/null || true' EXIT
@@ -58,11 +88,15 @@ run_benchmark() {
   local label="$1"; shift
   local log="/tmp/fosm-vector-$label.log"
   echo "── run: $label $*"
+  # Clear synchronously before starting flutter in the background. Otherwise
+  # the poll below can see a previous run's VM URL before the child opens
+  # and truncates its redirected log.
+  : > "$log"
   flutter run --profile --start-paused -d "$device" \
     -t lib/benchmark/map_vector_benchmark.dart \
     --dart-define=BENCHMARK_LABEL="$label" \
     --dart-define=BENCHMARK_VECTOR_BASE="$base" \
-    --dart-define=BENCHMARK_MARKER_URL="$base/log" "$@" > "$log" 2>&1 &
+    --dart-define=BENCHMARK_MARKER_URL="$base/log" "${dash_args[@]}" "$@" > "$log" 2>&1 &
   local flutter_pid=$!
   # Wait for the VM service URL, then subscribe and resume. The trace arm
   # also saves the VM timeline (all isolates — the MVT worker included)

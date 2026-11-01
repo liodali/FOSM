@@ -33,3 +33,5 @@ export 'src/common/tile_coverage.dart';
 export 'src/vector/style/style_loader.dart'
     show VectorMapStyle, openFreeMapLiberty;
 export 'src/vector/render/vector_trace.dart' show VectorSpanLog, VectorSpan;
+export 'src/vector/render/vector_dash_diagnostics.dart'
+    show VectorDashDiagnostics;

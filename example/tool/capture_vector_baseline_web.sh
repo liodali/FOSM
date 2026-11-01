@@ -20,6 +20,16 @@
 # The label passes per rep through `?label=web-clean-r1`; the marker sink
 # its server route passes through `?sink=`. Metadata identity of the
 # web build lands in the parsed report like any other run.
+#
+# The same env vars as tool/capture_vector_baseline.sh steer the build:
+#   BENCHMARK_DASH_CULL=1      add fosm.vectorDashCull to both arms
+#   BENCHMARK_SCENARIO=name    scenario filter define
+#   BENCHMARK_FIXTURE_DIR/ID   fixture payload defines (the *server* must
+#                              still be started with --fixture-dir itself)
+#   BENCHMARK_LATITUDE/LONGITUDE  benchmark center define
+#   BENCHMARK_SAMPLE_SECONDS   override the sampling window length
+# Arms that differ by defines get distinct build directories so baseline
+# and candidate builds can coexist.
 set -euo pipefail
 
 out="${1:?output dir}"
@@ -37,17 +47,52 @@ lan_ip="${lan_ip%%:*}"
 mkdir -p "$out"
 cd "$(dirname "$0")/.."
 
-# Build the two arms (the span arm needs the define at build time).
-if [[ ! -d build/web-clean ]]; then
-  echo "── building web-clean…"
-  flutter build web --profile -t lib/benchmark/map_vector_benchmark.dart \
-    -o build/web-clean > /tmp/fosm-bw-clean.log 2>&1
+# Build define list + a deterministic build-dir suffix from the env.
+target='lib/benchmark/map_vector_benchmark.dart'
+build_defines=()
+suffix_parts=()
+if [[ "${BENCHMARK_DASH_CULL:-0}" == 1 ]]; then
+  build_defines+=(--dart-define=fosm.vectorDashCull=true)
+  suffix_parts+=('cull')
 fi
-if [[ ! -d build/web-spans ]]; then
-  echo "── building web-spans…"
-  flutter build web --profile -t lib/benchmark/map_vector_benchmark.dart \
-    --dart-define=fosm.vectorSpans=true -o build/web-spans \
-    > /tmp/fosm-bw-spans.log 2>&1
+if [[ -n "${BENCHMARK_SCENARIO:-}" ]]; then
+  build_defines+=(--dart-define=BENCHMARK_SCENARIO="$BENCHMARK_SCENARIO")
+  suffix_parts+=("$BENCHMARK_SCENARIO")
+fi
+if [[ -n "${BENCHMARK_FIXTURE_DIR:-}" ]]; then
+  : "${BENCHMARK_FIXTURE_ID:?fixture runs require BENCHMARK_FIXTURE_ID}"
+  build_defines+=(--dart-define=BENCHMARK_PAYLOAD_IDENTITY="$BENCHMARK_FIXTURE_ID"
+    --dart-define=BENCHMARK_VECTOR_PROFILE=fixture)
+  suffix_parts+=("$BENCHMARK_FIXTURE_ID")
+fi
+if [[ -n "${BENCHMARK_LATITUDE:-}" && -n "${BENCHMARK_LONGITUDE:-}" ]]; then
+  build_defines+=(--dart-define=BENCHMARK_LATITUDE="$BENCHMARK_LATITUDE"
+    --dart-define=BENCHMARK_LONGITUDE="$BENCHMARK_LONGITUDE")
+elif [[ -n "${BENCHMARK_LATITUDE:-}" || -n "${BENCHMARK_LONGITUDE:-}" ]]; then
+  echo "BENCHMARK_LATITUDE and BENCHMARK_LONGITUDE must both be set" >&2
+  exit 2
+fi
+if [[ -n "${BENCHMARK_SAMPLE_SECONDS:-}" ]]; then
+  build_defines+=(--dart-define=BENCHMARK_SAMPLE_SECONDS="$BENCHMARK_SAMPLE_SECONDS")
+  suffix_parts+=("t${BENCHMARK_SAMPLE_SECONDS}s")
+fi
+suffix="${suffix_parts[*]:-default}"
+suffix="${suffix// /_}"
+
+# Build the two arms (the span arm needs the define at build time).
+arm_dir() {
+  printf 'build/web-%s-%s' "$1" "$suffix"
+}
+if [[ ! -d "$(arm_dir clean)" ]]; then
+  echo "── building web-clean ($suffix)…"
+  flutter build web --profile -t "$target" -o "$(arm_dir clean)" \
+    "${build_defines[@]}" > /tmp/fosm-bw-clean.log 2>&1
+fi
+if [[ ! -d "$(arm_dir spans)" ]]; then
+  echo "── building web-spans ($suffix)…"
+  flutter build web --profile -t "$target" \
+    --dart-define=fosm.vectorSpans=true -o "$(arm_dir spans)" \
+    "${build_defines[@]}" > /tmp/fosm-bw-spans.log 2>&1
 fi
 
 pids=()
@@ -73,8 +118,8 @@ serve_static() {
   done
   echo "static server on :$port failed to start"; exit 1
 }
-serve_static build/web-clean 6101
-serve_static build/web-spans 6102
+serve_static "$(arm_dir clean)" 6101
+serve_static "$(arm_dir spans)" 6102
 
 run_rep() {
   local dir_port="$1" label="$2"; shift 2

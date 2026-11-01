@@ -39,6 +39,7 @@ Future<void> main(List<String> arguments) async {
   var profile = BenchProfile.denseCity;
   var seed = BenchPayloads.defaultSeed;
   var markerLogDir = '';
+  var fixtureDir = '';
   for (var i = 0; i < arguments.length; i++) {
     switch (arguments[i]) {
       case '--host':
@@ -53,6 +54,8 @@ Future<void> main(List<String> arguments) async {
         seed = int.parse(arguments[++i]);
       case '--marker-log-dir':
         markerLogDir = arguments[++i];
+      case '--fixture-dir':
+        fixtureDir = arguments[++i];
     }
   }
 
@@ -70,8 +73,8 @@ Future<void> main(List<String> arguments) async {
   final server = await HttpServer.bind(host, port);
   stderr.writeln('vector payload server listening on '
       '${server.address.address}:${server.port} '
-      '(payload ${BenchPayloads.identity}, profile ${profile.name}, '
-      'seed $seed)');
+      '${fixtureDir.isEmpty ? '(payload ${BenchPayloads.identity}, '
+          'profile ${profile.name}, seed $seed)' : '(fixture $fixtureDir)'}');
 
   await for (final request in server) {
     try {
@@ -80,10 +83,8 @@ Future<void> main(List<String> arguments) async {
         request.response
           ..statusCode = 204
           ..headers.set('Access-Control-Allow-Origin', '*')
-          ..headers
-              .set('Access-Control-Allow-Headers', request.headers.value(
-                      'Access-Control-Request-Headers') ??
-                  '*');
+          ..headers.set('Access-Control-Allow-Headers',
+              request.headers.value('Access-Control-Request-Headers') ?? '*');
         await request.response.close();
         continue;
       }
@@ -113,8 +114,8 @@ Future<void> main(List<String> arguments) async {
         final dir = Directory(markerLogDir)..createSync(recursive: true);
         final sink = File('${dir.path}/markers-$label.log')
             .openWrite(mode: FileMode.append);
-        final body = await request.fold<List<int>>(
-            <int>[], (buffer, chunk) => buffer..addAll(chunk));
+        final body = await request
+            .fold<List<int>>(<int>[], (buffer, chunk) => buffer..addAll(chunk));
         sink.add(body);
         sink.add(const [10]); // separators per POST
         await sink.flush();
@@ -131,8 +132,8 @@ Future<void> main(List<String> arguments) async {
       if (path.length == 1 &&
           (path.single == 'style-a.json' || path.single == 'style-b.json')) {
         final variant = path.single == 'style-b.json' ? 'b' : 'a';
-        final hostHeader = request.headers.value(HttpHeaders.hostHeader) ??
-            '$host:$port';
+        final hostHeader =
+            request.headers.value(HttpHeaders.hostHeader) ?? '$host:$port';
         final body = cached(
           'style-$variant-$hostHeader',
           () => _bytes(benchStyleJson('http://$hostHeader', variant: variant)),
@@ -148,17 +149,33 @@ Future<void> main(List<String> arguments) async {
         final y = int.tryParse(path[3].split('.').first);
         if (z != null && x != null && y != null && z >= 0 && z <= 22) {
           final query = request.uri.queryParameters;
-          final tileSeed =
-              int.tryParse(query['seed'] ?? '') ?? seed;
+          final tileSeed = int.tryParse(query['seed'] ?? '') ?? seed;
           final tileProfile = query['profile'] == 'suburb'
               ? BenchProfile.suburb
               : (query['profile'] == 'denseCity'
                   ? BenchProfile.denseCity
                   : profile);
           if (family == 'tiles') {
+            if (fixtureDir.isNotEmpty) {
+              // Fail closed: missing recorded tiles must never be replaced
+              // silently with synthetic data in a production comparison.
+              final fixture = File('$fixtureDir/$z/$x/$y.pbf');
+              if (!await fixture.exists()) {
+                stderr.writeln('missing fixture: $z/$x/$y');
+                request.response
+                  ..statusCode = 404
+                  ..headers.set('Access-Control-Allow-Origin', '*');
+                await request.response.close();
+                continue;
+              }
+              await _respond(request, await fixture.readAsBytes(),
+                  'application/vnd.mapbox-vector-tile');
+              continue;
+            }
             await _respond(
                 request,
-                cached('mvt/$z/$x/$y/$tileProfile.name/$tileSeed',
+                cached(
+                    'mvt/$z/$x/$y/$tileProfile.name/$tileSeed',
                     () => BenchPayloads.tile(z, x, y,
                         profile: tileProfile, seed: tileSeed)),
                 'application/vnd.mapbox-vector-tile');
@@ -207,7 +224,10 @@ Uint8List _rasterTileBytes() {
   const size = 256;
   final rows = <int>[];
   void put(int r, int g, int b) {
-    rows..add(r)..add(g)..add(b);
+    rows
+      ..add(r)
+      ..add(g)
+      ..add(b);
   }
 
   for (var y = 0; y < size; y++) {

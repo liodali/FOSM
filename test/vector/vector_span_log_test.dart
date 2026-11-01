@@ -226,8 +226,8 @@ void main() {
         final joiner = runtime.decoder(buildTestTile(), 13, 7, 4);
         final first = await trigger.timeout(const Duration(seconds: 20));
         final second = await joiner.timeout(const Duration(seconds: 20));
-        first?.dispose();
-        second?.dispose();
+        first.dispose();
+        second.dispose();
       });
 
       final spans = VectorSpanLog.take();

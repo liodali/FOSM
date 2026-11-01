@@ -6,6 +6,7 @@ import '../style/css_color.dart';
 import '../style/expression.dart';
 import '../style/map_style.dart';
 import '../style/style_loader.dart';
+import 'vector_dash_diagnostics.dart';
 import 'vector_trace.dart';
 
 /// Maps source-layer coordinates (0..extent of the *source* tile) to pixel
@@ -598,8 +599,10 @@ class VectorTileRenderer {
         ..strokeCap = cap
         ..strokeJoin = join;
       if (hasDash && batch.width >= 0.5) {
-        yield* _traceChunks('dash',
-            _drawDashedChunks(canvas, batch.path, paint, dashRaw, batch.width));
+        yield* _traceChunks(
+            'dash',
+            _drawDashedChunks(
+                canvas, batch.path, paint, dashRaw, batch.width, layer.id));
       } else {
         canvas.drawPath(batch.path, paint);
       }
@@ -813,18 +816,32 @@ class VectorTileRenderer {
     ui.Paint paint,
     List<dynamic> dash,
     double width,
+    String layerId,
   ) sync* {
+    VectorDashStats? stats() =>
+        VectorDashDiagnostics.row(_traceTile, _traceAttempt, layerId);
+    final clock = VectorDashDiagnostics.enabled ? Stopwatch() : null;
     final pattern = <double>[
       for (final v in dash) (v is num ? v.toDouble() : 0.0) * width,
     ];
     final anyPositive = pattern.any((v) => v > 0);
     if (!anyPositive) {
+      final diagnostic = VectorDashDiagnostics.enabled ? stats() : null;
+      if (diagnostic != null) diagnostic.solidFallbacks++;
       canvas.drawPath(path, paint);
       return;
     }
 
     var segments = 0;
+    const cullOffscreen = bool.fromEnvironment('fosm.vectorDashCull');
+    // Stroke can reach miterLimit * half-width from its centerline. Two
+    // extra logical pixels cover antialiasing and numerical uncertainty.
+    final strokeMargin =
+        width * (paint.strokeMiterLimit > 2 ? paint.strokeMiterLimit : 2) / 2 +
+            2;
     for (final metric in path.computeMetrics()) {
+      final contourStats = VectorDashDiagnostics.enabled ? stats() : null;
+      if (contourStats != null) contourStats.contours++;
       // Advancing the native metric iterator is indivisible, but extraction
       // and draw dispatch must not monopolise the rest of a frame.
       yield null;
@@ -833,10 +850,77 @@ class VectorTileRenderer {
       var draw = true;
       final length = metric.length;
       while (distance < length) {
+        final diagnostic = VectorDashDiagnostics.enabled ? stats() : null;
+        if (diagnostic != null) diagnostic.patternSteps++;
         final segmentLength = pattern[segment % pattern.length];
         final next = (distance + segmentLength).clamp(0.0, length);
         if (draw && segmentLength > 0) {
-          canvas.drawPath(metric.extractPath(distance, next), paint);
+          var outside = false;
+          if (cullOffscreen && strokeMargin.isFinite && next.isFinite) {
+            // Every point on a dash is within its arc length of its start.
+            // This conservative square avoids extracting the path solely
+            // to discover its bounds. Fall back for unknown/huge values.
+            final radius = next - distance + strokeMargin;
+            final tangent = metric.getTangentForOffset(distance);
+            if (tangent != null &&
+                radius.isFinite &&
+                radius >= 0 &&
+                radius < 1e6) {
+              final p = tangent.position;
+              if (p.dx.isFinite &&
+                  p.dy.isFinite &&
+                  p.dx.abs() < 1e6 &&
+                  p.dy.abs() < 1e6) {
+                outside = p.dx + radius < 0 ||
+                    p.dy + radius < 0 ||
+                    p.dx - radius > tileSize ||
+                    p.dy - radius > tileSize;
+              }
+            }
+          }
+          if (outside) {
+            if (diagnostic != null) {
+              diagnostic.culledExtractions++;
+              // Diagnostic captures independently check the candidate's
+              // decision against the extracted path's expanded bounds.
+              // This extra extraction must never run in clean comparisons.
+              final rect = metric.extractPath(distance, next).getBounds();
+              if (!_dashBoundsOutside(rect, strokeMargin)) {
+                diagnostic.culledUnproven++;
+              }
+            }
+          } else if (diagnostic == null) {
+            canvas.drawPath(metric.extractPath(distance, next), paint);
+          } else {
+            clock!
+              ..reset()
+              ..start();
+            final segmentPath = metric.extractPath(distance, next);
+            clock.stop();
+            diagnostic.extractionTicks += clock.elapsedTicks;
+            diagnostic.extractions++;
+            // Diagnostic only: account for possible stroke joins/caps and
+            // antialiasing before declaring a dash outside the tile. Do not
+            // rely on Rect.overlaps: horizontal/vertical path bounds can
+            // have zero height/width while still contributing pixels.
+            final rect = segmentPath.getBounds();
+            final margin = strokeMargin;
+            if (!rect.left.isFinite ||
+                !rect.top.isFinite ||
+                !rect.right.isFinite ||
+                !rect.bottom.isFinite ||
+                !margin.isFinite) {
+              diagnostic.unknownBounds++;
+            } else if (_dashBoundsOutside(rect, margin)) {
+              diagnostic.offscreenExtractions++;
+            }
+            clock
+              ..reset()
+              ..start();
+            canvas.drawPath(segmentPath, paint);
+            clock.stop();
+            diagnostic.drawDispatchTicks += clock.elapsedTicks;
+          }
         }
         distance = next;
         segment++;
@@ -847,6 +931,17 @@ class VectorTileRenderer {
       }
     }
   }
+
+  static bool _dashBoundsOutside(ui.Rect rect, double margin) =>
+      rect.left.isFinite &&
+      rect.top.isFinite &&
+      rect.right.isFinite &&
+      rect.bottom.isFinite &&
+      margin.isFinite &&
+      (rect.right < -margin ||
+          rect.bottom < -margin ||
+          rect.left > tileSize + margin ||
+          rect.top > tileSize + margin);
 
   static ui.Color _alpha(ui.Color color, double opacity) =>
       color.withValues(alpha: color.a * opacity.clamp(0.0, 1.0));
@@ -933,18 +1028,19 @@ class _StaticPaintCache {
     if (expr == null) return null;
     if (dependsOnProperties(expr)) {
       return VectorTrace.syncSpans
-          ? VectorTrace.sync('style', () => evaluateExpression(expr, featureCtx),
+          ? VectorTrace.sync(
+              'style', () => evaluateExpression(expr, featureCtx),
               tile: traceTile, attempt: traceAttempt)
           : evaluateExpression(expr, featureCtx);
     }
     if (VectorTrace.syncSpans) {
       return _cache.putIfAbsent(
           key,
-          () => VectorTrace.sync('style', () => evaluateExpression(expr, baseCtx),
+          () => VectorTrace.sync(
+              'style', () => evaluateExpression(expr, baseCtx),
               tile: traceTile, attempt: traceAttempt));
     }
-    return _cache.putIfAbsent(
-        key, () => evaluateExpression(expr, baseCtx));
+    return _cache.putIfAbsent(key, () => evaluateExpression(expr, baseCtx));
   }
 
   double number(

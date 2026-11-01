@@ -75,14 +75,25 @@ const _profileName = String.fromEnvironment('BENCHMARK_VECTOR_PROFILE',
 const _seed = int.fromEnvironment('BENCHMARK_VECTOR_SEED',
     defaultValue: BenchPayloads.defaultSeed);
 
+const _payloadIdentity = String.fromEnvironment('BENCHMARK_PAYLOAD_IDENTITY',
+    defaultValue: BenchPayloads.identity);
+
 const _sampleSeconds =
     int.fromEnvironment('BENCHMARK_SAMPLE_SECONDS', defaultValue: 10);
+
+/// Optional exact scenario name for short, paired candidate captures.
+const _scenarioFilter = String.fromEnvironment('BENCHMARK_SCENARIO');
 
 /// Upper bound for the settle phase that establishes warm cache states.
 const _settleSeconds =
     int.fromEnvironment('BENCHMARK_SETTLE_SECONDS', defaultValue: 25);
 
-const _center = LatLng(latitude: 47, longitude: 8);
+final _center = LatLng(
+  latitude: double.parse(const String.fromEnvironment('BENCHMARK_LATITUDE',
+      defaultValue: '47')),
+  longitude: double.parse(const String.fromEnvironment('BENCHMARK_LONGITUDE',
+      defaultValue: '8')),
+);
 
 /// Camera-motion family used while sampling.
 enum _Motion { none, fling, pinch, returnPan, returnFrom }
@@ -488,7 +499,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     final view = View.of(context);
     final refresh = view.display.refreshRate;
     final styleUrlBase = '$_base/style-$_styleVariant.json';
-    await _emitPayload('FOSM_BENCHMARK_META', jsonEncode({
+    await _emitPayload(
+        'FOSM_BENCHMARK_META',
+        jsonEncode({
           'label': _runLabel,
           'harness': 'vector-baseline',
           'mode': 'profile',
@@ -498,21 +511,33 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           'physicalWidth': view.physicalSize.width,
           'physicalHeight': view.physicalSize.height,
           'devicePixelRatio': view.devicePixelRatio,
-          'payloadIdentity': BenchPayloads.identity,
+          'payloadIdentity': _payloadIdentity,
           'payloadProfile': _profileName,
-          'payloadSeed': _seed,
+          'payloadSeed':
+              _payloadIdentity == BenchPayloads.identity ? _seed : null,
           'payloadServer': Uri.parse(_base).authority,
           'styleUrlPath':
               '/style-<variant>.json ($styleUrlBase mounted at start)',
           'sourceMaxZoom': 14,
+          'centerLatitude': _center.latitude,
+          'centerLongitude': _center.longitude,
           'sampleSeconds': _sampleSeconds,
           'settleSeconds': _settleSeconds,
           'schedulerPaced': true,
           'spans': VectorSpanLog.enabled,
           'timeline': const bool.fromEnvironment('fosm.traceVector'),
+          'scenarioFilter': _scenarioFilter,
+          'dashCull': const bool.fromEnvironment('fosm.vectorDashCull'),
         }));
 
-    for (final scenario in _scenarios) {      _scenario = scenario;
+    final scenarios = _scenarioFilter.isEmpty
+        ? _scenarios
+        : _scenarios.where((s) => s.name == _scenarioFilter).toList();
+    if (scenarios.isEmpty) {
+      throw StateError('Unknown benchmark scenario: $_scenarioFilter');
+    }
+    for (final scenario in scenarios) {
+      _scenario = scenario;
       _styleVariant = 'a';
       _styleSwitchTimer?.cancel();
       _styleSwitchTimer = null;
@@ -542,12 +567,13 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         }
       }
 
-      await _emitPayload('FOSM_BENCHMARK_SCENARIO',
+      await _emitPayload(
+          'FOSM_BENCHMARK_SCENARIO',
           '${scenario.name} '
-          'motion=${scenario.motion.name} '
-          'cacheState=${scenario.cacheState.name} '
-          'source=${scenario.source.name} startZoom=${scenario.startZoom} '
-          'styleSwitch=${scenario.styleSwitch} settled=$settled');
+              'motion=${scenario.motion.name} '
+              'cacheState=${scenario.cacheState.name} '
+              'source=${scenario.source.name} startZoom=${scenario.startZoom} '
+              'styleSwitch=${scenario.styleSwitch} settled=$settled');
 
       final int rssBefore;
       void armRecording() {
@@ -562,6 +588,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _peakParsedTiles = 0;
         _peakPreparedLabels = 0;
         VectorSpanLog.clear();
+        VectorDashDiagnostics.clear();
         _coverageClock = Stopwatch()..start();
         _chainCoverageSample();
         _recording = true;
@@ -569,8 +596,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         // armRecording is synchronous (the sampling chain starts here);
         // the marker rides out without the arm's timing depending on a
         // sink POST.
-        unawaited(_emitPayload(
-            'FOSM_BENCHMARK_SAMPLE_START', scenario.name));
+        unawaited(_emitPayload('FOSM_BENCHMARK_SAMPLE_START', scenario.name));
       }
 
       final sample = Duration(seconds: _sampleSeconds);
@@ -623,6 +649,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       _coverageWindowMs = coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
       _coverageClock = null;
       _timelineMark('sampleEnd.${scenario.name}');
+      final dashDiagnostics = VectorDashDiagnostics.enabled
+          ? VectorDashDiagnostics.snapshot()
+          : null;
       await _emitPayload('FOSM_BENCHMARK_SAMPLE_END', scenario.name);
 
       final uiMs = _timings
@@ -636,7 +665,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       double percentile(List<double> values, double p) =>
           values.isEmpty ? 0 : values[((values.length - 1) * p).round()];
 
-      await _emitPayload('FOSM_BENCHMARK_RESULT', jsonEncode({
+      await _emitPayload(
+          'FOSM_BENCHMARK_RESULT',
+          jsonEncode({
             'label': _runLabel,
             'harness': 'vector-baseline',
             'scenario': scenario.name,
@@ -649,9 +680,10 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'styleSwitch': scenario.styleSwitch,
             'settled': settled,
             'sampleSeconds': _sampleSeconds,
-            'payloadIdentity': BenchPayloads.identity,
+            'payloadIdentity': _payloadIdentity,
             'payloadProfile': _profileName,
-            'payloadSeed': _seed,
+            'payloadSeed':
+                _payloadIdentity == BenchPayloads.identity ? _seed : null,
             'spans': VectorSpanLog.enabled,
             'uiP50Ms': percentile(uiMs, 0.5),
             'uiP95Ms': percentile(uiMs, 0.95),
@@ -692,6 +724,10 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                 dropped: VectorSpanLog.dropped,
               ),
             ));
+      }
+      if (dashDiagnostics != null) {
+        await _emitPayload('FOSM_BENCHMARK_DASH_DIAGNOSTICS',
+            jsonEncode({'scenario': scenario.name, ...dashDiagnostics}));
       }
     }
     await _emitPayload('FOSM_BENCHMARK_DONE', _runLabel);

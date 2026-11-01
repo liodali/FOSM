@@ -9,9 +9,8 @@ void main() {
   late Process server;
   late Uri base;
   final client = HttpClient();
-  final markerDir = Directory.systemTemp
-      .createTempSync('marker-sink-test')
-      .path;
+  final markerDir =
+      Directory.systemTemp.createTempSync('marker-sink-test').path;
 
   setUpAll(() async {
     // Reserve an ephemeral port, release it, and hand it to the server.
@@ -64,15 +63,13 @@ void main() {
       // lines: marker files must accumulate in posted order and reject
       // unsafe labels.
       Future<HttpClientResponse> postLog(String label, String body) async {
-        final request = await client
-            .postUrl(base.resolve('/log?label=$label'));
+        final request = await client.postUrl(base.resolve('/log?label=$label'));
         request.add(utf8.encode(body));
         await request.flush();
         return request.close();
       }
 
-      final first =
-          await postLog('r1', 'FOSM_BENCHMARK_META {"label":"r1"}');
+      final first = await postLog('r1', 'FOSM_BENCHMARK_META {"label":"r1"}');
       final second = await postLog(
           'r1', 'FOSM_BENCHMARK_RESULT {"label":"r1","valid":true}');
       expect(first.statusCode, 204);
@@ -82,20 +79,16 @@ void main() {
       final file = File('$markerDir/markers-r1.log');
       final text = file.readAsStringSync();
       expect(text.contains('FOSM_BENCHMARK_META {"label":"r1"}'), isTrue);
-      expect(
-          text.contains('FOSM_BENCHMARK_RESULT {"label":"r1","valid":true}'),
+      expect(text.contains('FOSM_BENCHMARK_RESULT {"label":"r1","valid":true}'),
           isTrue);
       expect(File('$markerDir/markers-escape.log').existsSync(), isFalse);
     });
 
-    test('styles advertise the tile template on the request host',
-        () async {
+    test('styles advertise the tile template on the request host', () async {
       final (response, bytes) = await get('/style-a.json');
       expect(response.statusCode, 200);
-      final style =
-          jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-      final tiles = (style['sources'] as Map)['bench']
-          as Map<String, dynamic>;
+      final style = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+      final tiles = (style['sources'] as Map)['bench'] as Map<String, dynamic>;
       expect((tiles['tiles'] as List).single,
           'http://127.0.0.1:${base.port}/tiles/{z}/{x}/{y}.mvt');
     });
@@ -109,12 +102,11 @@ void main() {
 
     test('seed and profile query parameters change the payload', () async {
       final (_, defaultBytes) = await get('/tiles/14/8600/5740.mvt');
-      final (_, seeded) =
-          await get('/tiles/14/8600/5740.mvt?seed=42');
-      final (_, suburb) =
-          await get('/tiles/14/8600/5740.mvt?profile=suburb');
+      final (_, seeded) = await get('/tiles/14/8600/5740.mvt?seed=42');
+      final (_, suburb) = await get('/tiles/14/8600/5740.mvt?profile=suburb');
       expect(seeded, isNot(equals(defaultBytes)));
-      expect(suburb,
+      expect(
+          suburb,
           equals(BenchPayloads.tile(14, 8600, 5740,
               profile: BenchProfile.suburb)));
     });
@@ -134,6 +126,56 @@ void main() {
     test('unknown paths are 404', () async {
       final (response, _) = await get('/nope.json');
       expect(response.statusCode, 404);
+    });
+
+    test('fixture mode serves frozen bytes and rejects missing tiles',
+        () async {
+      final root = Directory.systemTemp.createTempSync('vector-fixture-test');
+      final tileDir = Directory('${root.path}/14/123')
+        ..createSync(recursive: true);
+      File('${tileDir.path}/456.pbf').writeAsBytesSync([1, 2, 3, 4]);
+      final probe = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final port = probe.port;
+      await probe.close();
+      final fixtureServer = await Process.start('dart', [
+        'run',
+        'tool/vector_payload_server.dart',
+        '--host',
+        '127.0.0.1',
+        '--port',
+        '$port',
+        '--fixture-dir',
+        root.path,
+      ]);
+      final fixtureBase = Uri.parse('http://127.0.0.1:$port');
+      Future<(int, List<int>)> fetch(String path) async {
+        final request = await client.getUrl(fixtureBase.resolve(path));
+        final response = await request.close();
+        final bytes = await response
+            .fold<List<int>>([], (all, chunk) => all..addAll(chunk));
+        return (response.statusCode, bytes);
+      }
+
+      try {
+        final deadline = DateTime.now().add(const Duration(seconds: 60));
+        var ready = false;
+        while (DateTime.now().isBefore(deadline)) {
+          try {
+            ready = (await fetch('/healthz')).$1 == 200;
+            if (ready) break;
+          } catch (_) {}
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+        }
+        expect(ready, isTrue);
+        final (status, bytes) = await fetch('/tiles/14/123/456.mvt?seed=4');
+        expect(status, 200);
+        expect(bytes, [1, 2, 3, 4]);
+        expect((await fetch('/tiles/14/123/457.mvt')).$1, 404);
+      } finally {
+        fixtureServer.kill();
+        await fixtureServer.exitCode;
+        root.deleteSync(recursive: true);
+      }
     });
   });
 }
