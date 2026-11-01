@@ -128,13 +128,24 @@ per-tile lane waits average ~2 s.*
 
 ## Found issues (reported back from the harness)
 
-1. **Retention laziness after a cache flush**: `RenderedTileCache.
-   flushUnused` cancels the expiry timer; entries whose grid protection
-   lifts later (camera moves away) stay served until another `trim()`
-   runs. Harmless for correctness (imagery rebuildable) but holds RSS
-   for recently visited areas and made the *strict* warm-parsed/
-   cold-images measurement impossible without a pin-bypass hook — the
-   shipped hook (`includeVisibleImages`) now closes that measurement.
+1. **Retention laziness after a cache flush — RESOLVED, no change**: the
+   round-1 reading assumed entries whose protection lifts later stay
+   served indefinitely after `flushUnused` cancels the expiry timer.
+   That timer cancel is correct and harmless by design (added with the
+   pressure API in `3a7faf9`): at flush time nothing evictable remains,
+   and both protection-lift paths — `setActiveKeys` (every grid rebuild)
+   and pin release (every snapshot/fallback teardown) — re-run `trim()`,
+   which re-arms the timer for whatever becomes evictable. The invariant
+   is covered by `rendered_tile_cache_test.dart` ("flushUnused drops
+   only unprotected images regardless of policy"), which asserts expiry
+   actually fires at the retention clock after both lift paths. The
+   strict warm-parsed measurement roadblock was separately closed by
+   the workload-only pin-bypass hook (`includeVisibleImages`, `a8df8a7`),
+   deliberately preserving production pressure semantics where visible
+   tiles keep painting. Remaining policy work — retention duration and
+   budget sizing against measured hit rates — belongs to plan 06's
+   comparison task; the widget knobs (`renderedCacheRetention`,
+   `maxBytes`) make it measurable without new plumbing.
 2. **Overzoom parseWait variance — RESOLVED by round-3 instrumentation**:
    one round-2 rep recorded 13.6 s of `parseWait` totals against 59 ms
    in the other. The queue/publication spans (`parseQueueWait`,
