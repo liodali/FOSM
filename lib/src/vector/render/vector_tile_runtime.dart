@@ -623,14 +623,24 @@ class VectorTileRuntime {
       try {
         // Skip the `toImage` snapshot too if the tile went stale while
         // rendering — it is the single most expensive stage.
-        _checkRelevant(z, x, y);
+        if (!_isRelevant(z, x, y)) {
+          // Counted as `snapshotDiscard`, distinct from `staleAbort`: this
+          // attempt finished recording and reached the snapshot stage, so
+          // the discard measures obsolete work the image lane would have
+          // spent on a tile the camera no longer wants.
+          VectorSpanLog.mark('snapshotDiscard', tile: tile, attempt: attempt);
+          throw const TileDecodeAborted();
+        }
         // Enter a new event-loop turn before toImage. On CanvasKit/SkWasm
         // this snapshot can take 5-15ms; a real timer gives an already
         // scheduled browser/desktop frame a chance to run first.
         await Future<void>.delayed(const Duration(milliseconds: 1));
         // The tile may have gone stale during the delay; never enter
         // `toImage` (the single most expensive stage) for a stale tile.
-        _checkRelevant(z, x, y);
+        if (!_isRelevant(z, x, y)) {
+          VectorSpanLog.mark('snapshotDiscard', tile: tile, attempt: attempt);
+          throw const TileDecodeAborted();
+        }
         final scheduler = workScheduler;
         Future<ui.Image> snapshot() => VectorTrace.async(
             'toImage', () => picture.toImage(256, 256),
@@ -643,6 +653,10 @@ class VectorTileRuntime {
                     snapshot,
                     priority: () => tilePriority?.call(z, x, y) ?? 0,
                     isRelevant: () => _isRelevant(z, x, y),
+                    // The lane drops irrelevant work before its slot;
+                    // count those drops per tile/attempt in spans.
+                    onRelevanceDrop: () => VectorSpanLog.mark(
+                        'laneDiscard', tile: tile, attempt: attempt),
                   ),
             tile: tile,
             attempt: attempt);

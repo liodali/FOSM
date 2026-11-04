@@ -122,8 +122,13 @@ class TileWorkScheduler {
   /// Bounds both image concurrency and submissions within a frame. Priority
   /// and relevance are evaluated when a slot opens, so a camera change can
   /// promote the new centre and drop obsolete work without entering a codec.
+  /// Work dropped as irrelevant before its slot never runs [create];
+  /// [onRelevanceDrop] fires at those drops so callers can count them.
+  /// Disposal aborts are not relevance drops and do not fire it.
   Future<T> image<T>(Future<T> Function() create,
-      {int Function()? priority, bool Function()? isRelevant}) {
+      {int Function()? priority,
+      bool Function()? isRelevant,
+      void Function()? onRelevanceDrop}) {
     if (_disposed) return Future<T>.error(const TileDecodeAborted());
     final now = _now();
     if (_images.isEmpty && _activeImages == 0 && _resumesAfterIdle(now)) {
@@ -133,7 +138,8 @@ class TileWorkScheduler {
       _imageStarts = 0;
       _sliceStart = now;
     }
-    final work = _TypedImageWork<T>(create, priority, isRelevant);
+    final work =
+        _TypedImageWork<T>(create, priority, isRelevant, onRelevanceDrop);
     _images.add(work);
     scheduleMicrotask(_pumpImages);
     return work.result.future;
@@ -146,6 +152,7 @@ class TileWorkScheduler {
       while (!_disposed && _activeImages < maxActiveImages) {
         _images.removeWhere((work) {
           if (work.isRelevant?.call() ?? true) return false;
+          work.onRelevanceDrop?.call();
           work.abort();
           return true;
         });
@@ -162,6 +169,7 @@ class TileWorkScheduler {
         }
         final work = _images.removeAt(best);
         if (!(work.isRelevant?.call() ?? true)) {
+          work.onRelevanceDrop?.call();
           work.abort();
           continue;
         }
@@ -202,16 +210,21 @@ class TileWorkScheduler {
 }
 
 abstract class _ImageWork {
-  _ImageWork(this.priority, this.isRelevant);
+  _ImageWork(this.priority, this.isRelevant, this.onRelevanceDrop);
   final int Function()? priority;
   final bool Function()? isRelevant;
+
+  /// Fired when this work is dropped as irrelevant before its slot —
+  /// never on disposal or normal completion.
+  final void Function()? onRelevanceDrop;
   int get priorityValue => priority?.call() ?? 0;
   Future<void> run({void Function()? onFinish});
   void abort();
 }
 
 class _TypedImageWork<T> extends _ImageWork {
-  _TypedImageWork(this.create, super.priority, super.isRelevant);
+  _TypedImageWork(this.create, super.priority, super.isRelevant,
+      super.onRelevanceDrop);
   final Future<T> Function() create;
   final result = Completer<T>();
 

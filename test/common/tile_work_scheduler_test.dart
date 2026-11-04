@@ -159,6 +159,44 @@ void main() {
     expect(created, isFalse);
   });
 
+  test('relevance drops fire onRelevanceDrop exactly once and skip creation',
+      () async {
+    final frame = Completer<void>();
+    final scheduler = TileWorkScheduler(
+      now: () => Duration.zero,
+      maxImageStartsPerFrame: 1,
+      nextFrame: () => frame.future,
+    );
+    addTearDown(scheduler.dispose);
+    await scheduler.image(() async => 1);
+    var relevant = true;
+    var created = false;
+    var drops = 0;
+    final dropped = scheduler.image(() async {
+      created = true;
+      return 2;
+    },
+        isRelevant: () => relevant,
+        onRelevanceDrop: () => drops++);
+    final expectation = expectLater(dropped, throwsA(isA<TileDecodeAborted>()));
+    await _flush();
+    relevant = false;
+    frame.complete();
+    await expectation;
+    expect(created, isFalse);
+    expect(drops, 1);
+
+    // Disposal aborts are teardown, not relevance drops: a queued relevant
+    // image that never runs must not fire the callback.
+    var disposalDrops = 0;
+    scheduler.image(() async => 3,
+        onRelevanceDrop: () => disposalDrops++);
+    await _flush();
+    scheduler.dispose();
+    await _flush();
+    expect(disposalDrops, 0);
+  });
+
   test('image errors release the lane without cancelling other tiles',
       () async {
     final scheduler = TileWorkScheduler(now: () => Duration.zero);

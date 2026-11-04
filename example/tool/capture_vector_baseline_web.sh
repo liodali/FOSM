@@ -47,6 +47,11 @@ lan_ip="${lan_ip%%:*}"
 mkdir -p "$out"
 cd "$(dirname "$0")/.."
 
+# Record tool versions next to the captures so results stay interpretable
+# after the fact (Chrome patch versions change between sessions).
+"$chrome_app" --version > "$out/browser-version.txt" 2>/dev/null || true
+flutter --version > "$out/flutter-version.txt" 2>/dev/null || true
+
 # Build define list + a deterministic build-dir suffix from the env.
 target='lib/benchmark/map_vector_benchmark.dart'
 build_defines=()

@@ -656,9 +656,23 @@ class _MapViewState extends State<MapView>
 
   /// Shared cooperative pacing for this map's tile work, or `null` under
   /// the measurement-only `fosm.unpaced` define (unpaced pre-scheduler
-  /// behaviour). See [TileWorkScheduler.disabledByDefine].
+  /// behaviour). See [TileWorkScheduler.disabledByDefine]. The
+  /// `fosm.workBudgetMs` / `fosm.imageStartsPerFrame` / `fosm.activeImages`
+  /// defines override the pacing for measurement A/B captures; their
+  /// defaults reproduce the shipped pacing exactly.
   final TileWorkScheduler? _tileWorkScheduler =
-      TileWorkScheduler.disabledByDefine ? null : TileWorkScheduler();
+      TileWorkScheduler.disabledByDefine
+          ? null
+          : TileWorkScheduler(
+              budget: Duration(
+                  milliseconds: const int.fromEnvironment('fosm.workBudgetMs',
+                      defaultValue: 2)),
+              maxImageStartsPerFrame: const int.fromEnvironment(
+                  'fosm.imageStartsPerFrame',
+                  defaultValue: 2),
+              maxActiveImages: const int.fromEnvironment('fosm.activeImages',
+                  defaultValue: 2),
+            );
 
   /// Cancels the opt-in periodic memory-attribution logger
   /// (`--dart-define=fosm.traceMemory=true`), null when disabled.

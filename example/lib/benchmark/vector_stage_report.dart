@@ -140,7 +140,11 @@ Map<String, Object?> _finishEventStats(Map<String, Object?> stats) {
 }
 
 bool durationIsMarker(String name) =>
-    name == 'staleAbort' || name == 'payloadInvalid' || name == 'publish';
+    name == 'staleAbort' ||
+    name == 'snapshotDiscard' ||
+    name == 'laneDiscard' ||
+    name == 'payloadInvalid' ||
+    name == 'publish';
 
 Map<String, Object?> _attemptRow(
     Map<String, Object?> tileRow, String attempt) {
@@ -290,6 +294,10 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
       row['dashUs'] = ((row['dashUs'] as int?) ?? 0) + span.durationUs;
     case 'staleAbort':
       row['staleAborts'] = ((row['staleAborts'] as int?) ?? 0) + 1;
+    case 'snapshotDiscard':
+      row['snapshotDiscards'] = ((row['snapshotDiscards'] as int?) ?? 0) + 1;
+    case 'laneDiscard':
+      row['laneDiscards'] = ((row['laneDiscards'] as int?) ?? 0) + 1;
     case 'payloadInvalid':
       row['payloadInvalid'] = ((row['payloadInvalid'] as int?) ?? 0) + 1;
     case 'publish':

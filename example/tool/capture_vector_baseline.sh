@@ -54,6 +54,16 @@ fi
 if [[ "${BENCHMARK_DASH_CULL:-0}" == 1 ]]; then
   dash_args+=(--dart-define=fosm.vectorDashCull=true)
 fi
+# Plan-05 scheduler A/B overrides (defaults reproduce shipped pacing).
+if [[ -n "${BENCHMARK_WORK_BUDGET_MS:-}" ]]; then
+  dash_args+=(--dart-define=fosm.workBudgetMs="$BENCHMARK_WORK_BUDGET_MS")
+fi
+if [[ -n "${BENCHMARK_IMAGE_STARTS:-}" ]]; then
+  dash_args+=(--dart-define=fosm.imageStartsPerFrame="$BENCHMARK_IMAGE_STARTS")
+fi
+if [[ -n "${BENCHMARK_ACTIVE_IMAGES:-}" ]]; then
+  dash_args+=(--dart-define=fosm.activeImages="$BENCHMARK_ACTIVE_IMAGES")
+fi
 if [[ -n "${BENCHMARK_SCENARIO:-}" ]]; then
   dash_args+=(--dart-define=BENCHMARK_SCENARIO="$BENCHMARK_SCENARIO")
 fi

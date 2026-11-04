@@ -37,6 +37,28 @@ void main() {
       expect(events['recordChunk.water']!['totalUs'], 50);
     });
 
+    test('counts snapshot and lane discards as markers and per tile', () {
+      final report = buildVectorStageReport(const [
+        VectorSpan('staleAbort', '10/1/1', 0, 0, attempt: 'r1.0'),
+        VectorSpan('snapshotDiscard', '10/1/1', 10, 0, attempt: 'r1.0'),
+        VectorSpan('snapshotDiscard', '10/1/2', 20, 0, attempt: 'r2.0'),
+        VectorSpan('laneDiscard', '10/1/3', 30, 0, attempt: 'r2.0'),
+      ]);
+      final markers = report['markers'] as Map<String, dynamic>;
+      expect(markers['staleAbort'], 1);
+      expect(markers['snapshotDiscard'], 2);
+      expect(markers['laneDiscard'], 1);
+      final tiles = report['tiles'] as Map<String, dynamic>;
+      // Attempt-carrying spans accumulate on their attempt row.
+      Map<String, dynamic> attemptOf(String tile, String attempt) =>
+          ((tiles[tile] as Map<String, dynamic>)['attempts']
+              as Map<String, dynamic>)[attempt] as Map<String, dynamic>;
+      expect(attemptOf('10/1/1', 'r1.0')['staleAborts'], 1);
+      expect(attemptOf('10/1/1', 'r1.0')['snapshotDiscards'], 1);
+      expect(attemptOf('10/1/2', 'r2.0')['snapshotDiscards'], 1);
+      expect(attemptOf('10/1/3', 'r2.0')['laneDiscards'], 1);
+    });
+
     test('keeps stage sums and timestamps per rendering attempt', () {
       final report = buildVectorStageReport(const [
         // First attempt of 10/5/5.
