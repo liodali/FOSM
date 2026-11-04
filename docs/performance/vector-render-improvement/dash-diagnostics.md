@@ -289,3 +289,28 @@ extractions were offscreen, which dense central Zurich at z16 overzoom is
 not. The prototype stays opt-in (`fosm.vectorDashCull`); enabling it is
 only defensible for dash-dense synthetic-like payloads. Raw local logs:
 `raw/dash-production-zurich/ios-{baseline,candidate}/`.
+
+## Versions and provenance
+
+Capture provenance lives in each run's `FOSM_BENCHMARK_META` payload: the
+device runs report iOS 27.2 (Build 24B119), 60 Hz, DPR 3 (iPhone) or DPR 2
+(macOS), the fixture identity, replay center, scenario filter, window
+length and the `dashCull` arm flag. The browser runs report
+`osVersion = browser` only — the Chrome binary version was not captured at
+run time. The best available reference is Chrome 156.0.8078.80 checked on
+2026-11-03, two to three days after the captures; patch updates in between
+cannot be ruled out. `capture_vector_baseline_web.sh` now writes
+`browser-version.txt` and `flutter-version.txt` into the output directory
+at capture time so future rounds record this automatically.
+
+Toolchain at verification (2026-11-03): Flutter 3.47.8 stable, engine
+`dfd2e6cb7d319db05e3bf1503f3e2ac60f6288a2`, Dart 3.13.7. The framework and
+engine revisions date from 2026-10-22/23, before all captures above, so
+the captures ran on this SDK.
+
+Verification re-run (2026-11-03): all nine Zurich SHA-256 table entries
+re-hashed from the stored tiles and matched; the dash pixel/cancellation
+suite passes with the cull define off, on, and on together with the
+diagnostics define (14/2, 14/2, 16/0); `flutter analyze` and the full test
+suite were re-run clean. No evidence in this report changed; the decision
+below stands.
