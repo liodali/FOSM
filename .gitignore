@@ -81,3 +81,6 @@ build/
 .commandcode
 .zcode
 .plan
+# Performance reports and raw captures are local-only; commits carry code
+# and tooling only (dart/sh). See docs/performance/README.md on disk.
+/docs/performance/
