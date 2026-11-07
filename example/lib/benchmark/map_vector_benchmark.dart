@@ -379,7 +379,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _moveToFling(t);
       case _Motion.pinch:
         _controller.setFractionalZoom(
-            10 +
+            _startZoom +
                 _pinchAmplitudeLevels *
                     math.sin(t * 2 * math.pi / _pinchPeriodSeconds),
             animate: false);
@@ -387,15 +387,19 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         final phase = 2 * math.pi * t / _returnPanPeriodSeconds;
         _controller.moveTo(
             LatLng(
-                latitude: 47 + 0.01 * math.sin(phase),
-                longitude: 8 + _returnPanAmplitudeDeg * math.sin(phase)),
+                latitude: _center.latitude + 0.01 * math.sin(phase),
+                longitude:
+                    _center.longitude + _returnPanAmplitudeDeg * math.sin(phase)),
             animate: false);
       case _Motion.returnFrom:
         // Smoothstep from +offset back to the origin, then hold.
         final p = (t / _returnFromSeconds).clamp(0.0, 1.0);
         final eased = 1 - (p * p * (3 - 2 * p));
         _controller.moveTo(
-            LatLng(latitude: 47, longitude: 8 + _returnFromOffsetDeg * eased),
+            LatLng(
+                latitude: _center.latitude,
+                longitude:
+                    _center.longitude + _returnFromOffsetDeg * eased),
             animate: false);
       case _Motion.none:
         break;
@@ -406,7 +410,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   void _moveToFling(double t) {
     final segment = (t / _flingSegmentSeconds).floor();
     final tSeg = t - segment * _flingSegmentSeconds;
-    var longitude = 8.0;
+    var longitude = _center.longitude;
     for (var i = 0; i < segment; i++) {
       longitude += (i.isEven ? 1.0 : -1.0) * _flingMaxTravelDeg;
     }
@@ -414,7 +418,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _flingV0DegPerSec *
         _flingTauSeconds *
         (1 - math.exp(-tSeg / _flingTauSeconds));
-    final latitude = 47 + 0.015 * math.sin(t * 1.1);
+    final latitude = _center.latitude + 0.015 * math.sin(t * 1.1);
     _controller.moveTo(LatLng(latitude: latitude, longitude: longitude),
         animate: false);
   }
