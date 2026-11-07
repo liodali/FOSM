@@ -315,14 +315,39 @@ class VectorTileRuntime {
   /// Arranges label preparation for a tile whose image was served from
   /// the rendered cache (the promotion path for pre-rendered speculative
   /// images, whose decode skipped labels). No-op when preparation is
-  /// already queued or done, or when no parsed tile survives in the LRU
-  /// (labels then return on the tile's next full decode).
-  void ensureLabelsPrepared(int z, int x, int y) {
+  /// already queued or done. When no parsed tile survives the runtime
+  /// LRU but [bytes] carries the tile payload, it is parsed for label
+  /// preparation alone — the rendered image keeps painting; waiting for
+  /// a full decode would leave cached tiles labelless.
+  void ensureLabelsPrepared(int z, int x, int y, {Uint8List? bytes}) {
     if (_disposed) return;
     final key = '$z/$x/$y';
     if (_labelQueued.contains(key)) return;
     if (labelOverlayPreparedTileKeys.contains(key)) return;
-    if (parsedTileFor(z, x, y) == null) return;
+    if (parsedTileFor(z, x, y) != null || bytes != null) {
+      unawaited(_ensureLabelsParsed(z, x, y, bytes));
+    }
+  }
+
+  Future<void> _ensureLabelsParsed(int z, int x, int y, Uint8List? bytes) async {
+    if (_disposed) return;
+    final key = '$z/$x/$y';
+    if (labelOverlayPreparedTileKeys.contains(key)) return;
+    if (parsedTileFor(z, x, y) == null) {
+      if (bytes == null) return;
+      try {
+        final coord = vectorSource.resolve(z, x, y);
+        await _parseAndStore(bytes, coord,
+            isRelevant: () => _isRelevant(z, x, y),
+            traceTile: key,
+            traceAttempt: '$traceId.promote.${_attemptSequence++}');
+      } catch (_) {
+        // Payload unreadable or stale: labels return on the tile's next
+        // full decode; the cached image keeps painting.
+        return;
+      }
+      if (_disposed) return;
+    }
     _scheduleLabels(z, x, y, '$traceId.promote.${_attemptSequence++}');
   }
 
@@ -689,10 +714,14 @@ class VectorTileRuntime {
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness
         // never wait for feature scanning and text layout. Speculative
-        // decodes skip it: an offscreen tile's label job would be dropped
-        // by the relevance-gated pump, and promotion arranges preparation
-        // through [ensureLabelsPrepared] instead.
-        if (!speculative) _scheduleLabels(z, x, y, attempt);
+        // decodes skip it only while their tile is still offscreen — the
+        // relevance-gated label pump would discard those labels anyway —
+        // because a speculative tile that turned visible before the decode
+        // resolved publishes straight into the grid with no cache-hit
+        // promotion callback; its labels must be arranged here.
+        if (!speculative || _isRelevant(z, x, y)) {
+          _scheduleLabels(z, x, y, attempt);
+        }
         return image;
       } finally {
         picture.dispose();

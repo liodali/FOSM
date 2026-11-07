@@ -2946,7 +2946,8 @@ void main() {
         byteOnlyPadding: true,
         speculativePrepare: true,
       );
-      manager.onTileServedFromCache = (z, x, y) => promoted.add('$z/$x/$y');
+      manager.onTileServedFromCache =
+          (z, x, y, bytes) => promoted.add('$z/$x/$y');
       addTearDown(manager.dispose);
 
       manager.calculate();
@@ -3111,26 +3112,199 @@ void main() {
       expect(manager.isTileRelevant(3, ringLng, ringLat), isFalse);
       manager.dispose();
     });
+
+    testWidgets('camera change revokes speculative relevance immediately: '
+        'stale relevance dies and revoked results neither publish nor '
+        'promote', (tester) async {
+      final counts = _SpecCounts();
+      final gate = Completer<void>();
+      counts.specGate = gate;
+      final trace = <String>[];
+      TileManager.debugSpeculativeTrace = trace.add;
+      addTearDown(() => TileManager.debugSpeculativeTrace = null);
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Park the background-lane speculative decodes on the gate; two run
+      // concurrently (the lane limit), any further admission stays queued.
+      await _settleUntil(
+          tester, () => counts.calls.where((c) => c.startsWith('spec:')).length >= 2);
+      final observed = counts.calls
+          .where((c) => c.startsWith('spec:'))
+          .map((c) => c.substring('spec:'.length))
+          .take(2)
+          .toList();
+      expect(observed.length, 2);
+      int zOf(String tile) => int.parse(tile.split('/')[0]);
+      int xOf(String tile) => int.parse(tile.split('/')[1]);
+      int yOf(String tile) => int.parse(tile.split('/')[2]);
+
+      // Camera change while speculative decodes are in flight and queued.
+      manager.setCenterTile(
+          latLng: const LatLng(latitude: 60, longitude: 120));
+      manager.calculate();
+      // The core P1 invariant: revocation is synchronous. In-flight
+      // speculative decodes lose their relevance extension right here,
+      // before they can keep holding decode slots after foreground demand
+      // returned, and the trace records the queued-work drop.
+      expect(
+          manager.isTileRelevant(zOf(observed[0]), xOf(observed[0]),
+              yOf(observed[0])),
+          isFalse,
+          reason: '$observed was decoded speculatively');
+      expect(
+          manager.isTileRelevant(zOf(observed[1]), xOf(observed[1]),
+              yOf(observed[1])),
+          isFalse);
+      expect(
+          trace.any((line) => line.startsWith('revoke:') &&
+              !line.contains('nothing admitted')),
+          isTrue,
+          reason: 'the camera revocation must record the dropped work, '
+              'not a no-op');
+
+      // Release the parked decodes: they finish, but the post-decode
+      // relevance gate throws their results away (never cached, never
+      // presented) and no stale image promotes on any later camera.
+      await tester.runAsync(() async => gate.complete());
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pump();
+      for (final tile in observed) {
+        expect(
+            manager.isTileRelevant(
+                zOf(tile), xOf(tile), yOf(tile)),
+            isFalse,
+            reason: '$tile stays irrelevant for the far ring');
+      }
+      manager.dispose();
+    });
+
+    testWidgets('corrupt speculative bytes recover once the tile becomes '
+        'visible', (tester) async {
+      final counts = _SpecCounts();
+      final gate = Completer<void>();
+      counts.specGate = gate;
+      counts.failNextSpecPayload = true;
+      final promoted = <String>[];
+      final trace = <String>[];
+      TileManager.debugSpeculativeTrace = trace.add;
+      addTearDown(() => TileManager.debugSpeculativeTrace = null);
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        maxSpeculativePrepares: 1,
+      );
+      manager.onTileServedFromCache =
+          (z, x, y, bytes) => promoted.add('$z/$x/$y');
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Park the single budgeted speculative decode on the gate; wait
+      // until its decoder entry is recorded (calls record spec entries
+      // even while parked on the gate).
+      await _settleUntil(
+          tester, () => counts.calls.any((c) => c.startsWith('spec:')));
+      final specTile = counts.calls
+          .where((c) => c.startsWith('spec:'))
+          .map((c) => c.substring('spec:'.length))
+          .toList();
+      expect(specTile, isNotEmpty,
+          reason: 'one speculative decode must have been admitted');
+      final parts = specTile[0].split('/');
+
+      // The tile becomes visible while its decode is parked: the manager
+      // deduplicates the foreground demand against the running job.
+      final panLat = tileY2Lat(int.parse(parts[2]) + 0.5, 3);
+      final panLng = tileX2Lng(int.parse(parts[1]) + 0.5, 3);
+      // ignore: avoid_print
+      print('PANDBG target x=${parts[1]} y=${parts[2]} '
+          'lat=$panLat lng=$panLng before=(${manager.centerTileLng}, ${manager.centerTileLat})');
+      manager.setCenterTile(latLng: LatLng(latitude: panLat, longitude: panLng));
+      // ignore: avoid_print
+      print('PANDBG after=(${manager.centerTileLng}, ${manager.centerTileLat})');
+      manager.calculate();
+      expect(
+          manager.isTileRelevant(3, int.parse(parts[1]), int.parse(parts[2])),
+          isTrue);
+
+      // Release: the decode resolves to a payload exception with the tile
+      // visible - recovery must run under foreground rules, not the
+      // speculative suppression.
+      await tester.runAsync(() async => gate.complete());
+      await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
+
+      final renderKey = '${parts[0]}/${parts[1]}/${parts[2]}';
+      final slot = manager.renderTiles
+          .where((t) => t.index == renderKey)
+          .toList();
+      expect(slot, hasLength(1));
+      expect(slot.first.sourceTile, isNotNull,
+          reason: 'the refetched presentation must publish into the now-'
+              'visible slot instead of stranding it on the fallback');
+      expect(promoted, isNot(contains(renderKey)),
+          reason: 'a freshly decoded visible tile publishes directly, not '
+              'through the cache-promotion callback');
+      manager.dispose();
+    });
   });
 }
 
-/// Decoder bookkeeping for the speculative-preparation group: counts and
-/// optional gates for each decoder variant.
+/// Decoder bookkeeping for the speculative-preparation group: counts,
+/// per-tile call identities, a park gate for in-flight decodes, and a
+/// one-shot payload failure for corrupt-byte recovery tests.
 class _SpecCounts {
   int regularCount = 0;
   int spec = 0;
   int specInside = 0;
   Completer<void>? specGate;
 
+  /// Every decode call identified by class and logical tile
+  /// (`spec:z/x/y`, `reg:z/x/y`), in issue order.
+  final List<String> calls = <String>[];
+
+  /// The next speculative decode throws a payload exception instead of
+  /// decoding; cleared by the test when the recovery should succeed.
+  bool failNextSpecPayload = false;
+
   Future<ui.Image> regular(Uint8List bytes, int z, int x, int y) async {
     regularCount++;
+    calls.add('reg:$z/$x/$y');
     return Tile.decodeImage(bytes);
   }
 
   Future<ui.Image> speculative(Uint8List bytes, int z, int x, int y) async {
     spec++;
+    calls.add('spec:$z/$x/$y');
     final gate = specGate;
     if (gate != null) await gate.future;
+    if (failNextSpecPayload) {
+      failNextSpecPayload = false;
+      throw const TilePayloadException('mvt payload corrupt (test)');
+    }
     specInside++;
     return Tile.decodeImage(bytes);
   }

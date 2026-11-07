@@ -1198,7 +1198,7 @@ class _MapViewState extends State<MapView>
     // speculative decode skipped (no-op when labels already exist).
     manager.onTileServedFromCache = runtime == null
         ? null
-        : (z, x, y) => runtime.ensureLabelsPrepared(z, x, y);
+        : (z, x, y, bytes) => runtime.ensureLabelsPrepared(z, x, y, bytes: bytes);
     // Let the vector runtime abort decodes for tiles that leave the
     // render set before they reach render/`toImage`, and dispatch the
     // newest centre tile first from its presentation lane.
