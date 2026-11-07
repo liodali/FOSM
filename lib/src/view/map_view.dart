@@ -1178,6 +1178,14 @@ class _MapViewState extends State<MapView>
       // in another image-lane reservation. This is scheduling ownership,
       // independent of the padding policy above.
       decoderOwnsImageScheduling: runtime != null,
+      // Plan-06 idle-time preparation of nearest-ring vector padding
+      // tiles. Measurement-only define until plan-06 acceptance is met;
+      // the runtime provides the label-skipping decode variant and the
+      // promotion callback below arranges labels when the pre-rendered
+      // image enters the viewport.
+      speculativePrepare:
+          runtime != null && TileManager.speculativeEnabledByDefine,
+      speculativeDecoder: runtime?.speculativeDecoder,
       cameraBounds: widget.cameraBounds,
       maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
       renderedCacheRetention: widget.renderedCacheRetention,
@@ -1185,6 +1193,12 @@ class _MapViewState extends State<MapView>
     );
     manager.onTilesChanged = _notify;
     manager.onTileError = (error) => widget.onTileError?.call(error);
+    // Promotion path for pre-rendered speculative images: a visible tile
+    // served from the rendered cache arranges the label preparation its
+    // speculative decode skipped (no-op when labels already exist).
+    manager.onTileServedFromCache = runtime == null
+        ? null
+        : (z, x, y) => runtime.ensureLabelsPrepared(z, x, y);
     // Let the vector runtime abort decodes for tiles that leave the
     // render set before they reach render/`toImage`, and dispatch the
     // newest centre tile first from its presentation lane.

@@ -59,6 +59,30 @@ Future<void> _runUntil(
       reason: 'condition not met within ${timeout.inSeconds}s');
 }
 
+/// Like [_runUntil], but alternates real-event-loop yields with frame
+/// pumps. Manager work started outside `runAsync` parks parts of its
+/// completion chain on the fake test clock; a plain real-time sleep never
+/// releases those links, so long pipelines (speculative admission waits
+/// for byte preloads, which wait for presentations) only progress one
+/// link per pump. Alternating both drives the whole chain.
+Future<void> _settleUntil(
+  WidgetTester tester,
+  bool Function() condition, {
+  Duration timeout = const Duration(seconds: 5),
+}) async {
+  final stopwatch = Stopwatch()..start();
+  while (!condition() && stopwatch.elapsed < timeout) {
+    await tester.runAsync(() async {
+      for (var i = 0; i < 5; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    });
+    await tester.pump();
+  }
+  expect(condition(), isTrue,
+      reason: 'condition not met within ${timeout.inSeconds}s');
+}
+
 /// Lets already-scheduled real async work run for a bounded number of turns.
 Future<void> _flushAsync(WidgetTester tester, {int turns = 20}) async {
   await tester.runAsync(() async {
@@ -2897,6 +2921,219 @@ void main() {
       manager.dispose();
     });
   });
+
+  group('speculative preparation (plan 06)', () {
+    // 256×256 viewport with 256px tiles: the strict viewport is a couple
+    // of cells; tilePadding 1 makes the nearest ring the padded outline.
+    final center = const LatLng(latitude: 0.01, longitude: 0.01);
+
+    testWidgets(
+        'idle admission decodes the nearest ring into the cache; '
+        'promotion serves it synchronously and arranges labels',
+        (tester) async {
+      final counts = _SpecCounts();
+      final promoted = <String>[];
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+      );
+      manager.onTileServedFromCache = (z, x, y) => promoted.add('$z/$x/$y');
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      final paddedH = manager.horizontalTileCount;
+      final paddedV = manager.verticalTileCount;
+      final visibleH = paddedH - 2;
+      final visibleV = paddedV - 2;
+      final ringCount = paddedH * paddedV - visibleH * visibleV;
+      await _settleUntil(tester, () => counts.spec >= ringCount);
+
+      // Only strict-viewport tiles ever reach the regular decoder.
+      expect(counts.regularCount, lessThanOrEqualTo(visibleH * visibleV));
+      // Speculative completions stay out of the render set: the grid only
+      // holds images for visible slots.
+      final withImage =
+          manager.renderTiles.where((t) => t.sourceTile != null).length;
+      expect(withImage, lessThanOrEqualTo(visibleH * visibleV),
+          reason: 'offscreen speculative images must wait in the cache');
+
+      // Admitted ring tiles are decode-relevant and rank below visible.
+      final ringLng = manager.leftColumnTilesLngIndex + 1;
+      final centreLng = manager.leftColumnTilesLngIndex + 1 + visibleH ~/ 2;
+      final centreLat = manager.topRowTilesLatIndex + 1 + visibleV ~/ 2;
+      expect(manager.isTileRelevant(3, ringLng, manager.topRowTilesLatIndex),
+          isTrue,
+          reason: 'admitted speculative tiles stay decode-relevant');
+      expect(
+          manager.tileDecodePriority(3, centreLng, centreLat),
+          greaterThan(manager.tileDecodePriority(
+              3, ringLng, manager.topRowTilesLatIndex)),
+          reason: 'visible tiles outrank speculative ones');
+
+      // Pan one tile east: the eastern ring is now the strict viewport and
+      // must promote from the rendered cache synchronously — no decode,
+      // no async wait.
+      final tileDeg = 360 / (1 << 3);
+      manager.setCenterTile(
+          latLng: LatLng(
+              latitude: center.latitude,
+              longitude: center.longitude + tileDeg));
+      manager.calculate();
+      final promotedImages = manager.renderTiles
+          .where((t) => t.sourceTile != null)
+          .length;
+      expect(promoted, isNotEmpty,
+          reason: 'cache-served visible tiles must fire the promotion hook');
+      expect(promotedImages, greaterThan(0),
+          reason: 'promoted speculative images render immediately');
+      final regularBefore = counts.regularCount;
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      expect(counts.regularCount, regularBefore,
+          reason: 'promotion must not re-decode cached speculative tiles');
+      manager.dispose();
+    });
+
+    testWidgets('admission respects the per-generation budget', (tester) async {
+      final counts = _SpecCounts();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        maxSpeculativePrepares: 2,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      await _settleUntil(tester, () => counts.spec >= 2);
+      // No further admissions beyond the budget.
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      });
+      expect(counts.spec, 2);
+      manager.dispose();
+    });
+
+    testWidgets('memory pressure suspends speculative admission', (tester) async {
+      final counts = _SpecCounts();
+      final gate = Completer<void>();
+      counts.specGate = gate;
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Wait until a speculative decode has entered the decoder and is
+      // parked on the gate (spec increments at entry, specInside only
+      // after the gate releases).
+      await _settleUntil(tester, () => counts.spec > 0);
+      final enteredBeforePressure = counts.spec;
+      manager.handleMemoryPressure();
+      await tester.runAsync(() async => gate.complete());
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pump();
+      // In-flight decodes already inside their decoder may finish (bounded
+      // by the presentation-lane limit); nothing queued may start, and no
+      // new admission may happen after the flush.
+      expect(counts.specInside, counts.spec,
+          reason: 'every parked decode released; none still waiting');
+      final settled = counts.spec;
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pump();
+      expect(counts.spec, settled,
+          reason: 'memory pressure must suspend speculative admission');
+      expect(settled, lessThanOrEqualTo(enteredBeforePressure + 6),
+          reason: 'only already-running presentations may finish');
+      manager.dispose();
+    });
+
+    testWidgets('a tile leaving the padded grid loses speculative relevance',
+        (tester) async {
+      final counts = _SpecCounts();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        maxSpeculativePrepares: 1,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      final ringLng = manager.leftColumnTilesLngIndex;
+      final ringLat = manager.topRowTilesLatIndex;
+      await _settleUntil(tester, () => counts.spec >= 1);
+
+      // Move far away: the old ring tile must lose relevance and any
+      // still-queued speculative work for it must be pruned.
+      manager.setCenterTile(latLng: const LatLng(latitude: 60, longitude: 120));
+      manager.calculate();
+      expect(manager.isTileRelevant(3, ringLng, ringLat), isFalse);
+      manager.dispose();
+    });
+  });
+}
+
+/// Decoder bookkeeping for the speculative-preparation group: counts and
+/// optional gates for each decoder variant.
+class _SpecCounts {
+  int regularCount = 0;
+  int spec = 0;
+  int specInside = 0;
+  Completer<void>? specGate;
+
+  Future<ui.Image> regular(Uint8List bytes, int z, int x, int y) async {
+    regularCount++;
+    return Tile.decodeImage(bytes);
+  }
+
+  Future<ui.Image> speculative(Uint8List bytes, int z, int x, int y) async {
+    spec++;
+    final gate = specGate;
+    if (gate != null) await gate.future;
+    specInside++;
+    return Tile.decodeImage(bytes);
+  }
 }
 
 bool _containsZoom(List<String> keys, int zoom) =>

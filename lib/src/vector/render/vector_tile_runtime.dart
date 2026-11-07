@@ -303,6 +303,29 @@ class VectorTileRuntime {
   TileDecoder get decoder => (bytes, z, x, y) =>
       _gated(z, x, y, (attempt) => _decodeAndRender(bytes, z, x, y, attempt));
 
+  /// Decoder variant for idle-time speculative preparation (plan 06):
+  /// the identical decode pipeline, minus label preparation — an
+  /// offscreen tile's labels would be discarded by the relevance-gated
+  /// label pump anyway, so preparing them is pure waste. Promotion of the
+  /// pre-rendered image arranges preparation via [ensureLabelsPrepared].
+  TileDecoder get speculativeDecoder => (bytes, z, x, y) => _gated(z, x, y,
+      (attempt) =>
+          _decodeAndRender(bytes, z, x, y, attempt, speculative: true));
+
+  /// Arranges label preparation for a tile whose image was served from
+  /// the rendered cache (the promotion path for pre-rendered speculative
+  /// images, whose decode skipped labels). No-op when preparation is
+  /// already queued or done, or when no parsed tile survives in the LRU
+  /// (labels then return on the tile's next full decode).
+  void ensureLabelsPrepared(int z, int x, int y) {
+    if (_disposed) return;
+    final key = '$z/$x/$y';
+    if (_labelQueued.contains(key)) return;
+    if (labelOverlayPreparedTileKeys.contains(key)) return;
+    if (parsedTileFor(z, x, y) == null) return;
+    _scheduleLabels(z, x, y, '$traceId.promote.${_attemptSequence++}');
+  }
+
   Future<T> _gated<T>(
       int z, int x, int y, Future<T> Function(String attempt) job) async {
     // The attempt id is assigned at gate entry — before queueing — so the
@@ -489,11 +512,12 @@ class VectorTileRuntime {
   /// [TileDecodeAborted], which [TileManager] treats as a stale (non-failing)
   /// outcome so bytes are retained for a later pan.
   Future<ui.Image> _decodeAndRender(
-      Uint8List bytes, int z, int x, int y, String attempt) async {
+      Uint8List bytes, int z, int x, int y, String attempt,
+      {bool speculative = false}) async {
     final tile = '$z/$x/$y';
     try {
-      final image =
-          await _decodeAndRenderInner(bytes, z, x, y, attempt, tile);
+      final image = await _decodeAndRenderInner(bytes, z, x, y, attempt, tile,
+          speculative: speculative);
       // Note the attempt so the tile manager's `publish` marker (which
       // runs after this future resolves, across the decoder API) can
       // carry the identity of the decode whose image is being placed.
@@ -513,8 +537,9 @@ class VectorTileRuntime {
     int x,
     int y,
     String attempt,
-    String tile,
-  ) async {
+    String tile, {
+    bool speculative = false,
+  }) async {
     if (_disposed) throw StateError('runtime disposed');
     _checkRelevant(z, x, y);
     final source = vectorSource;
@@ -663,8 +688,11 @@ class VectorTileRuntime {
         // Publish the base image immediately. Label preparation runs on a
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness
-        // never wait for feature scanning and text layout.
-        _scheduleLabels(z, x, y, attempt);
+        // never wait for feature scanning and text layout. Speculative
+        // decodes skip it: an offscreen tile's label job would be dropped
+        // by the relevance-gated pump, and promotion arranges preparation
+        // through [ensureLabelsPrepared] instead.
+        if (!speculative) _scheduleLabels(z, x, y, attempt);
         return image;
       } finally {
         picture.dispose();

@@ -143,6 +143,7 @@ bool durationIsMarker(String name) =>
     name == 'staleAbort' ||
     name == 'snapshotDiscard' ||
     name == 'laneDiscard' ||
+    name == 'specPublish' ||
     name == 'payloadInvalid' ||
     name == 'publish';
 
@@ -298,6 +299,8 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
       row['snapshotDiscards'] = ((row['snapshotDiscards'] as int?) ?? 0) + 1;
     case 'laneDiscard':
       row['laneDiscards'] = ((row['laneDiscards'] as int?) ?? 0) + 1;
+    case 'specPublish':
+      row['specPublishes'] = ((row['specPublishes'] as int?) ?? 0) + 1;
     case 'payloadInvalid':
       row['payloadInvalid'] = ((row['payloadInvalid'] as int?) ?? 0) + 1;
     case 'publish':

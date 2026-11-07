@@ -54,6 +54,10 @@ fi
 if [[ "${BENCHMARK_DASH_CULL:-0}" == 1 ]]; then
   dash_args+=(--dart-define=fosm.vectorDashCull=true)
 fi
+# Plan-06 speculative vector preparation (nearest-ring idle decodes).
+if [[ "${BENCHMARK_SPECULATION:-0}" == 1 ]]; then
+  dash_args+=(--dart-define=fosm.vectorSpeculation=true)
+fi
 # Plan-05 scheduler A/B overrides (defaults reproduce shipped pacing).
 if [[ -n "${BENCHMARK_WORK_BUDGET_MS:-}" ]]; then
   dash_args+=(--dart-define=fosm.workBudgetMs="$BENCHMARK_WORK_BUDGET_MS")

@@ -528,6 +528,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           'timeline': const bool.fromEnvironment('fosm.traceVector'),
           'scenarioFilter': _scenarioFilter,
           'dashCull': const bool.fromEnvironment('fosm.vectorDashCull'),
+          'speculation': const bool.fromEnvironment('fosm.vectorSpeculation'),
         }));
 
     final scenarios = _scenarioFilter.isEmpty
