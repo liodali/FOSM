@@ -202,6 +202,13 @@ class VectorTileRuntime {
   /// render slot on an off-screen tile.
   bool Function(int z, int x, int y)? isTileRelevant;
 
+  /// Strictly-visible predicate (strict viewport, not the padding ring
+  /// and not speculative relevance). The manager wires both callbacks;
+  /// label scheduling distinguishes the two — an admitted speculative
+  /// tile is deliberately relevant while offscreen, but only a visible
+  /// tile needs its labels at decode completion.
+  bool Function(int z, int x, int y)? isTileVisible;
+
   /// Optional decode priority supplied by [TileManager]. Higher values are
   /// dispatched first when the presentation lane frees up. Evaluated at
   /// selection time, so a camera change re-ranks already-queued work
@@ -228,6 +235,12 @@ class VectorTileRuntime {
   final Set<String> _labelQueued = {};
   bool _activeLabelPrep = false;
   Timer? _labelPumpTimer;
+
+  /// Logical tiles whose label-recovery parse is in flight; guards the
+  /// window between promotion and label-job scheduling, where repeated
+  /// cache-hit callbacks (grid rebuilds) would otherwise start duplicate
+  /// parses for the same tile.
+  final Set<String> _labelRecovery = {};
 
   // ── Decode/render gating ────────────────────────────────────────────
   // Switching to vector mode schedules every visible tile at once; on web
@@ -323,31 +336,42 @@ class VectorTileRuntime {
     if (_disposed) return;
     final key = '$z/$x/$y';
     if (_labelQueued.contains(key)) return;
+    // Recovery parse in flight: repeated promotions (grid rebuilds re-fire
+    // the cache-hit callback) must not start duplicate work while no label
+    // job exists yet.
+    if (_labelRecovery.contains(key)) return;
     if (labelOverlayPreparedTileKeys.contains(key)) return;
-    if (parsedTileFor(z, x, y) != null || bytes != null) {
-      unawaited(_ensureLabelsParsed(z, x, y, bytes));
+    // Warm parsed data: straight to the label lane.
+    if (parsedTileFor(z, x, y) != null) {
+      _scheduleLabels(z, x, y, '$traceId.promote.${_attemptSequence++}');
+      return;
     }
+    // No payload anywhere reachable: labels return on the tile's next
+    // full decode.
+    if (bytes == null) return;
+    _labelRecovery.add(key);
+    unawaited(_ensureLabelsParsed(z, x, y, key, bytes));
   }
 
-  Future<void> _ensureLabelsParsed(int z, int x, int y, Uint8List? bytes) async {
-    if (_disposed) return;
-    final key = '$z/$x/$y';
-    if (labelOverlayPreparedTileKeys.contains(key)) return;
-    if (parsedTileFor(z, x, y) == null) {
-      if (bytes == null) return;
-      try {
-        final coord = vectorSource.resolve(z, x, y);
-        await _parseAndStore(bytes, coord,
-            isRelevant: () => _isRelevant(z, x, y),
-            traceTile: key,
-            traceAttempt: '$traceId.promote.${_attemptSequence++}');
-      } catch (_) {
-        // Payload unreadable or stale: labels return on the tile's next
-        // full decode; the cached image keeps painting.
-        return;
-      }
-      if (_disposed) return;
+  Future<void> _ensureLabelsParsed(
+      int z, int x, int y, String key, Uint8List bytes) async {
+    var recovered = false;
+    try {
+      final coord = vectorSource.resolve(z, x, y);
+      // The shared source-parse path: repeat promotions and over-zoom
+      // siblings join one in-flight parse instead of re-reading and
+      // re-decoding the same payload per key.
+      await _parseAndStoreDedup(bytes, coord, z, x, y,
+          attempt: '$traceId.promote.${_attemptSequence++}', tile: key);
+      recovered = !_disposed;
+    } catch (_) {
+      // Payload unreadable or stale: labels return on the tile's next
+      // full decode; the cached image keeps painting.
+    } finally {
+      _labelRecovery.remove(key);
     }
+    if (!recovered) return;
+    if (labelOverlayPreparedTileKeys.contains(key)) return;
     _scheduleLabels(z, x, y, '$traceId.promote.${_attemptSequence++}');
   }
 
@@ -714,12 +738,12 @@ class VectorTileRuntime {
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness
         // never wait for feature scanning and text layout. Speculative
-        // decodes skip it only while their tile is still offscreen — the
-        // relevance-gated label pump would discard those labels anyway —
-        // because a speculative tile that turned visible before the decode
-        // resolved publishes straight into the grid with no cache-hit
-        // promotion callback; its labels must be arranged here.
-        if (!speculative || _isRelevant(z, x, y)) {
+        // decodes schedule labels only when the tile is STRICTLY visible
+        // (the became-visible-mid-flight case, which publishes into the
+        // grid with no cache-hit promotion callback): relevance alone
+        // cannot decide this, because admitted speculative tiles are
+        // deliberately relevant while still offscreen.
+        if (!speculative || (isTileVisible?.call(z, x, y) ?? false)) {
           _scheduleLabels(z, x, y, attempt);
         }
         return image;

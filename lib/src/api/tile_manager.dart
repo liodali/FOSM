@@ -650,6 +650,14 @@ class TileManager with CacheTiles {
     return _renderIndex(key) != -1;
   }
 
+  /// Whether the logical tile is in the strict viewport — visible demand,
+  /// not the padding ring and not speculative relevance. The runtime's
+  /// label path distinguishes the two for speculative decodes: relevance
+  /// alone cannot decide label timing, because admitted speculation is
+  /// deliberately relevant while offscreen.
+  bool isTileVisible(int z, int x, int y) =>
+      _visibleKeys.contains(_key(z, x, y));
+
   /// Presentation priority for [VectorTileRuntime]'s decode lane: higher
   /// values run first. Newer camera generations outrank older ones; within a
   /// generation visible tiles outrank padding, and nearer-centre tiles
@@ -1098,12 +1106,16 @@ class TileManager with CacheTiles {
           // Promotion path for pre-rendered (speculative) images: the
           // view arranges the label preparation the speculative decode
           // deliberately skipped. Only strict-viewport tiles need it —
-          // padding tiles have no labels painted. Bytes from the byte
-          // cache let labels redrive even with an evicted parsed tile.
+          // padding tiles have no labels painted. The payload reaches
+          // the runtime from the byte cache first, then from the
+          // persistent disk cache: if both parsed data and memory bytes
+          // were evicted, the retained image is otherwise labelless
+          // despite valid disk bytes.
           if (!isPadding && onTileServedFromCache != null) {
             final resourceKey = _resourceKey(zoom, tileLngIndex, tileLatIndex);
-            onTileServedFromCache!(
-                zoom, tileLngIndex, tileLatIndex, _byteCache[resourceKey]);
+            var payload = _byteCache[resourceKey];
+            payload ??= cachedTileBytes(resourceKey);
+            onTileServedFromCache!(zoom, tileLngIndex, tileLatIndex, payload);
           }
           continue;
         }

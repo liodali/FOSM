@@ -1203,6 +1203,7 @@ class _MapViewState extends State<MapView>
     // render set before they reach render/`toImage`, and dispatch the
     // newest centre tile first from its presentation lane.
     runtime?.isTileRelevant = manager.isTileRelevant;
+    runtime?.isTileVisible = manager.isTileVisible;
     runtime?.tilePriority = manager.tileDecodePriority;
     _tileManager = manager;
     _currentZoom = manager.zoom;

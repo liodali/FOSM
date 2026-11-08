@@ -2933,6 +2933,7 @@ void main() {
         (tester) async {
       final counts = _SpecCounts();
       final promoted = <String>[];
+      final promotedWithPayload = <String>[];
       final manager = TileManager.init(
         width: 256,
         height: 256,
@@ -2946,8 +2947,10 @@ void main() {
         byteOnlyPadding: true,
         speculativePrepare: true,
       );
-      manager.onTileServedFromCache =
-          (z, x, y, bytes) => promoted.add('$z/$x/$y');
+      manager.onTileServedFromCache = (z, x, y, bytes) {
+        promoted.add('$z/$x/$y');
+        if (bytes != null) promotedWithPayload.add('$z/$x/$y');
+      };
       addTearDown(manager.dispose);
 
       manager.calculate();
@@ -2994,6 +2997,10 @@ void main() {
           .length;
       expect(promoted, isNotEmpty,
           reason: 'cache-served visible tiles must fire the promotion hook');
+      // The cached bytes reach the runtime so label recovery can reparse
+      // without a full decode; the disk fallback shares this signature.
+      expect(promotedWithPayload, promoted,
+          reason: 'every promotion from the cache must carry its payload');
       expect(promotedImages, greaterThan(0),
           reason: 'promoted speculative images render immediately');
       final regularBefore = counts.regularCount;
