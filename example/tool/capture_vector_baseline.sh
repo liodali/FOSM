@@ -149,13 +149,18 @@ run_benchmark() {
   # The marker sink is the run's data safety net: when the wireless
   # console relay wedges mid-run (results frozen while the app kept
   # running), the app's direct POSTs still filled markers-$label.log.
-  # Canonize it when it is more complete than the console copy.
+  # Canonize it when it is more complete than the console copy — more
+  # result lines, or an equal count whose first result line is longer
+  # (the console relay caps long payloads mid-JSON; only the marker
+  # channel carries the un-split tail).
   local markers="$out/markers-$label.log"
   if [[ -f "$markers" ]]; then
-    local console_n marker_n
+    local console_n marker_n console_len marker_len
     console_n=$(grep -cF FOSM_BENCHMARK_RESULT "$out/$label.log" 2>/dev/null || echo 0)
     marker_n=$(grep -cF FOSM_BENCHMARK_RESULT "$markers" 2>/dev/null || echo 0)
-    if (( marker_n > console_n )); then
+    console_len=$(grep -F FOSM_BENCHMARK_RESULT "$out/$label.log" 2>/dev/null | head -1 | wc -c)
+    marker_len=$(grep -F FOSM_BENCHMARK_RESULT "$markers" 2>/dev/null | head -1 | wc -c)
+    if (( marker_n > console_n )) || { [[ $marker_n -eq $console_n && $console_n -gt 0 ]] && (( marker_len > console_len )); }; then
       mv "$markers" "$out/$label.log"
       echo "   (marker sink was the more complete channel)"
     else
