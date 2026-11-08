@@ -626,8 +626,12 @@ class ZoomFallbackPainter extends CustomPainter {
               canvas, base, cellX, cellY, tileW, tileH, layerPaint, false);
         }
         for (final draw in region.refinements) {
-          _drawFallbackImage(canvas, draw, cellX, cellY, tileW, tileH,
-              layerPaint, base != null);
+          // Isolation is unconditional: a refinement may overlap not only
+          // a base but also earlier carried refinements (coarser sources
+          // are emitted first). Its transparent pixels must reveal the
+          // plain background, never any older imagery underneath.
+          _drawFallbackImage(
+              canvas, draw, cellX, cellY, tileW, tileH, layerPaint, true);
         }
       }
     }
@@ -641,6 +645,12 @@ class ZoomFallbackPainter extends CustomPainter {
   /// Each descendant gets its own layer, so its blur cannot enter an
   /// uncovered quadrant elsewhere in the cell. With no blur, the same clip
   /// still enforces the geographic footprint without paying for a layer.
+  ///
+  /// When [isolateEarlierDraws] is set, the opaque plain background is
+  /// painted *outside* the filtered layer, before it starts: a blurred
+  /// layer edge cannot make that isolation fill translucent, and the
+  /// filtered image above it can therefore never reveal older imagery
+  /// beneath the footprint.
   void _drawFallbackImage(
       Canvas canvas,
       _FallbackDraw draw,
@@ -649,7 +659,7 @@ class ZoomFallbackPainter extends CustomPainter {
       double tileW,
       double tileH,
       Paint layerPaint,
-      bool isolateFromBase) {
+      bool isolateEarlierDraws) {
     final image = draw.image;
     final src = Rect.fromLTRB(
       draw.srcUnit.left * image.width,
@@ -669,12 +679,13 @@ class ZoomFallbackPainter extends CustomPainter {
     final blurred = blurSigma > 0.1;
     canvas.save();
     canvas.clipRect(dst);
-    if (blurred) canvas.saveLayer(dst, layerPaint);
-    if (isolateFromBase) {
-      // Alpha isolation: a transparent descendant quadrant must blend
-      // against the plain background, never the old-zoom ancestor crop.
+    if (isolateEarlierDraws) {
+      // Alpha isolation outside the filtered layer: transparent descendant
+      // pixels blend against this opaque fill, never older imagery, and the
+      // fill's edge cannot become translucent through its own blur.
       canvas.drawRect(dst, _basePaint);
     }
+    if (blurred) canvas.saveLayer(dst, layerPaint);
     canvas.drawImageRect(image, src, dst, _imagePaint);
     if (blurred) canvas.restore(); // filtered layer, inside the output clip
     canvas.restore(); // explicit destination-footprint clip

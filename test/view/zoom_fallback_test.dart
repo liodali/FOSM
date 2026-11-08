@@ -1063,6 +1063,158 @@ void main() {
     // Neighbouring imagery is still painted (cell 8/8's red child).
     expect(_pixel(data, 192, 192, 256), const ui.Color(0xFFFF0000));
 
+    // Compositor-facing ordering contract for the blurred isolation fill:
+    // it must be issued BEFORE saveLayer (outside the filtered layer). A
+    // fill inside the layer acquires a translucent blurred edge and lets
+    // the red ancestor tint through — the reviewer's compositor repro.
+    // Headless rasterization drops the filter, so the recorded command
+    // order is the observable contract here.
+    final recording = TestRecordingCanvas();
+    ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 2)
+        .paint(recording, const Size(256, 256));
+    final commands = [
+      for (final recorded in recording.invocations)
+        recorded.invocation.memberName,
+    ];
+    var isolatedOutsideLayer = false;
+    for (var i = 4; i < commands.length; i++) {
+      if (commands[i] == #drawImageRect &&
+          commands[i - 4] == #save &&
+          commands[i - 3] == #clipRect &&
+          commands[i - 2] == #drawRect &&
+          commands[i - 1] == #saveLayer) {
+        isolatedOutsideLayer = true;
+      }
+    }
+    expect(isolatedOutsideLayer, isTrue,
+        reason: 'every filtered refinement needs its opaque isolation fill '
+            'clipped, then painted before the filtered layer starts');
+
+    coverage.dispose();
+    manager.dispose();
+  });
+
+  testWidgets(
+      'overlapping carried descendants isolate newer transparent imagery',
+      (tester) async {
+    tester.view.physicalSize = const ui.Size(360, 240);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final red = await _unitPng(tester, const ui.Color(0xFFFF0000));
+    final transparent = await _unitPng(tester, null);
+    final fetcher = _GatedFetcher();
+    final manager = _smallManager(fetcher, zoom: 5);
+    manager.calculate();
+    // One retained transparent z5 child; the rest of z5 stays blocked.
+    fetcher.deliver(5, 16, 16, transparent);
+    await _drain(tester, until: () {
+      final tile = manager.renderTiles
+          .where((tile) => tile.index == '5/16/16')
+          .firstOrNull;
+      return tile?.sourceTile != null;
+    });
+
+    // z4: the only region is the cell refined by that transparent child —
+    // no ancestor base exists (5/16/16 is a child of 4/8/8).
+    final coverage = ZoomFallbackCoverage(manager);
+    coverage.beginZoomTransition();
+    manager.setZoom(4);
+    await _drain(tester);
+    coverage.reconcile();
+    expect(coverage.debugRegionKeys(), ['4/8/8']);
+    expect(coverage.debugRegionSourceKeys('4/8/8'), ['5/16/16']);
+    expect(coverage.debugRegionDrawCount('4/8/8'), 1);
+
+    // Publish the red z4 replacement for that same cell WITHOUT
+    // reconciling, then switch directly to z2. The next reconcile carries
+    // both the previous region's transparent z5 source and the transition
+    // grid's red z4 source into one base-less z2 region, with the sharper
+    // transparent source overlapping the coarser red one.
+    fetcher.deliver(4, 8, 8, red);
+    await _drain(tester, until: () {
+      final tile = manager.renderTiles
+          .where((tile) => tile.index == '4/8/8')
+          .firstOrNull;
+      return tile?.sourceTile != null && manager.pendingPresentationCount == 0;
+    });
+    expect(
+        manager.renderTiles
+            .where((tile) => tile.index == '4/8/8')
+            .firstOrNull
+            ?.sourceTile,
+        isNotNull,
+        reason: 'the red z4 replacement must be published and retained '
+            'before the jump');
+    coverage.beginZoomTransition();
+    manager.setZoom(2);
+    await _drain(tester);
+    coverage.reconcile();
+
+    expect(coverage.debugRegionKeys(), contains('2/2/2'));
+    final sources = coverage.debugRegionSourceKeys('2/2/2');
+    expect(sources, containsAll(['4/8/8', '5/16/16']));
+    final geometry = coverage.debugRegionDrawGeometry('2/2/2');
+    expect(geometry.length, 2,
+        reason: 'the base-less region has exactly the two overlapping '
+            'carried descendants');
+    final redUnit = geometry[0].$2;
+    final transparentUnit = geometry[1].$2;
+    expect(redUnit.width, closeTo(0.25, 1e-9));
+    expect(transparentUnit.width, closeTo(0.125, 1e-9));
+    expect(redUnit.contains(transparentUnit.center), isTrue,
+        reason: 'the transparent z5 footprint overlaps the red z4 one');
+
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+    ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 2)
+        .paint(canvas, const Size(256, 256));
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(256, 256);
+    picture.dispose();
+    final data = await tester.runAsync(
+        () => image.toByteData(format: ui.ImageByteFormat.rawStraightRgba));
+    image.dispose();
+    expect(data, isNotNull);
+
+    final tile =
+        manager.renderTiles.firstWhere((tile) => tile.index == '2/2/2');
+    Rect canvasRect(Rect unit) => Rect.fromLTRB(
+          manager.leftColumnTilesCanvasX +
+              (tile.lngIndex - manager.leftColumnTilesLngIndex) *
+                  manager.renderedTileWidth +
+              unit.left * manager.renderedTileWidth,
+          manager.topRowTilesCanvasY +
+              (tile.latIndex - manager.topRowTilesLatIndex) *
+                  manager.renderedTileHeight +
+              unit.top * manager.renderedTileHeight,
+          manager.leftColumnTilesCanvasX +
+              (tile.lngIndex - manager.leftColumnTilesLngIndex) *
+                  manager.renderedTileWidth +
+              unit.right * manager.renderedTileWidth,
+          manager.topRowTilesCanvasY +
+              (tile.latIndex - manager.topRowTilesLatIndex) *
+                  manager.renderedTileHeight +
+              unit.bottom * manager.renderedTileHeight,
+        );
+
+    // The transparent overlap must show the plain background, not the red
+    // z4 imagery painted earlier in the same base-less region.
+    final overlap = canvasRect(transparentUnit).center;
+    expect(_pixel(data!, overlap.dx.toInt(), overlap.dy.toInt(), 256),
+        const ui.Color(0xFFF5F5F5),
+        reason: 'a transparent carried descendant isolates from every '
+            'earlier overlapping refinement, not only a base');
+    // The red z4 footprint outside that overlap is still retained imagery
+    // (5/16/16 is the top-left child of 4/8/8, so its bottom-right
+    // quadrant is red-only).
+    final redOnly = Rect.fromLTRB(transparentUnit.right, transparentUnit.bottom,
+        redUnit.right, redUnit.bottom);
+    expect(redOnly.isEmpty, isFalse);
+    final redPoint = canvasRect(redOnly).center;
+    expect(_pixel(data, redPoint.dx.toInt(), redPoint.dy.toInt(), 256),
+        const ui.Color(0xFFFF0000));
+
     coverage.dispose();
     manager.dispose();
   });
