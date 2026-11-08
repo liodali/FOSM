@@ -6,15 +6,32 @@ import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/view/render.dart';
 
-/// One imagery draw inside a fallback region: [image] (pinned in the
+/// One retained source image and its geographic tile coordinate.
+///
+/// [key] is deliberately opaque: raster keys are `z/x/y`, while vector keys
+/// carry a style namespace. Coordinates are stored explicitly instead of
+/// being recovered by parsing that cache identity.
+class _FallbackSource {
+  const _FallbackSource(this.key, this.image, this.z, this.x, this.y);
+
+  final String key;
+  final ui.Image image;
+  final int z;
+  final int x;
+  final int y;
+}
+
+/// One imagery draw inside a fallback region: [source] (pinned in the
 /// rendered cache) cropped to [srcUnit] (fractions of the source image)
 /// and painted into [dstUnit] (fractions of the missing cell's rect).
 class _FallbackDraw {
-  const _FallbackDraw(this.image, this.srcUnit, this.dstUnit);
+  const _FallbackDraw(this.source, this.srcUnit, this.dstUnit);
 
-  final ui.Image image;
+  final _FallbackSource source;
   final Rect srcUnit;
   final Rect dstUnit;
+
+  ui.Image get image => source.image;
 }
 
 /// Fallback coverage for one missing visible cell. Holds the full-cell
@@ -40,6 +57,17 @@ class _FallbackRegion {
   /// Cache keys of every image the draws reference — also the keys pinned.
   final Set<String> sourceKeys;
   final VoidCallback release;
+
+  /// Unique sources with explicit coordinates for the next reconcile's
+  /// geographic carry. No cache-key parsing is involved.
+  Iterable<_FallbackSource> get sources sync* {
+    final seen = <String>{};
+    final base = this.base;
+    if (base != null && seen.add(base.source.key)) yield base.source;
+    for (final draw in refinements) {
+      if (seen.add(draw.source.key)) yield draw.source;
+    }
+  }
 }
 
 /// Geographic fallback coverage for the visible grid, region by region.
@@ -100,11 +128,16 @@ class ZoomFallbackCoverage {
   /// a reconcile, keeping ownership bounded to the visible missing
   /// regions (plan 09 review 2: the chain of integer steps stays covered
   /// at any depth instead of relying on a fixed ancestor cutoff).
-  Map<String, ui.Image>? _carrySources;
+  Map<String, _FallbackSource>? _carrySources;
 
   /// Pin held across a zoom switch (see [beginZoomTransition]) and
   /// released by the next [reconcile] once region pins took over.
   VoidCallback? _transitionRelease;
+
+  /// Explicit source coordinates for the pinned pre-switch grid. These
+  /// join the previous regions' carry for one reconcile, allowing even a
+  /// direct multi-level zoom jump to crop retained descendant imagery.
+  List<_FallbackSource>? _transitionSources;
 
   /// Bumped whenever the region set changes, so painters can compare.
   int _version = 0;
@@ -140,6 +173,18 @@ class ZoomFallbackCoverage {
     return (region.base == null ? 0 : 1) + region.refinements.length;
   }
 
+  /// Source and destination unit rectangles for every draw in [cellKey]
+  /// (test hook). Base first, then refinements.
+  @visibleForTesting
+  List<(Rect, Rect)> debugRegionDrawGeometry(String cellKey) {
+    final region = _regions[cellKey];
+    if (region == null) return const [];
+    return [
+      if (region.base != null) (region.base!.srcUnit, region.base!.dstUnit),
+      for (final draw in region.refinements) (draw.srcUnit, draw.dstUnit),
+    ];
+  }
+
   /// The covered cell keys (test hook).
   @visibleForTesting
   List<String> debugRegionKeys() => _regions.keys.toList();
@@ -153,39 +198,38 @@ class ZoomFallbackCoverage {
   void reconcile() {
     if (_disposed) return;
     final transition = _transitionRelease;
+    final transitionSources = _transitionSources;
     _transitionRelease = null;
+    _transitionSources = null;
     try {
-      _reconcileRegions();
+      _reconcileRegions(transitionSources ?? const []);
     } finally {
       transition?.call();
     }
   }
 
-  void _reconcileRegions() {
+  void _reconcileRegions(List<_FallbackSource> transitionSources) {
     final manager = this.manager;
     final revision = manager.revision;
     if (revision == _lastReconciledRevision) return;
     _lastReconciledRevision = revision;
 
-    // The cross-step carry: the previous generation's region sources,
-    // still held by their pins for the duration of this pass (release
-    // happens only after the new pins acquire). New cells look these up
-    // regardless of many levels the retained content sits deep, so a
-    // chain of integer zoom steps never falls out of the fixed ancestor
-    // window.
-    _carrySources = {};
+    // The cross-step carry: the previous generation's region sources plus
+    // the pinned pre-switch grid, all still held by their pins for the
+    // duration of this pass (release happens only after the new pins
+    // acquire). Source coordinates are explicit and cache keys stay opaque,
+    // so namespaced vector imagery follows exactly the same geographic path
+    // as raster imagery, at any zoom separation.
+    final carry = <String, _FallbackSource>{};
+    for (final source in transitionSources) {
+      carry[source.key] = source;
+    }
     for (final region in _regions.values) {
-      for (final key in region.sourceKeys) {
-        final parts = key.split('/');
-        if (parts.length != 3) continue;
-        final z = int.tryParse(parts[0]);
-        final x = int.tryParse(parts[1]);
-        final y = int.tryParse(parts[2]);
-        if (z == null || x == null || y == null || z < 0 || z > 30) continue;
-        final entry = _rawImageFor(manager, z, x, y);
-        if (entry != null) _carrySources![key] = entry.$2;
+      for (final source in region.sources) {
+        carry[source.key] = source;
       }
     }
+    _carrySources = carry;
 
     // Current missing visible cells (off-world rows can never load and
     // never have imagery, so they are skipped like everywhere else).
@@ -249,15 +293,16 @@ class ZoomFallbackCoverage {
     _FallbackDraw? base;
     final baseEntry = _nearestAncestor(manager, z, cell);
     if (baseEntry != null) {
-      final span = 1 << baseEntry.$3;
+      final source = baseEntry.$1;
+      final span = 1 << baseEntry.$2;
       final unit = 1.0 / span;
       base = _FallbackDraw(
-        baseEntry.$2,
+        source,
         Rect.fromLTWH(
             (cell.x % span) * unit, (cell.y % span) * unit, unit, unit),
         const Rect.fromLTWH(0, 0, 1, 1),
       );
-      sourceKeys.add(baseEntry.$1);
+      sourceKeys.add(source.key);
     }
 
     // Refinement: available descendants overlay the base quadrant by
@@ -267,60 +312,56 @@ class ZoomFallbackCoverage {
     final budget = maxDrawsPerRegion - (base == null ? 0 : 1);
     _refineWithChildren(manager, z, cell.x, cell.y,
         const Rect.fromLTWH(0, 0, 1, 1), 0, refinements, sourceKeys, budget);
+    _refineWithCarriedDescendants(z, cell, refinements, sourceKeys, budget);
 
     if (base == null && refinements.isEmpty) return null;
     return _FallbackRegion(cellKey, base, refinements, sourceKeys,
         manager.pinRenderedImages(sourceKeys));
   }
 
-  /// Looks up a retained image for `(z, x, y)`: the grid's raw key, then
-  /// the wrapped-X canonical key — the antimeridian duplicate of a
-  /// retained tile depicts the same region — then the cross-step carry
-  /// (an exact match against the previous generation's sources, the
-  /// zoom-out side of the chain). Zooms beyond the manager's supported
-  /// range can never be cached, so they skip the wrap arithmetic (which
-  /// would overflow 32-bit web ints past 30).
-  (String, ui.Image)? _imageFor(TileManager manager, int z, int x, int y) {
-    if (z > 30 || z < 0) return null;
-    final rawKey = manager.renderTileKey(z, x, y);
-    final raw = manager.retainedImage(rawKey);
-    if (raw != null) return (rawKey, raw);
+  static int _wrappedX(int z, int x) {
     final n = 1 << z;
-    final wrappedX = ((x % n) + n) % n;
-    if (wrappedX != x) {
-      final wrappedKey = manager.renderTileKey(z, wrappedX, y);
-      final wrapped = manager.retainedImage(wrappedKey);
-      if (wrapped != null) return (wrappedKey, wrapped);
-    }
-    final carry = _carrySources;
-    if (carry != null && carry.containsKey('$z/$x/$y')) {
-      return ('$z/$x/$y', carry['$z/$x/$y']!);
+    return ((x % n) + n) % n;
+  }
+
+  /// Looks up a retained source for `(z, x, y)`: the grid's raw key, then
+  /// the wrapped-X canonical key, then an exact coordinate match in the
+  /// cross-step carry. The returned source always uses canonical X so its
+  /// explicit coordinates remain usable by later geographic carry passes.
+  _FallbackSource? _imageFor(TileManager manager, int z, int x, int y) {
+    final direct = _rawImageFor(manager, z, x, y);
+    if (direct != null) return direct;
+    if (z > 30 || z < 0) return null;
+    final wrappedX = _wrappedX(z, x);
+    for (final source in _carrySources?.values ?? const <_FallbackSource>[]) {
+      if (source.z == z && source.x == wrappedX && source.y == y) {
+        return source;
+      }
     }
     return null;
   }
 
-  /// Raw cache-only lookup (no carry): reads the carry through `_imageFor`
-  /// during its own build, so the reconcile-time carry map must be built
-  /// from the direct cache to avoid feedback.
-  (String, ui.Image)? _rawImageFor(TileManager manager, int z, int x, int y) {
+  /// Raw cache-only lookup (no carry). Namespaces remain part of the opaque
+  /// cache key; the source coordinate is carried alongside it explicitly.
+  _FallbackSource? _rawImageFor(TileManager manager, int z, int x, int y) {
     if (z > 30 || z < 0) return null;
+    final wrappedX = _wrappedX(z, x);
     final rawKey = manager.renderTileKey(z, x, y);
     final raw = manager.retainedImage(rawKey);
-    if (raw != null) return (rawKey, raw);
-    final n = 1 << z;
-    final wrappedX = ((x % n) + n) % n;
+    if (raw != null) return _FallbackSource(rawKey, raw, z, wrappedX, y);
     if (wrappedX == x) return null;
     final wrappedKey = manager.renderTileKey(z, wrappedX, y);
     final wrapped = manager.retainedImage(wrappedKey);
-    if (wrapped != null) return (wrappedKey, wrapped);
+    if (wrapped != null) {
+      return _FallbackSource(wrappedKey, wrapped, z, wrappedX, y);
+    }
     return null;
   }
 
   /// Nearest retained ancestor of `(z, x, y)`: first the fixed shallow
-  /// window ([maxAncestorLevels]), then the cross-step carry — the
-  /// deepest carried source whose footprint contains the cell, however
-  /// many levels down the retained content sits.
-  (String, ui.Image, int)? _nearestAncestor(
+  /// window ([maxAncestorLevels]), then the deepest carried source whose
+  /// footprint contains the cell, however many levels down it sits.
+  (_FallbackSource, int)? _nearestAncestor(
       TileManager manager, int z, _TileCoord cell) {
     for (var level = 1; level <= maxAncestorLevels; level++) {
       final ancestorZoom = z - level;
@@ -328,33 +369,19 @@ class ZoomFallbackCoverage {
       final x = cell.x >> level;
       final y = cell.y >> level;
       final entry = _rawImageFor(manager, ancestorZoom, x, y);
-      if (entry != null) return (entry.$1, entry.$2, level);
+      if (entry != null) return (entry, level);
     }
     final carry = _carrySources;
-    if (carry == null || carry.isEmpty) return null;
-    // Deepest carried zoom whose footprint contains the cell wins.
-    int? bestLevel;
-    (String, ui.Image, int)? best;
-    for (final entry in carry.entries) {
-      final parts = entry.key.split('/');
-      final sourceZoom = int.tryParse(parts[0]);
-      final sourceX = int.tryParse(parts[1]);
-      final sourceY = int.tryParse(parts[2]);
-      if (sourceZoom == null ||
-          sourceX == null ||
-          sourceY == null ||
-          sourceZoom >= z ||
-          sourceZoom < 0) {
+    if (carry == null || carry.isEmpty || z > 30) return null;
+    final cellX = _wrappedX(z, cell.x);
+    (_FallbackSource, int)? best;
+    for (final source in carry.values) {
+      if (source.z >= z || source.z < 0) continue;
+      final level = z - source.z;
+      if ((cellX >> level) != source.x || (cell.y >> level) != source.y) {
         continue;
       }
-      final level = z - sourceZoom;
-      if ((cell.x >> level) != sourceX || (cell.y >> level) != sourceY) {
-        continue;
-      }
-      if (best == null || level < bestLevel!) {
-        best = (entry.key, entry.value, level);
-        bestLevel = level;
-      }
+      if (best == null || level < best.$2) best = (source, level);
     }
     return best;
   }
@@ -379,14 +406,54 @@ class ZoomFallbackCoverage {
             unit.top + j * unit.height / 2, unit.width / 2, unit.height / 2);
         final entry = _imageFor(manager, z + 1, cx, cy);
         if (entry != null) {
-          refinements.add(_FallbackDraw(
-              entry.$2, const Rect.fromLTWH(0, 0, 1, 1), quadrant));
-          sourceKeys.add(entry.$1);
+          refinements.add(
+              _FallbackDraw(entry, const Rect.fromLTWH(0, 0, 1, 1), quadrant));
+          sourceKeys.add(entry.key);
         } else {
           _refineWithChildren(manager, z + 1, cx, cy, quadrant, depth + 1,
               refinements, sourceKeys, budget);
         }
       }
+    }
+  }
+
+  /// Crops every carried descendant footprint into the missing cell. Unlike
+  /// the shallow recursive walk, this has no depth cutoff: a z12 source can
+  /// refine a z9 cell directly. Both rectangles are clamped to their actual
+  /// intersection, so a partially overlapping source never stretches into
+  /// geography it does not depict.
+  void _refineWithCarriedDescendants(int z, _TileCoord cell,
+      List<_FallbackDraw> refinements, Set<String> sourceKeys, int budget) {
+    final carry = _carrySources;
+    if (carry == null || carry.isEmpty || z > 30) return;
+    final candidates = carry.values
+        .where((source) =>
+            source.z > z && source.z <= 30 && !sourceKeys.contains(source.key))
+        .toList()
+      // Coarser imagery first; sharper descendants overlay it. Key order
+      // makes the bounded draw selection deterministic.
+      ..sort((a, b) {
+        final byZoom = a.z.compareTo(b.z);
+        return byZoom != 0 ? byZoom : a.key.compareTo(b.key);
+      });
+    final cellX = _wrappedX(z, cell.x);
+    const cellUnit = Rect.fromLTWH(0, 0, 1, 1);
+    for (final source in candidates) {
+      if (refinements.length >= budget) return;
+      final span = 1 << (source.z - z);
+      final unit = 1.0 / span;
+      final sourceUnit = Rect.fromLTWH((source.x - cellX * span) * unit,
+          (source.y - cell.y * span) * unit, unit, unit);
+      final dstUnit = sourceUnit.intersect(cellUnit);
+      if (dstUnit.isEmpty) continue;
+      final srcUnit = Rect.fromLTRB(
+        (dstUnit.left - sourceUnit.left) / unit,
+        (dstUnit.top - sourceUnit.top) / unit,
+        (dstUnit.right - sourceUnit.left) / unit,
+        (dstUnit.bottom - sourceUnit.top) / unit,
+      );
+      refinements.add(_FallbackDraw(source, srcUnit, dstUnit));
+      sourceKeys.add(source.key);
     }
   }
 
@@ -400,9 +467,18 @@ class ZoomFallbackCoverage {
     if (_disposed) return;
     _transitionRelease?.call();
     _transitionRelease = null;
-    _transitionRelease = manager.pinRenderedImages(manager.renderTiles
+    _transitionSources = null;
+    final z = manager.zoom;
+    final loaded = manager.renderTiles
         .where((tile) => tile.sourceTile != null)
-        .map((tile) => tile.index));
+        .toList(growable: false);
+    _transitionSources = [
+      for (final tile in loaded)
+        _FallbackSource(tile.index, tile.sourceTile!, z,
+            _wrappedX(z, tile.lngIndex), tile.latIndex),
+    ];
+    _transitionRelease =
+        manager.pinRenderedImages(loaded.map((tile) => tile.index));
   }
 
   /// Releases every region. Used by camera commands and teardown paths
@@ -412,6 +488,8 @@ class ZoomFallbackCoverage {
   void clear() {
     _transitionRelease?.call();
     _transitionRelease = null;
+    _transitionSources = null;
+    _carrySources = null;
     // The next reconcile must re-evaluate even at the same grid/content
     // revision: clearing is an explicit invalidation, not a paint-time
     // identity change.
@@ -452,12 +530,12 @@ class _TileCoord {
 /// A full-viewport opaque base is painted first, unblurred: loaded replacement
 /// tiles draw above this layer in the widget stack, and transparent ones
 /// must blend against the same background the plain grid paints — never
-/// against stale old-zoom imagery. The gathered regions then each draw
-/// inside their own bounded layer ([Canvas.saveLayer]/`bounds` = the
-/// cell) carrying the zoom snapshot's gaussian sigma, so the softened
-/// look survives the handoff while each region's blur stays clipped to
-/// its own cell: neighboring ready tiles and uncovered areas never
-/// receive tint from a covered cell's bleed (plan 09 review round 2).
+/// against stale old-zoom imagery. Every imagery draw then composites through
+/// its own bounded layer ([Canvas.saveLayer]) carrying the zoom snapshot's
+/// gaussian sigma, with an explicit [Canvas.clipRect] around the layer at the
+/// draw's geographic footprint. The softened look survives the handoff without
+/// tinting neighboring ready tiles, uncovered cells, or uncovered descendant
+/// quadrants (plan 09 review round 3).
 ///
 /// While this painter is present the grid painter skips its background
 /// and placeholder passes, so the two never double-paint.
@@ -492,9 +570,9 @@ class ZoomFallbackPainter extends CustomPainter {
     ..filterQuality = FilterQuality.medium;
   static final Paint _basePaint = Paint()..color = const Color(0xFFF5F5F5);
 
-  /// One-shot layer paint per paint() with the bounded blur; content
-  /// inside the layer rasterizes crisply and blurs when the layer
-  /// composites, so per-region clipping stays exact.
+  /// Layer paint for one paint() pass; content rasterizes crisply inside
+  /// each draw's layer and blurs only while compositing inside its explicit
+  /// output clip.
   Paint _layerPaint() {
     final paint = Paint();
     if (blurSigma > 0.1) {
@@ -542,49 +620,36 @@ class ZoomFallbackPainter extends CustomPainter {
         final region = coverage._region(tile.index);
         if (region == null) continue;
 
-        // Bounded per-region blur layer: the filter composites within
-        // the cell's bounds only — no imagery bleeds into a neighbouring
-        // ready tile's or uncovered cell's plain area, and the plain
-        // base beneath guarantees exact background isolation regardless
-        // of what the kernel leaves transparent at the layer edge.
-        canvas.saveLayer(
-            Rect.fromLTWH(cellX, cellY, tileW, tileH), layerPaint);
         final base = region.base;
         if (base != null) {
-          _drawImageUnit(canvas, base, cellX, cellY, tileW, tileH);
+          _drawFallbackImage(
+              canvas, base, cellX, cellY, tileW, tileH, layerPaint, false);
         }
         for (final draw in region.refinements) {
-          final dst = Rect.fromLTRB(
-            cellX + draw.dstUnit.left * tileW,
-            cellY + draw.dstUnit.top * tileH,
-            cellX + draw.dstUnit.right * tileW,
-            cellY + draw.dstUnit.bottom * tileH,
-          );
-          if (dst.isEmpty) continue;
-          if (base != null) {
-            // Alpha isolation: a transparent descendant quadrant must
-            // blend against the plain background, never against the
-            // old-zoom ancestor crop underneath it.
-            canvas.drawRect(dst, _basePaint);
-          }
-          final image = draw.image;
-          final src = Rect.fromLTRB(
-            draw.srcUnit.left * image.width,
-            draw.srcUnit.top * image.height,
-            draw.srcUnit.right * image.width,
-            draw.srcUnit.bottom * image.height,
-          );
-          if (src.isEmpty) continue;
-          canvas.drawImageRect(image, src, dst, _imagePaint);
+          _drawFallbackImage(canvas, draw, cellX, cellY, tileW, tileH,
+              layerPaint, base != null);
         }
-        canvas.restore();
       }
     }
   }
 
   /// Draws one unit-rect imagery draw into the cell at `(cellX, cellY)`.
-  void _drawImageUnit(Canvas canvas, _FallbackDraw draw, double cellX,
-      double cellY, double tileW, double tileH) {
+  ///
+  /// The destination footprint is both the `saveLayer` bounds and an
+  /// explicit output clip around that layer. A saveLayer's bounds alone do
+  /// not constrain the compositor's blur output; the enclosing clip does.
+  /// Each descendant gets its own layer, so its blur cannot enter an
+  /// uncovered quadrant elsewhere in the cell. With no blur, the same clip
+  /// still enforces the geographic footprint without paying for a layer.
+  void _drawFallbackImage(
+      Canvas canvas,
+      _FallbackDraw draw,
+      double cellX,
+      double cellY,
+      double tileW,
+      double tileH,
+      Paint layerPaint,
+      bool isolateFromBase) {
     final image = draw.image;
     final src = Rect.fromLTRB(
       draw.srcUnit.left * image.width,
@@ -600,7 +665,19 @@ class ZoomFallbackPainter extends CustomPainter {
       cellY + draw.dstUnit.bottom * tileH,
     );
     if (dst.isEmpty) return;
+
+    final blurred = blurSigma > 0.1;
+    canvas.save();
+    canvas.clipRect(dst);
+    if (blurred) canvas.saveLayer(dst, layerPaint);
+    if (isolateFromBase) {
+      // Alpha isolation: a transparent descendant quadrant must blend
+      // against the plain background, never the old-zoom ancestor crop.
+      canvas.drawRect(dst, _basePaint);
+    }
     canvas.drawImageRect(image, src, dst, _imagePaint);
+    if (blurred) canvas.restore(); // filtered layer, inside the output clip
+    canvas.restore(); // explicit destination-footprint clip
   }
 
   @override
@@ -609,5 +686,6 @@ class ZoomFallbackPainter extends CustomPainter {
       oldDelegate.version != version ||
       oldDelegate.canvasX != canvasX ||
       oldDelegate.canvasY != canvasY ||
-      oldDelegate.tileScale != tileScale;
+      oldDelegate.tileScale != tileScale ||
+      oldDelegate.blurSigma != blurSigma;
 }

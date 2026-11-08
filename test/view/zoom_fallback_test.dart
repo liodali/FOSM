@@ -58,8 +58,8 @@ Future<Uint8List> twoColumnPng(
   final image = picture.toImageSync(4, 4);
   picture.dispose();
   try {
-    final bytes = await tester.runAsync(
-        () => image.toByteData(format: ui.ImageByteFormat.png));
+    final bytes = await tester
+        .runAsync(() => image.toByteData(format: ui.ImageByteFormat.png));
     return bytes!.buffer.asUint8List();
   } finally {
     image.dispose();
@@ -139,13 +139,15 @@ Future<void> _drain(WidgetTester tester,
   }
 }
 
-TileManager _smallManager(_GatedFetcher fetcher, {int zoom = 5}) =>
+TileManager _smallManager(_GatedFetcher fetcher,
+        {int zoom = 5, String cacheNamespace = ''}) =>
     TileManager.init(
       width: 256,
       height: 256,
       centerLatLng: const LatLng(latitude: 0, longitude: 0),
       zoom: zoom,
       fetcher: fetcher.call,
+      cacheNamespace: cacheNamespace,
       tilePadding: 0,
       preloadAdjacentZoom: false,
       maxRenderedCacheBytes: 64 * 1024 * 1024,
@@ -210,13 +212,11 @@ void main() {
         reason: 'the default zoom style applies the snapshot-matching '
             'sigma over the active coverage');
 
-    // Region isolation (pixels): rasterize the whole fallback layer and
-    // verify the crisp part of the contract — every pixel OUTSIDE a
-    // covered region equals the plain base, so a layer-wide blur could
-    // never tint a ready tile's or uncovered cell's background. (The
-    // compositor softness itself is pixel-verified on the affected
-    // platform; headless rasterization drops canvas filters, which is
-    // why the inspector stops at the crisp plane here.)
+    // Region isolation (pixels): exercise the filtered draw path and verify
+    // that every pixel OUTSIDE a covered region equals the plain base. The
+    // explicit output clips are observable headlessly; compositor softness
+    // itself remains pixel-verified on the affected platform because this
+    // rasterizer drops canvas filters.
     final coverage = painter.coverage;
     final ctr = coverage.manager;
     final regionCoverage = <String, ui.Rect>{
@@ -240,8 +240,7 @@ void main() {
     {
       final recorder = ui.PictureRecorder();
       final canvas = ui.Canvas(recorder);
-      ZoomFallbackPainter(
-              coverage: coverage, manager: ctr, blurSigma: 0.0)
+      ZoomFallbackPainter(coverage: coverage, manager: ctr, blurSigma: 2.0)
           .paint(canvas, const Size(360, 240));
       final picture = recorder.endRecording();
       frame = picture.toImageSync(360, 240);
@@ -292,17 +291,18 @@ void main() {
 
     // Publication retires coverage and the sigma wiring with it.
     controller.setFractionalZoom(5.0, animate: false);
-    await _drain(tester, until: () => (_gridLoaded(tester)) &&
-        (fallbackPainter() == null ||
-            !fallbackPainter()!.coverage.hasRegions));
+    await _drain(tester,
+        until: () =>
+            (_gridLoaded(tester)) &&
+            (fallbackPainter() == null ||
+                !fallbackPainter()!.coverage.hasRegions));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets(
       'repeated zoom steps keep coverage through the carried region '
-      'sources (z5 content, replacements blocked, z6–z12)',
-      (tester) async {
+      'sources (z5 content, replacements blocked, z6–z12)', (tester) async {
     final fetcher = _GatedFetcher();
     final manager = _smallManager(fetcher);
     manager.calculate();
@@ -329,6 +329,88 @@ void main() {
             reason: 'z$target covered by the same z5 content: $sources');
       }
     }
+    coverage.dispose();
+    manager.dispose();
+  });
+
+  testWidgets('namespaced vector cache keys carry coverage from z5 through z9',
+      (tester) async {
+    final fetcher = _GatedFetcher();
+    final manager = _smallManager(fetcher, cacheNamespace: 'vector-style');
+    manager.calculate();
+    fetcher.deliverZoom(5);
+    await _drain(tester, until: () => manager.visibleTilesReady);
+
+    final coverage = ZoomFallbackCoverage(manager);
+    coverage.reconcile();
+    for (final target in [6, 7, 8, 9]) {
+      coverage.beginZoomTransition();
+      manager.setZoom(target);
+      await _drain(tester);
+      coverage.reconcile();
+      expect(coverage.hasRegions, isTrue,
+          reason: 'namespaced z5 imagery must still cover z$target');
+      for (final key in coverage.debugRegionKeys()) {
+        final sources = coverage.debugRegionSourceKeys(key);
+        expect(sources, isNotEmpty);
+        expect(sources, everyElement(startsWith('vector-style/5/')),
+            reason: 'the opaque style/$target cache key must not be parsed '
+                'as a geographic coordinate: $sources');
+      }
+    }
+    coverage.dispose();
+    manager.dispose();
+  });
+
+  testWidgets('a direct z12 to z9 zoom-out carries and crops deep descendants',
+      (tester) async {
+    final fetcher = _GatedFetcher();
+    final manager =
+        _smallManager(fetcher, zoom: 12, cacheNamespace: 'vector-style');
+    manager.calculate();
+    fetcher.deliverZoom(12);
+    await _drain(tester, until: () => manager.visibleTilesReady);
+
+    final coverage = ZoomFallbackCoverage(manager);
+    // No intermediate fallback regions exist: the pinned pre-switch grid
+    // itself must supply the deep descendant footprints.
+    coverage.beginZoomTransition();
+    manager.setZoom(9);
+    await _drain(tester);
+    coverage.reconcile();
+
+    final keys = coverage.debugRegionKeys();
+    expect(keys, isNotEmpty,
+        reason: 'z12 content must not disappear three descendant levels '
+            'below the old two-level refinement walk');
+    var checkedGeometry = false;
+    for (final key in keys) {
+      final sources = coverage.debugRegionSourceKeys(key);
+      expect(sources, isNotEmpty);
+      expect(sources, everyElement(startsWith('vector-style/12/')));
+      for (final geometry in coverage.debugRegionDrawGeometry(key)) {
+        final src = geometry.$1;
+        final dst = geometry.$2;
+        expect(dst.left, greaterThanOrEqualTo(0));
+        expect(dst.top, greaterThanOrEqualTo(0));
+        expect(dst.right, lessThanOrEqualTo(1));
+        expect(dst.bottom, lessThanOrEqualTo(1));
+        expect(dst.width, lessThanOrEqualTo(1 / 8 + 1e-9));
+        expect(dst.height, lessThanOrEqualTo(1 / 8 + 1e-9));
+        expect(src.left, greaterThanOrEqualTo(-1e-9));
+        expect(src.top, greaterThanOrEqualTo(-1e-9));
+        expect(src.right, lessThanOrEqualTo(1 + 1e-9));
+        expect(src.bottom, lessThanOrEqualTo(1 + 1e-9));
+        // A z12 tile occupies 1/8 of a z9 cell. Partial overlaps crop the
+        // same fraction from the source instead of stretching the image.
+        expect(src.width, closeTo(dst.width * 8, 1e-8));
+        expect(src.height, closeTo(dst.height * 8, 1e-8));
+        checkedGeometry = true;
+      }
+      expect(coverage.debugRegionDrawCount(key),
+          lessThanOrEqualTo(ZoomFallbackCoverage.maxDrawsPerRegion));
+    }
+    expect(checkedGeometry, isTrue);
     coverage.dispose();
     manager.dispose();
   });
@@ -897,9 +979,34 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('a blur-sigma-only change repaints the stationary fallback',
+      (tester) async {
+    final fetcher = _GatedFetcher();
+    final manager = _smallManager(fetcher);
+    manager.calculate();
+    final coverage = ZoomFallbackCoverage(manager);
+
+    final crisp =
+        ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 0);
+    final soft =
+        ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 2);
+    final sameSoft =
+        ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 2);
+
+    expect(soft.shouldRepaint(crisp), isTrue,
+        reason: 'gesture end can change only sigma while every grid and '
+            'coverage snapshot field stays stationary');
+    expect(crisp.shouldRepaint(soft), isTrue);
+    expect(soft.shouldRepaint(sameSoft), isFalse,
+        reason: 'an unchanged painter configuration still avoids repaint');
+
+    coverage.dispose();
+    manager.dispose();
+  });
+
   testWidgets(
-      'transparent descendant quadrants never blend over the '
-      'ancestor base', (tester) async {
+      'filtered descendant quadrants stay clipped and never blend over '
+      'the ancestor base', (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -939,7 +1046,7 @@ void main() {
 
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder);
-    ZoomFallbackPainter(coverage: coverage, manager: manager)
+    ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 2)
         .paint(canvas, const Size(256, 256));
     final picture = recorder.endRecording();
     final image = picture.toImageSync(256, 256);
@@ -1012,8 +1119,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 700));
     expect(fallbackVisible(), isTrue,
         reason: 'still-missing covered cells are not deadline-bounded');
-    controller.moveTo(const LatLng(latitude: 0, longitude: 64),
-        animate: false);
+    controller.moveTo(const LatLng(latitude: 0, longitude: 64), animate: false);
     await _drain(tester, until: () => !fallbackVisible());
     expect(fallbackVisible(), isFalse,
         reason: 'regions retire when their cells leave the window');
