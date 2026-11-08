@@ -69,9 +69,15 @@ class ZoomFallbackCoverage {
   final TileManager manager;
 
   /// How many ancestor zooms above the grid zoom are searched for a base
-  /// crop. Level 1 (2× upscale) is preferred; deeper levels only fill in
-  /// when nearer ancestors were never retained.
-  static const int maxAncestorLevels = 3;
+  /// crop. The per-step handoff pins each generation's region sources, so
+  /// retained imagery survives across zoom steps — the search depth is
+  /// then what bounds coverage: repeated integer steps through blocked
+  /// replacements leave only the last content zoom retained, and a
+  /// z5→z9 walk is 4 levels (found-issue review 2026-11-08: search
+  /// stopped at 3 and holes appeared at z9). 6 covers a six-step walk;
+  /// deeper steps re-open coverage at the next reconcile over whatever
+  /// survived, always at bounded draw counts.
+  static const int maxAncestorLevels = 6;
 
   /// How many descendant zooms below the grid zoom refine the region.
   /// Descendants are sharper than the cell itself, so they overlay the

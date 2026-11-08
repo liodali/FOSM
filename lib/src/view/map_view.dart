@@ -1252,6 +1252,25 @@ class _MapViewState extends State<MapView>
     _zoomFallback?.clear();
   }
 
+  /// The regional fallback layer. The softened appearance (plan 09)
+  /// rides the same widget-level blur the zoom snapshot uses, bounded to
+  /// the fallback layer only — the live grid is never blurred. Disabled
+  /// on web (the snapshot's perf gate) and during direct manipulation,
+  /// identically to the snapshot itself.
+  Widget _zoomFallbackLayer(
+      ZoomFallbackCoverage coverage, TileManager manager, Size size) {
+    final child = CustomPaint(
+      size: size,
+      painter: ZoomFallbackPainter(coverage: coverage, manager: manager),
+    );
+    final softSigma = (kIsWeb || _interacting) ? 0.0 : _blurSigma;
+    if (softSigma <= 0.1) return child;
+    return ImageFiltered(
+      imageFilter: ui.ImageFilter.blur(sigmaX: softSigma, sigmaY: softSigma),
+      child: child,
+    );
+  }
+
   /// Per-region fallback settles publication-driven: every still-missing
   /// covered cell keeps its retained imagery until its own image
   /// publishes (or the cell leaves the window), independent of how long
@@ -2489,13 +2508,7 @@ class _MapViewState extends State<MapView>
                         // tiles blend against the plain-grid background.
                         if (fallbackActive)
                           Positioned.fill(
-                            child: CustomPaint(
-                              size: size,
-                              painter: ZoomFallbackPainter(
-                                coverage: coverage,
-                                manager: manager,
-                              ),
-                            ),
+                            child: _zoomFallbackLayer(coverage, manager, size),
                           ),
                         // ── Current tile grid ─
                         Positioned.fill(

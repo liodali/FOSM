@@ -137,6 +137,93 @@ bool _gridLoaded(WidgetTester tester) {
 }
 
 void main() {
+  testWidgets(
+      'the regional fallback keeps the snapshot softness until '
+      'publication', (tester) async {
+    tester.view.physicalSize = const ui.Size(360, 240);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final fetcher = _GatedFetcher();
+    final controller = MapController();
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: const LatLng(latitude: 0, longitude: 0),
+      zoom: 5,
+      enableFractionalZoom: true,
+      controller: controller,
+      tileFetcher: fetcher.call,
+    ))));
+    fetcher.deliverZoom(5);
+    await _drain(tester, until: () => _gridLoaded(tester));
+
+    // The blur is a compositor filter (ImageFiltered) riding the same
+    // recipe as the zoom snapshot; headless picture rasterization drops
+    // paint-level filters, so the pixel contract is verified in the
+    // structure: the blur layer wraps the fallback painter while it is
+    // active and leaves the stack with the coverage.
+
+    controller.setFractionalZoom(6.25, animate: false);
+    await tester.pump();
+
+    Finder fallbackPainterAncestor() {
+      return find.ancestor(
+        of: find.byWidgetPredicate(
+            (w) => w is CustomPaint && w.painter is ZoomFallbackPainter),
+        matching: find.byType(ImageFiltered),
+      );
+    }
+
+    expect(fallbackPainterAncestor(), findsOneWidget);
+
+    // The blocked z6 cells publish late; the blur rides the whole time,
+    // then disappears with the regions once everything is ready. The
+    // deterministic publish lever is the cache-return: stepping back to
+    // z5 re-serves the region-pinned tiles instantly.
+    controller.setFractionalZoom(5.0, animate: false);
+    await _drain(tester, until: () => _gridLoaded(tester));
+    expect(fallbackPainterAncestor(), findsNothing,
+        reason: 'with every visible tile sharp, the softness layer '
+            'retires with the coverage');
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets(
+      'repeated zoom steps keep coverage through the chain-pinned '
+      'ancestor handoff (z5 content, replacements blocked, z6–z9)',
+      (tester) async {
+    final fetcher = _GatedFetcher();
+    final manager = _smallManager(fetcher);
+    manager.calculate();
+    fetcher.deliverZoom(5);
+    await _drain(tester, until: () => manager.visibleTilesReady);
+
+    final coverage = ZoomFallbackCoverage(manager);
+    coverage.reconcile();
+    for (final target in [6, 7, 8, 9]) {
+      // Replacements blocked: every z6..z9 request stays pending, only
+      // the z5 content exists in the rendered cache. The step's regions
+      // must re-cover from it — the pin handoff keeps the sources alive
+      // and the ancestor search walks the retained chain.
+      manager.setZoom(target);
+      await _drain(tester);
+      coverage.reconcile();
+      expect(coverage.hasRegions, isTrue,
+          reason: 'stepping to z$target must keep coverage, not checkerboards');
+      for (final key in coverage.debugRegionKeys()) {
+        final sources = coverage.debugRegionSourceKeys(key);
+        // Depth can never exceed the search bound; the sources, drawn
+        // from one content zoom highway, must still be z5.
+        expect(sources.map((s) => s.split('/')[0]), everyElement('5'),
+            reason: 'z$target covered by the same z5 content: $sources');
+      }
+    }
+    coverage.dispose();
+    manager.dispose();
+  });
+
   testWidgets('zoom-in covers each missing cell with its parent region',
       (tester) async {
     final fetcher = _GatedFetcher();
