@@ -58,6 +58,17 @@ fi
 if [[ "${BENCHMARK_SPECULATION:-0}" == 1 ]]; then
   dash_args+=(--dart-define=fosm.vectorSpeculation=true)
 fi
+# Plan-06 deeper-ring revision arm: Chebyshev ring depth beyond the
+# padded grid (rings 2..N, fetched and decoded by the admitted job on the
+# background lane) and the per-generation budget. Inert unless
+# BENCHMARK_SPECULATION=1 is set alongside the ring knob, since the
+# defines only act through speculativePrepare.
+if [[ -n "${BENCHMARK_SPECULATION_RING:-}" ]]; then
+  dash_args+=(--dart-define=fosm.vectorSpeculationRing="$BENCHMARK_SPECULATION_RING")
+fi
+if [[ -n "${BENCHMARK_SPECULATION_BUDGET:-}" ]]; then
+  dash_args+=(--dart-define=fosm.vectorSpeculationBudget="$BENCHMARK_SPECULATION_BUDGET")
+fi
 # Plan-05 scheduler A/B overrides (defaults reproduce shipped pacing).
 if [[ -n "${BENCHMARK_WORK_BUDGET_MS:-}" ]]; then
   dash_args+=(--dart-define=fosm.workBudgetMs="$BENCHMARK_WORK_BUDGET_MS")
