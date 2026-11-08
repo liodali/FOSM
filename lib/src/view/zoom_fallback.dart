@@ -69,15 +69,13 @@ class ZoomFallbackCoverage {
   final TileManager manager;
 
   /// How many ancestor zooms above the grid zoom are searched for a base
-  /// crop. The per-step handoff pins each generation's region sources, so
-  /// retained imagery survives across zoom steps — the search depth is
-  /// then what bounds coverage: repeated integer steps through blocked
-  /// replacements leave only the last content zoom retained, and a
-  /// z5→z9 walk is 4 levels (found-issue review 2026-11-08: search
-  /// stopped at 3 and holes appeared at z9). 6 covers a six-step walk;
-  /// deeper steps re-open coverage at the next reconcile over whatever
-  /// survived, always at bounded draw counts.
-  static const int maxAncestorLevels = 6;
+  /// crop before falling back to the cross-step carry (see
+  /// [_carrySources]). Three nearest levels answer the common cases
+  /// directly; deeper chains — several integer steps over blocked
+  /// replacements — resolve through the carry instead of growing this
+  /// fixed bound, so a z5→z12 walk stays covered without moving the
+  /// cutoff (review round 2: depth 6 merely moved the z9 cutoff).
+  static const int maxAncestorLevels = 3;
 
   /// How many descendant zooms below the grid zoom refine the region.
   /// Descendants are sharper than the cell itself, so they overlay the
@@ -92,6 +90,17 @@ class ZoomFallbackCoverage {
   final Map<String, _FallbackRegion> _regions = {};
   int _lastReconciledRevision = -1;
   bool _disposed = false;
+
+  /// Geographic carry for one reconcile pass: the sources of the
+  /// regions that existed *before* this pass — the previous generation's
+  /// imagery. Their pins are still live during the pass (retired regions
+  /// release only after the new regions acquire their own), so every
+  /// carried image is guaranteed in-cache while looked up. Cleared at
+  /// the end of the pass; carries no pins of its own and never outlives
+  /// a reconcile, keeping ownership bounded to the visible missing
+  /// regions (plan 09 review 2: the chain of integer steps stays covered
+  /// at any depth instead of relying on a fixed ancestor cutoff).
+  Map<String, ui.Image>? _carrySources;
 
   /// Pin held across a zoom switch (see [beginZoomTransition]) and
   /// released by the next [reconcile] once region pins took over.
@@ -158,6 +167,26 @@ class ZoomFallbackCoverage {
     if (revision == _lastReconciledRevision) return;
     _lastReconciledRevision = revision;
 
+    // The cross-step carry: the previous generation's region sources,
+    // still held by their pins for the duration of this pass (release
+    // happens only after the new pins acquire). New cells look these up
+    // regardless of many levels the retained content sits deep, so a
+    // chain of integer zoom steps never falls out of the fixed ancestor
+    // window.
+    _carrySources = {};
+    for (final region in _regions.values) {
+      for (final key in region.sourceKeys) {
+        final parts = key.split('/');
+        if (parts.length != 3) continue;
+        final z = int.tryParse(parts[0]);
+        final x = int.tryParse(parts[1]);
+        final y = int.tryParse(parts[2]);
+        if (z == null || x == null || y == null || z < 0 || z > 30) continue;
+        final entry = _rawImageFor(manager, z, x, y);
+        if (entry != null) _carrySources![key] = entry.$2;
+      }
+    }
+
     // Current missing visible cells (off-world rows can never load and
     // never have imagery, so they are skipped like everywhere else).
     final missing = <String>{};
@@ -204,6 +233,7 @@ class ZoomFallbackCoverage {
     for (final region in retired) {
       region.release();
     }
+    _carrySources = null;
     if (changed) _version++;
   }
 
@@ -243,27 +273,36 @@ class ZoomFallbackCoverage {
         manager.pinRenderedImages(sourceKeys));
   }
 
-  /// Nearest retained ancestor of `(z, x, y)` within
-  /// [maxAncestorLevels]. Returns the cache key, image and level.
-  (String, ui.Image, int)? _nearestAncestor(
-      TileManager manager, int z, _TileCoord cell) {
-    for (var level = 1; level <= maxAncestorLevels; level++) {
-      final ancestorZoom = z - level;
-      if (ancestorZoom < 0) break;
-      final x = cell.x >> level;
-      final y = cell.y >> level;
-      final entry = _imageFor(manager, ancestorZoom, x, y);
-      if (entry != null) return (entry.$1, entry.$2, level);
+  /// Looks up a retained image for `(z, x, y)`: the grid's raw key, then
+  /// the wrapped-X canonical key — the antimeridian duplicate of a
+  /// retained tile depicts the same region — then the cross-step carry
+  /// (an exact match against the previous generation's sources, the
+  /// zoom-out side of the chain). Zooms beyond the manager's supported
+  /// range can never be cached, so they skip the wrap arithmetic (which
+  /// would overflow 32-bit web ints past 30).
+  (String, ui.Image)? _imageFor(TileManager manager, int z, int x, int y) {
+    if (z > 30 || z < 0) return null;
+    final rawKey = manager.renderTileKey(z, x, y);
+    final raw = manager.retainedImage(rawKey);
+    if (raw != null) return (rawKey, raw);
+    final n = 1 << z;
+    final wrappedX = ((x % n) + n) % n;
+    if (wrappedX != x) {
+      final wrappedKey = manager.renderTileKey(z, wrappedX, y);
+      final wrapped = manager.retainedImage(wrappedKey);
+      if (wrapped != null) return (wrappedKey, wrapped);
+    }
+    final carry = _carrySources;
+    if (carry != null && carry.containsKey('$z/$x/$y')) {
+      return ('$z/$x/$y', carry['$z/$x/$y']!);
     }
     return null;
   }
 
-  /// Looks up a retained image for `(z, x, y)`, first by the grid's raw
-  /// key convention, then by the wrapped-X canonical key — the antimeridian
-  /// duplicate of a retained tile depicts the same region. Zooms beyond
-  /// the manager's supported range can never be cached, so they skip the
-  /// wrap arithmetic (which would overflow 32-bit web ints past 30).
-  (String, ui.Image)? _imageFor(TileManager manager, int z, int x, int y) {
+  /// Raw cache-only lookup (no carry): reads the carry through `_imageFor`
+  /// during its own build, so the reconcile-time carry map must be built
+  /// from the direct cache to avoid feedback.
+  (String, ui.Image)? _rawImageFor(TileManager manager, int z, int x, int y) {
     if (z > 30 || z < 0) return null;
     final rawKey = manager.renderTileKey(z, x, y);
     final raw = manager.retainedImage(rawKey);
@@ -275,6 +314,49 @@ class ZoomFallbackCoverage {
     final wrapped = manager.retainedImage(wrappedKey);
     if (wrapped != null) return (wrappedKey, wrapped);
     return null;
+  }
+
+  /// Nearest retained ancestor of `(z, x, y)`: first the fixed shallow
+  /// window ([maxAncestorLevels]), then the cross-step carry — the
+  /// deepest carried source whose footprint contains the cell, however
+  /// many levels down the retained content sits.
+  (String, ui.Image, int)? _nearestAncestor(
+      TileManager manager, int z, _TileCoord cell) {
+    for (var level = 1; level <= maxAncestorLevels; level++) {
+      final ancestorZoom = z - level;
+      if (ancestorZoom < 0) break;
+      final x = cell.x >> level;
+      final y = cell.y >> level;
+      final entry = _rawImageFor(manager, ancestorZoom, x, y);
+      if (entry != null) return (entry.$1, entry.$2, level);
+    }
+    final carry = _carrySources;
+    if (carry == null || carry.isEmpty) return null;
+    // Deepest carried zoom whose footprint contains the cell wins.
+    int? bestLevel;
+    (String, ui.Image, int)? best;
+    for (final entry in carry.entries) {
+      final parts = entry.key.split('/');
+      final sourceZoom = int.tryParse(parts[0]);
+      final sourceX = int.tryParse(parts[1]);
+      final sourceY = int.tryParse(parts[2]);
+      if (sourceZoom == null ||
+          sourceX == null ||
+          sourceY == null ||
+          sourceZoom >= z ||
+          sourceZoom < 0) {
+        continue;
+      }
+      final level = z - sourceZoom;
+      if ((cell.x >> level) != sourceX || (cell.y >> level) != sourceY) {
+        continue;
+      }
+      if (best == null || level < bestLevel!) {
+        best = (entry.key, entry.value, level);
+        bestLevel = level;
+      }
+    }
+    return best;
   }
 
   void _refineWithChildren(
@@ -367,17 +449,28 @@ class _TileCoord {
 ///    a base sits underneath, so transparent descendant pixels never
 ///    blend over old-zoom imagery.
 ///
-/// A full-viewport opaque base is painted first: loaded replacement
+/// A full-viewport opaque base is painted first, unblurred: loaded replacement
 /// tiles draw above this layer in the widget stack, and transparent ones
 /// must blend against the same background the plain grid paints — never
-/// against stale old-zoom imagery.
+/// against stale old-zoom imagery. The gathered regions then each draw
+/// inside their own bounded layer ([Canvas.saveLayer]/`bounds` = the
+/// cell) carrying the zoom snapshot's gaussian sigma, so the softened
+/// look survives the handoff while each region's blur stays clipped to
+/// its own cell: neighboring ready tiles and uncovered areas never
+/// receive tint from a covered cell's bleed (plan 09 review round 2).
 ///
 /// While this painter is present the grid painter skips its background
 /// and placeholder passes, so the two never double-paint.
 class ZoomFallbackPainter extends CustomPainter {
+  /// The zoom snapshot's gaussian sigma — the softened appearance that
+  /// persists over the handoff (plan 09). Zero per-engine/gesture gates;
+  /// sub-0.1 is treated as off.
+  final double blurSigma;
+
   ZoomFallbackPainter({
     required this.coverage,
     required this.manager,
+    this.blurSigma = 0.0,
   })  : revision = manager.revision,
         canvasX = manager.leftColumnTilesCanvasX,
         canvasY = manager.topRowTilesCanvasY,
@@ -399,9 +492,23 @@ class ZoomFallbackPainter extends CustomPainter {
     ..filterQuality = FilterQuality.medium;
   static final Paint _basePaint = Paint()..color = const Color(0xFFF5F5F5);
 
+  /// One-shot layer paint per paint() with the bounded blur; content
+  /// inside the layer rasterizes crisply and blurs when the layer
+  /// composites, so per-region clipping stays exact.
+  Paint _layerPaint() {
+    final paint = Paint();
+    if (blurSigma > 0.1) {
+      paint.imageFilter =
+          ui.ImageFilter.blur(sigmaX: blurSigma, sigmaY: blurSigma);
+    }
+    return paint;
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
-    // Opaque base under everything (background parity + alpha guard).
+    // Opaque base under everything (background parity + alpha guard),
+    // unblurred: ready tiles and uncovered cells keep the plain
+    // background beneath them.
     canvas.drawRect(Offset.zero & size, _basePaint);
 
     final pad = manager.tilePadding;
@@ -411,6 +518,7 @@ class ZoomFallbackPainter extends CustomPainter {
     final originX = manager.leftColumnTilesCanvasX;
     final originY = manager.topRowTilesCanvasY;
     final tiles = manager.renderTiles;
+    final layerPaint = _layerPaint();
 
     for (var h = 0; h < manager.visibleHorizontalCount; h++) {
       for (var v = 0; v < manager.visibleVerticalCount; v++) {
@@ -433,6 +541,14 @@ class ZoomFallbackPainter extends CustomPainter {
 
         final region = coverage._region(tile.index);
         if (region == null) continue;
+
+        // Bounded per-region blur layer: the filter composites within
+        // the cell's bounds only — no imagery bleeds into a neighbouring
+        // ready tile's or uncovered cell's plain area, and the plain
+        // base beneath guarantees exact background isolation regardless
+        // of what the kernel leaves transparent at the layer edge.
+        canvas.saveLayer(
+            Rect.fromLTWH(cellX, cellY, tileW, tileH), layerPaint);
         final base = region.base;
         if (base != null) {
           _drawImageUnit(canvas, base, cellX, cellY, tileW, tileH);
@@ -461,6 +577,7 @@ class ZoomFallbackPainter extends CustomPainter {
           if (src.isEmpty) continue;
           canvas.drawImageRect(image, src, dst, _imagePaint);
         }
+        canvas.restore();
       }
     }
   }

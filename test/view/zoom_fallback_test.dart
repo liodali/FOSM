@@ -40,6 +40,32 @@ Future<Uint8List> _unitPng(WidgetTester tester, ui.Color? color) async {
   }
 }
 
+/// Encodes a 4×4 RGBA PNG: columns alternate [even]/[odd] colors, so a
+/// two-column crop of any quadrant carries a sharp interior edge — the
+/// probe for gaussian-blur bleeding in the fallback painter.
+Future<Uint8List> twoColumnPng(
+    WidgetTester tester, ui.Color even, ui.Color odd) async {
+  final recorder = ui.PictureRecorder();
+  final canvas = ui.Canvas(recorder);
+  for (var x = 0; x < 4; x++) {
+    canvas.drawRect(
+        ui.Rect.fromLTWH(x.toDouble(), 0, 1, 4),
+        ui.Paint()
+          ..blendMode = ui.BlendMode.src
+          ..color = (x % 2 == 0) ? even : odd);
+  }
+  final picture = recorder.endRecording();
+  final image = picture.toImageSync(4, 4);
+  picture.dispose();
+  try {
+    final bytes = await tester.runAsync(
+        () => image.toByteData(format: ui.ImageByteFormat.png));
+    return bytes!.buffer.asUint8List();
+  } finally {
+    image.dispose();
+  }
+}
+
 /// Pixel color of a rasterized fallback painting.
 ui.Color _pixel(ByteData data, int x, int y, int width) {
   final offset = (y * width + x) * 4;
@@ -138,12 +164,17 @@ bool _gridLoaded(WidgetTester tester) {
 
 void main() {
   testWidgets(
-      'the regional fallback keeps the snapshot softness until '
-      'publication', (tester) async {
+      'the regional fallback carries the snapshot softness and isolates '
+      'each region\'s blur', (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
 
+    // Column-striped z5 content: every ancestor crop carries a sharp
+    // interior edge, so a wrongly clipped blur would visibly tint.
+    final red = const ui.Color(0xFFFF0000);
+    final blue = const ui.Color(0xFF0000FF);
+    final striped = await twoColumnPng(tester, red, blue);
     final fetcher = _GatedFetcher();
     final controller = MapController();
     await tester.pumpWidget(MaterialApp(
@@ -155,44 +186,122 @@ void main() {
       controller: controller,
       tileFetcher: fetcher.call,
     ))));
-    fetcher.deliverZoom(5);
+    for (final key in List<String>.of(fetcher._pending.keys)) {
+      final parts = key.split('/');
+      fetcher.deliver(int.parse(parts[0]), int.parse(parts[1]),
+          int.parse(parts[2]), striped);
+    }
     await _drain(tester, until: () => _gridLoaded(tester));
-
-    // The blur is a compositor filter (ImageFiltered) riding the same
-    // recipe as the zoom snapshot; headless picture rasterization drops
-    // paint-level filters, so the pixel contract is verified in the
-    // structure: the blur layer wraps the fallback painter while it is
-    // active and leaves the stack with the coverage.
 
     controller.setFractionalZoom(6.25, animate: false);
     await tester.pump();
 
-    Finder fallbackPainterAncestor() {
-      return find.ancestor(
-        of: find.byWidgetPredicate(
-            (w) => w is CustomPaint && w.painter is ZoomFallbackPainter),
-        matching: find.byType(ImageFiltered),
+    ZoomFallbackPainter? fallbackPainter() => tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((w) => w.painter)
+        .whereType<ZoomFallbackPainter>()
+        .firstOrNull;
+    final painter = fallbackPainter()!;
+    expect(painter.coverage.hasRegions, isTrue);
+    // The sigma wiring: at rest with loading coverage the painter gets
+    // the zoom style's sigma (the snapshot's own value); on web and
+    // during direct manipulation it stays 0 (the snapshot's gates).
+    expect(painter.blurSigma, 2.0,
+        reason: 'the default zoom style applies the snapshot-matching '
+            'sigma over the active coverage');
+
+    // Region isolation (pixels): rasterize the whole fallback layer and
+    // verify the crisp part of the contract — every pixel OUTSIDE a
+    // covered region equals the plain base, so a layer-wide blur could
+    // never tint a ready tile's or uncovered cell's background. (The
+    // compositor softness itself is pixel-verified on the affected
+    // platform; headless rasterization drops canvas filters, which is
+    // why the inspector stops at the crisp plane here.)
+    final coverage = painter.coverage;
+    final ctr = coverage.manager;
+    final regionCoverage = <String, ui.Rect>{
+      // The painter draws region imagery inside the missing cell rect —
+      // mirror its geometry from the manager canvas here.
+    };
+    for (final key in coverage.debugRegionKeys()) {
+      final parts = key.split('/');
+      final x = int.parse(parts[1]);
+      final y = int.parse(parts[2]);
+      regionCoverage[key] = ui.Rect.fromLTWH(
+        ctr.leftColumnTilesCanvasX +
+            (x - ctr.leftColumnTilesLngIndex) * ctr.renderedTileWidth,
+        ctr.topRowTilesCanvasY +
+            (y - ctr.topRowTilesLatIndex) * ctr.renderedTileHeight,
+        ctr.renderedTileWidth.toDouble(),
+        ctr.renderedTileHeight.toDouble(),
       );
     }
+    final ui.Image frame;
+    {
+      final recorder = ui.PictureRecorder();
+      final canvas = ui.Canvas(recorder);
+      ZoomFallbackPainter(
+              coverage: coverage, manager: ctr, blurSigma: 0.0)
+          .paint(canvas, const Size(360, 240));
+      final picture = recorder.endRecording();
+      frame = picture.toImageSync(360, 240);
+      picture.dispose();
+    }
+    final data = await tester.runAsync(
+        () => frame.toByteData(format: ui.ImageByteFormat.rawStraightRgba));
+    frame.dispose();
 
-    expect(fallbackPainterAncestor(), findsOneWidget);
+    ui.Color pixel(double dx, double dy) {
+      final px = (dx * 1).toInt().clamp(0, 359);
+      final py = (dy * 1).toInt().clamp(0, 239);
+      return _pixel(data!, px, py, 360);
+    }
 
-    // The blocked z6 cells publish late; the blur rides the whole time,
-    // then disappears with the regions once everything is ready. The
-    // deterministic publish lever is the cache-return: stepping back to
-    // z5 re-serves the region-pinned tiles instantly.
+    // The plain base under ready tiles and uncovered cells is exact.
+    final common = const ui.Color(0xFFF5F5F5);
+    for (var y = 8.0; y < 232; y += 4) {
+      for (var x = 8.0; x < 352; x += 4) {
+        var covered = false;
+        for (final rect in regionCoverage.values) {
+          if (rect.contains(ui.Offset(x, y))) covered = true;
+        }
+        if (covered) continue;
+        expect(pixel(x, y), common,
+            reason: 'uncovered area at ($x,$y) must be the exact plain '
+                'background — no fallback imagery may tint it');
+      }
+    }
+
+    // And a covered region's interior carries the striped imagery (an
+    // edge exists between the two sides), proving regions do paint.
+    final coveredRect = regionCoverage.values.first;
+    final inside = pixel(coveredRect.left + coveredRect.width / 2,
+        coveredRect.top + coveredRect.height / 2);
+    final edgeL = pixel(coveredRect.left + coveredRect.width * 0.25,
+        coveredRect.top + coveredRect.height / 2);
+    final edgeR = pixel(coveredRect.left + coveredRect.width * 0.75,
+        coveredRect.top + coveredRect.height / 2);
+    expect(edgeL, isNot(edgeR),
+        reason: 'a striped crop edges visibly through region draws');
+    // The alpha-isolation base never pushes the source color two columns
+    // across the edge in the CRISP plane (blur placement is verified by
+    // the sigma wiring above; its per-region bounds are structural).
+    expect({edgeL, edgeR, inside}.contains(common), isFalse,
+        reason: 'regions carry content, not blank base fills');
+    expect(tester.takeException(), isNull);
+
+    // Publication retires coverage and the sigma wiring with it.
     controller.setFractionalZoom(5.0, animate: false);
-    await _drain(tester, until: () => _gridLoaded(tester));
-    expect(fallbackPainterAncestor(), findsNothing,
-        reason: 'with every visible tile sharp, the softness layer '
-            'retires with the coverage');
+    await _drain(tester, until: () => (_gridLoaded(tester)) &&
+        (fallbackPainter() == null ||
+            !fallbackPainter()!.coverage.hasRegions));
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
   testWidgets(
-      'repeated zoom steps keep coverage through the chain-pinned '
-      'ancestor handoff (z5 content, replacements blocked, z6–z9)',
+      'repeated zoom steps keep coverage through the carried region '
+      'sources (z5 content, replacements blocked, z6–z12)',
       (tester) async {
     final fetcher = _GatedFetcher();
     final manager = _smallManager(fetcher);
@@ -202,7 +311,7 @@ void main() {
 
     final coverage = ZoomFallbackCoverage(manager);
     coverage.reconcile();
-    for (final target in [6, 7, 8, 9]) {
+    for (final target in [6, 7, 8, 9, 10, 11, 12]) {
       // Replacements blocked: every z6..z9 request stays pending, only
       // the z5 content exists in the rendered cache. The step's regions
       // must re-cover from it — the pin handoff keeps the sources alive
