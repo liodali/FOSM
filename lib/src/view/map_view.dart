@@ -1182,9 +1182,18 @@ class _MapViewState extends State<MapView>
       // tiles. Measurement-only define until plan-06 acceptance is met;
       // the runtime provides the label-skipping decode variant and the
       // promotion callback below arranges labels when the pre-rendered
-      // image enters the viewport.
+      // image enters the viewport. Ring depth and budget define knobs
+      // drive the deeper-ring revision arm (rings beyond the padded
+      // grid, whose bytes the admitted job fetches itself); both stay
+      // inert unless speculation is on.
       speculativePrepare:
           runtime != null && TileManager.speculativeEnabledByDefine,
+      speculativeRingDepth: TileManager.speculativeRingDepthByDefine > 1
+          ? TileManager.speculativeRingDepthByDefine
+          : 1,
+      maxSpeculativePrepares: TileManager.speculativeBudgetByDefine > 0
+          ? TileManager.speculativeBudgetByDefine
+          : 12,
       speculativeDecoder: runtime?.speculativeDecoder,
       cameraBounds: widget.cameraBounds,
       maxRenderedCacheBytes: widget.maxRenderedCacheBytes,

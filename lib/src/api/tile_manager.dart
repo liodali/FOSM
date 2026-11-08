@@ -79,6 +79,23 @@ class TileManager with CacheTiles {
   static const bool speculativeEnabledByDefine =
       bool.fromEnvironment('fosm.vectorSpeculation');
 
+  /// Experiment knob for the plan-06 deeper-ring revision: speculative
+  /// admission covers Chebyshev rings 1..N around the strict viewport
+  /// instead of the shipped nearest ring (N=1). Ring-2+ tiles lie outside
+  /// the padded grid, so admitting them also fetches their bytes on the
+  /// background lane — every admitted deep tile costs real network bytes,
+  /// bounded by [maxSpeculativePrepares] per camera generation. 0 keeps
+  /// the shipped ring 1.
+  static const int speculativeRingDepthByDefine =
+      int.fromEnvironment('fosm.vectorSpeculationRing');
+
+  /// Experiment knob for the per-generation speculative budget
+  /// ([maxSpeculativePrepares]). The deeper-ring arm needs a larger
+  /// budget so ring-2 tiles can be admitted after ring-1 saturates the
+  /// shipped 12. 0 keeps the constructor default.
+  static const int speculativeBudgetByDefine =
+      int.fromEnvironment('fosm.vectorSpeculationBudget');
+
   /// Whether to speculatively prepare nearest-ring vector padding tiles
   /// during idle time: their bytes are already cached bytes-only, and a
   /// speculative job runs the full parse → record → `toImage` pipeline so
@@ -96,8 +113,17 @@ class TileManager with CacheTiles {
 
   /// Upper bound on speculative decodes admitted per camera generation.
   /// Rendered images are ~256 KB each, so this is also the extra memory
-  /// bound for speculation while the camera rests.
+  /// bound for speculation while the camera rests. With ring depth ≥ 2 it
+  /// additionally bounds the deep-ring byte fetches (network use).
   final int maxSpeculativePrepares;
+
+  /// Chebyshev ring depth speculative admission covers around the strict
+  /// viewport: 1 prepares only the nearest ring (the padded grid's
+  /// bytes-only outline, the shipped behavior); 2+ extends admission to
+  /// tiles beyond the padded grid, whose bytes are fetched on the
+  /// background lane when the foreground is quiet. Values < 1 are
+  /// clamped to 1 at admission time.
+  final int speculativeRingDepth;
 
   /// Decoder used for speculative jobs instead of [TileDecoder] when set.
   /// The vector runtime provides a variant that skips label preparation
@@ -704,6 +730,7 @@ class TileManager with CacheTiles {
     this.preloadDebounce = const Duration(milliseconds: 500),
     this.speculativePrepare = false,
     this.maxSpeculativePrepares = 12,
+    this.speculativeRingDepth = 1,
     this.speculativeDecoder,
     this.cameraBounds,
     int maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
@@ -1274,7 +1301,8 @@ class TileManager with CacheTiles {
         }
         return false;
       }
-      final relevant = _renderIndex(job.key) != -1;
+      final relevant =
+          _renderIndex(job.key) != -1 || _speculativeOffGridLive(job);
       if (!relevant) {
         _queued.remove(job.key);
         _jobsByKey.remove(job.key);
@@ -1293,6 +1321,15 @@ class TileManager with CacheTiles {
   static bool _isForeground(_LoadJob job) =>
       job.jobClass == _JobClass.visible ||
       (job.jobClass == _JobClass.padding && !job.byteOnly);
+
+  /// Whether an off-grid speculative job may still run its resource or
+  /// presentation stage. Deep-ring (ring ≥ 2) tiles have no render-set
+  /// slot; their work stays live only while the camera generation that
+  /// admitted them has not revoked the key. Revocation therefore also
+  /// drains deep work at these gates instead of just relevance checks.
+  bool _speculativeOffGridLive(_LoadJob job) =>
+      job.jobClass == _JobClass.speculative &&
+      _speculativeKeys.contains(job.key);
 
   /// Cancels every admitted speculative job at a camera change. Queued
   /// load and presentation entries are dropped (in-flight key released),
@@ -1354,43 +1391,82 @@ class TileManager with CacheTiles {
     }
 
     final candidates = <_LoadJob>[];
-    final visibleH = _visibleHorizontalCount;
-    final visibleV = _visibleVerticalCount;
-    // Nearest ring: the immediate outline around the strict-viewport rect
-    // (Chebyshev ring distance 1 — sides and corners included).
-    for (var h = 0; h < horizontalTileCount; h++) {
-      final ringH = h < tilePadding
-          ? tilePadding - h
-          : (h >= tilePadding + visibleH
-              ? h - (tilePadding + visibleH - 1)
-              : 0);
-      for (var v = 0; v < verticalTileCount; v++) {
-        final ringV = v < tilePadding
-            ? tilePadding - v
-            : (v >= tilePadding + visibleV
-                ? v - (tilePadding + visibleV - 1)
-                : 0);
-        if (ringH > 1 || ringV > 1 || (ringH == 0 && ringV == 0)) continue;
-        final tileLngIndex = leftColumnTilesLngIndex + h;
-        final tileLatIndex = topRowTilesLatIndex + v;
-        if (!_isValidWorld(zoom, tileLatIndex)) continue;
-        final key = _key(zoom, tileLngIndex, tileLatIndex);
+    final ringByKey = <String, int>{};
+    // A shallow-ring tile still waiting for its byte-only preload: while
+    // any exists, deeper rings are deferred (admission expands shell by
+    // shell even across pumps — see the byte check in the scan).
+    var ring1Pending = false;
+    // Ring distance is measured from the strict-viewport rect (Chebyshev
+    // ring distance 1 — sides and corners included). Depth 1 keeps the
+    // shipped behavior exactly: only tiles of the nearest outline, and
+    // only ones whose bytes are already cached. Depth ≥ 2 extends the
+    // scan beyond the padded grid; those tiles' bytes are fetched by the
+    // admitted job itself on the background lane (never on the visible
+    // path), still bounded by the per-generation budget.
+    final depth = speculativeRingDepth < 1 ? 1 : speculativeRingDepth;
+    final zoomWorld = 1 << zoom;
+    final visibleLeftLng = leftColumnTilesLngIndex + tilePadding;
+    final visibleTopLat = topRowTilesLatIndex + tilePadding;
+    final visibleRightLng = visibleLeftLng + _visibleHorizontalCount - 1;
+    final visibleBottomLat = visibleTopLat + _visibleVerticalCount - 1;
+    final scanMinX = visibleLeftLng - depth;
+    final scanMaxX = visibleRightLng + depth;
+    final scanMinY = visibleTopLat - depth;
+    final scanMaxY = visibleBottomLat + depth;
+    for (var x = scanMinX; x <= scanMaxX; x++) {
+      // Deep-ring scans reach past the world edge; a wrapped duplicate
+      // would admit the same content twice. The grid-based ring-1 slots
+      // are clipped by the grid itself.
+      if (x < 0 || x >= zoomWorld) continue;
+      final xRing = x < visibleLeftLng
+          ? visibleLeftLng - x
+          : (x > visibleRightLng ? x - visibleRightLng : 0);
+      for (var y = scanMinY; y <= scanMaxY; y++) {
+        final yRing = y < visibleTopLat
+            ? visibleTopLat - y
+            : (y > visibleBottomLat ? y - visibleBottomLat : 0);
+        final ring = xRing > yRing ? xRing : yRing;
+        if (ring == 0 || ring > depth) continue;
+        if (!_isValidWorld(zoom, y)) continue;
+        final key = _key(zoom, x, y);
         if (_visibleKeys.contains(key)) continue;
-        if (_speculativeKeys.contains(key) || _inFlight.contains(key)) continue;
-        if (_queued.contains(key)) continue;
         if (_memoryCache.containsKey(key)) continue;
         if (_loadFailures[key]?.isRetryable == false) continue;
-        if (_failedUntil[key] != null) continue;
-        final resource = _resourceKey(zoom, tileLngIndex, tileLatIndex);
-        if (_byteCache[resource] == null) continue;
-        final dx = tileLngIndex - centerTileLng;
-        final dy = tileLatIndex - centerTileLat;
+        if (_failedUntil[key] != null) {
+          // Backoff: a scheduled retry may still resolve this shallow
+          // tile this generation, so deeper rings keep waiting behind it.
+          if (ring < 2) ring1Pending = true;
+          continue;
+        }
+        final resource = _resourceKey(zoom, x, y);
+        // Ring-1 tiles are bytes-only preloads of the padded grid: their
+        // bytes arrive with the grid rebuild, so admission only ever
+        // decodes them. Deep tiles have no preload job — the admitted job
+        // fetches the bytes itself.
+        if (_byteCache[resource] == null && ring < 2) {
+          ring1Pending = true;
+          continue;
+        }
+        if (_speculativeKeys.contains(key)) continue;
+        if (_inFlight.contains(key) || _queued.contains(key)) {
+          // Unsettled shallow work of any stage (a byte-only preload
+          // finishing, a presentation landing) keeps the deeper rings
+          // deferred — the microtask gap between its bytes arriving and
+          // its job's in-flight release must not hand the budget to a
+          // deep tile. Admitted speculative keys are filtered above;
+          // settled tiles were filtered by the image check.
+          if (ring < 2) ring1Pending = true;
+          continue;
+        }
+        final dx = x - centerTileLng;
+        final dy = y - centerTileLat;
+        ringByKey[key] = ring;
         candidates.add(_LoadJob(
           key: key,
           resourceKey: resource,
           z: zoom,
-          x: tileLngIndex,
-          y: tileLatIndex,
+          x: x,
+          y: y,
           generation: _generation,
           jobClass: _JobClass.speculative,
           distance: dx * dx + dy * dy,
@@ -1402,7 +1478,22 @@ class TileManager with CacheTiles {
       _trace('admit: no candidates (bytes pending?)');
       return;
     }
-    candidates.sort((a, b) => a.distance.compareTo(b.distance));
+    if (ring1Pending) {
+      _trace('admit: shallow ring pending, deep deferred');
+      candidates.removeWhere((job) => (ringByKey[job.key] ?? 1) > 1);
+      if (candidates.isEmpty) return;
+    }
+    // Admission expands shell by shell: every ring-1 tile outranks any
+    // deeper tile even when the deeper edge is metrically closer than a
+    // ring-1 corner. Ties break by key so the order never depends on
+    // List.sort's instability.
+    candidates.sort((a, b) {
+      final r = (ringByKey[a.key] ?? 0).compareTo(ringByKey[b.key] ?? 0);
+      if (r != 0) return r;
+      final d = a.distance.compareTo(b.distance);
+      if (d != 0) return d;
+      return a.key.compareTo(b.key);
+    });
     final admittedNames = <String>[];
     for (final job in candidates) {
       if (_speculativeAdmitted >= maxSpeculativePrepares) break;
@@ -1556,7 +1647,9 @@ class TileManager with CacheTiles {
     // The tile may have scrolled off screen between queueing and starting.
     // Adjacent-zoom preloads target tiles outside the render set on purpose,
     // so they bypass this check.
-    if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
+    if (job.jobClass != _JobClass.adjacentZoom &&
+        !_speculativeOffGridLive(job) &&
+        _renderIndex(job.key) == -1) {
       return false;
     }
 
@@ -1756,7 +1849,9 @@ class TileManager with CacheTiles {
     if (_disposed) return false;
     // A resource that finished after the camera moved keeps its bytes but
     // must not occupy the newest presentation queue.
-    if (job.jobClass != _JobClass.adjacentZoom && _renderIndex(job.key) == -1) {
+    if (job.jobClass != _JobClass.adjacentZoom &&
+        !_speculativeOffGridLive(job) &&
+        _renderIndex(job.key) == -1) {
       return false;
     }
     _presentQueue.add(
@@ -1785,6 +1880,7 @@ class TileManager with CacheTiles {
       final entry = _presentQueue.removeAt(0);
       final job = entry.job;
       if (job.jobClass != _JobClass.adjacentZoom &&
+          !_speculativeOffGridLive(job) &&
           _renderIndex(job.key) == -1) {
         _inFlight.remove(job.key);
         continue;
@@ -1930,7 +2026,7 @@ class TileManager with CacheTiles {
       final job = entry.job;
       final stale = job.jobClass == _JobClass.adjacentZoom
           ? job.generation != _generation
-          : _renderIndex(job.key) == -1;
+          : _renderIndex(job.key) == -1 && !_speculativeOffGridLive(job);
       if (stale) {
         _inFlight.remove(job.key);
         if (job.jobClass == _JobClass.speculative) {
@@ -1996,8 +2092,7 @@ class TileManager with CacheTiles {
       // regular decoder serves both classes.
       final decode = job.jobClass == _JobClass.speculative
           ? (speculativeDecoder ?? _decoder)
-          : _decoder;
-      final image = scheduler != null && !decoderOwnsImageScheduling
+          : _decoder;      final image = scheduler != null && !decoderOwnsImageScheduling
           ? await scheduler.image(
               () => decode(bytes, job.z, job.x, job.y),
               priority: () => tileDecodePriority(job.z, job.x, job.y),
@@ -2574,9 +2669,11 @@ enum _JobClass {
   /// Adjacent zoom level preload (bytes only).
   adjacentZoom,
 
-  /// Idle-time full-pipeline preparation of a bytes-cached vector padding
-  /// tile (plan 06). Never outranks foreground work: admission requires a
-  /// quiet foreground, and it travels the background lane.
+  /// Idle-time full-pipeline preparation of a vector tile: ring-1 works
+  /// on an already bytes-cached padding tile; deep-ring (ring ≥ 2, plan-06
+  /// revision arm) fetches the bytes itself. Never outranks foreground
+  /// work: admission requires a quiet foreground, and it travels the
+  /// background lane.
   speculative,
 }
 

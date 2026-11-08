@@ -2960,6 +2960,10 @@ void main() {
       final visibleV = paddedV - 2;
       final ringCount = paddedH * paddedV - visibleH * visibleV;
       await _settleUntil(tester, () => counts.spec >= ringCount);
+      // Drain the presentation lane so every ring image is actually in the
+      // rendered cache before the promotion assertions.
+      await _settleUntil(
+          tester, () => manager.pendingPresentationCount == 0);
 
       // Only strict-viewport tiles ever reach the regular decoder.
       expect(counts.regularCount, lessThanOrEqualTo(visibleH * visibleV));
@@ -2970,13 +2974,17 @@ void main() {
       expect(withImage, lessThanOrEqualTo(visibleH * visibleV),
           reason: 'offscreen speculative images must wait in the cache');
 
-      // Admitted ring tiles are decode-relevant and rank below visible.
+      // Completed speculative work releases its relevance extension — its
+      // image now lives in the rendered cache, so nothing in-flight needs
+      // the extension any more.
       final ringLng = manager.leftColumnTilesLngIndex + 1;
+      expect(manager.isTileRelevant(3, ringLng, manager.topRowTilesLatIndex),
+          isFalse,
+          reason: 'a fully drained speculative ring reads coverage from '
+              'the cache, not from an admitted decode');
+      // Ranking is static: visible outranks the ring slot either way.
       final centreLng = manager.leftColumnTilesLngIndex + 1 + visibleH ~/ 2;
       final centreLat = manager.topRowTilesLatIndex + 1 + visibleV ~/ 2;
-      expect(manager.isTileRelevant(3, ringLng, manager.topRowTilesLatIndex),
-          isTrue,
-          reason: 'admitted speculative tiles stay decode-relevant');
       expect(
           manager.tileDecodePriority(3, centreLng, centreLat),
           greaterThan(manager.tileDecodePriority(
@@ -3245,14 +3253,10 @@ void main() {
 
       // The tile becomes visible while its decode is parked: the manager
       // deduplicates the foreground demand against the running job.
-      final panLat = tileY2Lat(int.parse(parts[2]) + 0.5, 3);
-      final panLng = tileX2Lng(int.parse(parts[1]) + 0.5, 3);
-      // ignore: avoid_print
-      print('PANDBG target x=${parts[1]} y=${parts[2]} '
-          'lat=$panLat lng=$panLng before=(${manager.centerTileLng}, ${manager.centerTileLat})');
-      manager.setCenterTile(latLng: LatLng(latitude: panLat, longitude: panLng));
-      // ignore: avoid_print
-      print('PANDBG after=(${manager.centerTileLng}, ${manager.centerTileLat})');
+      manager.setCenterTile(
+          latLng: LatLng(
+              latitude: tileY2Lat(int.parse(parts[2]) + 0.5, 3),
+              longitude: tileX2Lng(int.parse(parts[1]) + 0.5, 3)));
       manager.calculate();
       expect(
           manager.isTileRelevant(3, int.parse(parts[1]), int.parse(parts[2])),
@@ -3275,6 +3279,186 @@ void main() {
       expect(promoted, isNot(contains(renderKey)),
           reason: 'a freshly decoded visible tile publishes directly, not '
               'through the cache-promotion callback');
+      manager.dispose();
+    });
+
+    testWidgets(
+        'deeper ring: ring-2 tiles are fetched, decoded into the cache '
+        'and promoted synchronously like ring-1', (tester) async {
+      final fetchLog = <String>[];
+      Future<Uint8List> loggingFetcher(int z, int x, int y) async {
+        fetchLog.add('$z/$x/$y');
+        return fakeTilePng;
+      }
+
+      final counts = _SpecCounts();
+      final promoted = <String>[]; // z/x/y promotions from the cache
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: loggingFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        speculativeRingDepth: 2,
+        maxSpeculativePrepares: 24,
+      );
+      manager.onTileServedFromCache =
+          (z, x, y, bytes) => promoted.add('$z/$x/$y');
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Geometry at 256×256, z3, padding 1: the strict viewport is the
+      // 2×2 rect x/y ∈ {3,4}; grid covers {2..5}; tile (1,4) sits one
+      // column beyond the grid — a Chebyshev ring-2 tile with no
+      // bytes-only preload of its own.
+      final deepX = manager.leftColumnTilesLngIndex - 1;
+      const deepY = 4;
+      expect(deepX, 1,
+          reason: 'the fixture geometry must expose the expected '
+              'ring-2 coordinate');
+      expect(manager.renderTiles.where((t) => t.index == '3/$deepX/$deepY'),
+          isEmpty,
+          reason: 'the deep tile is outside the padded grid');
+
+      // Ring-1 saturates first (12 tiles), then the budget admits
+      // nearest-first deep tiles including the western edge (1,4).
+      await _settleUntil(
+          tester, () => counts.calls.contains('spec:3/$deepX/$deepY'));
+      expect(fetchLog.where((c) => c == '3/$deepX/$deepY'), hasLength(1),
+          reason: 'the deep tile has no preload job: its bytes must come '
+              'from one background fetch by the admitted job itself');
+      // Drain the presentation lane: `specInside` proves the decodes were
+      // entered, not that their `ui.Image` work resolved — a pending
+      // engine decode whose tile got revoked by the pan below would abort
+      // its result instead of publishing it.
+      await _settleUntil(
+          tester, () => manager.pendingPresentationCount == 0);
+      await tester.pump();
+
+      // Pan one deep tile west so it becomes visible: the pre-rendered
+      // image must serve it synchronously with the cached-byte payload,
+      // exactly like a ring-1 promotion.
+      manager.setCenterTile(
+          latLng: LatLng(
+              latitude: tileY2Lat(deepY + 0.5, 3),
+              longitude: tileX2Lng(deepX + 0.5, 3)));
+      manager.calculate();
+      expect(promoted, contains('3/$deepX/$deepY'),
+          reason: 'the deep tile must promote from the rendered cache');
+      expect(counts.calls.where((c) => c == 'reg:3/$deepX/$deepY'), isEmpty,
+          reason: 'promotion must not re-decode a pre-rendered deep tile');
+      manager.dispose();
+    });
+
+    testWidgets('ring-1 saturates the budget before any deep tile',
+        (tester) async {
+      final counts = _SpecCounts();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        // Ship-default budget, depth 2: ring 1 has exactly 12 candidates
+        // in this geometry, so a distance-only sort would push out ring-1
+        // corners in favour of metrically closer ring-2 edges.
+        speculativeRingDepth: 2,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      await _settleUntil(tester, () => counts.spec >= 12);
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      });
+      expect(counts.spec, 12,
+          reason: 'the per-generation budget bounds total speculative '
+              'work, and ring 1 consumes it entirely here');
+
+      int ringOf(String call) {
+        final parts = call.substring('spec:'.length).split('/');
+        final x = int.parse(parts[1]);
+        final y = int.parse(parts[2]);
+        final left = manager.leftColumnTilesLngIndex + 1;
+        final top = manager.topRowTilesLatIndex + 1;
+        final right = left + (manager.horizontalTileCount - 2) - 1;
+        final bottom = top + (manager.verticalTileCount - 2) - 1;
+        final dx = x < left ? left - x : (x > right ? x - right : 0);
+        final dy = y < top ? top - y : (y > bottom ? y - bottom : 0);
+        return dx > dy ? dx : dy;
+      }
+
+      for (final call in counts.calls.where((c) => c.startsWith('spec:'))) {
+        expect(ringOf(call), 1,
+            reason: '$call: admission expands shell by shell — no deep '
+                'tile may outrank a ring-1 tile that still lacks an image');
+      }
+      manager.dispose();
+    });
+
+    testWidgets('a camera change revokes in-flight deep-ring fetches',
+        (tester) async {
+      // The deep tile's byte fetch is parked by the fetch gate so the
+      // job is in flight (not queued, not decoding) across the pan.
+      final counts = _SpecCounts();
+      final fetchGate = Completer<void>();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: (z, x, y) {
+          if (z == 3 && x == 1 && y == 4) {
+            return fetchGate.future.then((_) => fakeTilePng);
+          }
+          return _fakeFetcher(z, x, y);
+        },
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        speculativePrepare: true,
+        speculativeRingDepth: 2,
+        maxSpeculativePrepares: 24,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      // Ring-1 decodes flow; the ring-2 tile's fetch waits on the gate,
+      // observable through its relevance extension until the camera
+      // generation revokes it.
+      await _settleUntil(tester, () => counts.spec >= 12);
+      expect(manager.isTileRelevant(3, 1, 4), isTrue,
+          reason: 'the in-flight deep fetch holds its relevance extension');
+
+      manager.setCenterTile(
+          latLng: const LatLng(latitude: 60, longitude: 120));
+      manager.calculate();
+      expect(manager.isTileRelevant(3, 1, 4), isFalse,
+          reason: 'revocation drops deep work exactly like ring-1 work');
+
+      // The fetch resolves after the revocation: the bytes are welcome in
+      // the byte cache, but no decode may run for a slain key.
+      await tester.runAsync(() async => fetchGate.complete());
+      await tester.runAsync(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pump();
+      expect(counts.calls.where((c) => c == 'spec:3/1/4'), isEmpty,
+          reason: 'a revoked deep fetch must not decode');
       manager.dispose();
     });
   });
