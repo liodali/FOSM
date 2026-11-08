@@ -451,8 +451,9 @@ void main() {
     manager.dispose();
   });
 
-  testWidgets('suspend drops coverage until the grid window changes',
-      (tester) async {
+  testWidgets(
+      'clear() invalidates coverage; the next reconcile rebuilds it from '
+      'retained imagery', (tester) async {
     final fetcher = _GatedFetcher();
     final manager = _smallManager(fetcher);
     manager.calculate();
@@ -465,19 +466,14 @@ void main() {
     coverage.reconcile();
     expect(coverage.regionCount, greaterThan(0));
 
-    coverage.suspend();
-    expect(coverage.hasRegions, isFalse);
-    // Content-only changes (a late tile arriving) must not resurrect it.
-    final arriving = manager.renderTiles.first;
-    fetcher.deliver(6, arriving.lngIndex, arriving.latIndex);
-    await _drain(tester, until: () => arriving.sourceTile != null);
-    coverage.reconcile();
+    // Explicit invalidation (camera command / pressure path) drops every
+    // region and releases their pins.
+    coverage.clear();
     expect(coverage.hasRegions, isFalse);
 
-    // A grid membership change re-enables coverage for missing cells.
-    manager.setCenterFromTileCoords(
-        manager.centerTileLng + 2, manager.centerTileLat);
-    manager.calculate();
+    // The next reconcile rebuilds coverage for still-missing cells from
+    // whatever imagery is still retained — content-only changes and
+    // camera moves are handled the same publication-driven way.
     await _drain(tester);
     coverage.reconcile();
     expect(coverage.regionCount, greaterThan(0));
@@ -541,7 +537,8 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('settle timeout suspends fallback for still-missing cells',
+  testWidgets(
+      'a settle deadline keeps covered cells until their own tiles publish',
       (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;
@@ -562,32 +559,45 @@ void main() {
     fetcher.deliverZoom(5);
     await _drain(tester, until: () => _gridLoaded(tester));
 
+    ZoomFallbackPainter? fallbackPainter() => tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((widget) => widget.painter)
+        .whereType<ZoomFallbackPainter>()
+        .toList()
+        .cast<ZoomFallbackPainter?>()
+        .firstOrNull;
+
     controller.setFractionalZoom(6.25, animate: false);
     await tester.pump();
-
-    final coverage = tester
-        .widgetList<CustomPaint>(find.byType(CustomPaint))
-        .map((widget) => widget.painter)
-        .whereType<ZoomFallbackPainter>()
-        .single
-        .coverage;
+    final coverage = fallbackPainter()!.coverage;
     expect(coverage.regionCount, greaterThan(0));
 
-    // Nothing arrives at z6 — the settle timeout drops the coverage and
-    // the zero-budget cache disposes the unpinned old imagery.
+    // Pump well past the old settle deadline: nothing may gather the
+    // coverage (plan 09: a timeout must not discard valid coverage while
+    // its replacement is still pending) — the pinned imagery keeps the
+    // regions alive even under the zero-budget cache.
     await tester.pump(const Duration(milliseconds: 700));
-    final fallbackPainters = tester
-        .widgetList<CustomPaint>(find.byType(CustomPaint))
-        .map((widget) => widget.painter)
-        .whereType<ZoomFallbackPainter>()
-        .toList();
-    expect(fallbackPainters, isEmpty);
+    expect(fallbackPainter(), isNotNull,
+        reason: 'covered still-missing cells must stay painted past the '
+            'old deadline');
+    expect(coverage.regionCount, greaterThan(0));
+    expect(tester.takeException(), isNull);
+
+    // Publication-driven retirement, driven through the pinned imagery
+    // itself: stepping back to z5 re-serves the region-pinned parents as
+    // instant cache hits, every visible cell publishes, and the covered
+    // regions retire — no deadline needed at any point.
+    controller.setFractionalZoom(5.0, animate: false);
+    await _drain(tester, until: () => fallbackPainter() == null);
+    expect(fallbackPainter(), isNull,
+        reason: 'once every visible cell publishes, coverage retires');
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('programmatic instant pan settles its newly revealed fallback',
-      (tester) async {
+  testWidgets(
+      'pan-revealed coverage persists past the old deadline until '
+      'publication or window exit', (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.reset);
@@ -612,22 +622,29 @@ void main() {
         .whereType<ZoomFallbackPainter>()
         .isNotEmpty;
 
-    // Zoom with z6 blocked, then consume the zoom's own settle timeout.
+    // Zoom with z6 blocked; the old deadline passes without dropping the
+    // covered cells.
     controller.setFractionalZoom(6.25, animate: false);
     await tester.pump();
     expect(fallbackVisible(), isTrue);
     await tester.pump(const Duration(milliseconds: 700));
-    expect(fallbackVisible(), isFalse);
+    expect(fallbackVisible(), isTrue,
+        reason: 'still-missing coverage is not deadline-bounded');
 
-    // A programmatic pan reveals new cells; the window change re-enables
-    // coverage, and the post-move settle must bound it with a timeout.
-    // (12° ≈ two z6 tiles — the new cells' z5 parents stay cached.)
+    // A programmatic pan reveals new cells; their z5 parents stay cached,
+    // so they cover geographically, and again no deadline gathers them.
+    // (12° ≈ two z6 tiles.)
     controller.moveTo(const LatLng(latitude: 0, longitude: 12), animate: false);
     await tester.pump();
     expect(fallbackVisible(), isTrue);
     await tester.pump(const Duration(milliseconds: 700));
-    expect(fallbackVisible(), isFalse,
-        reason: 'panned-to regions must settle, not retain imagery forever');
+    expect(fallbackVisible(), isTrue,
+        reason: 'panned-to regions keep coverage until their tiles '
+            'publish or the cells leave the window');
+
+    // Publication retires every region for real.
+    fetcher.deliverAllPending();
+    await _drain(tester, until: () => !fallbackVisible());
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -660,24 +677,26 @@ void main() {
 
     controller.setFractionalZoom(6.25, animate: false);
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 700));
-    expect(fallbackVisible(), isFalse);
 
-    // The animated pan re-enables coverage while it moves; the settle
-    // that bounds it fires only after the animation completes.
-    // (12° ≈ two z6 tiles — the window changes and parents stay cached.)
+    // Coverage persists across the entire animated pan and after it:
+    // nothing discards it, motion start/finish included (retirement is
+    // publication-driven now).
     controller.moveTo(const LatLng(latitude: 0, longitude: 12));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 175));
-    // Mid-animation: coverage follows the motion, no timeout yet.
-    // Finish the 350 ms pan. The completion continuation may land on
-    // either of the next frames in fake-async, so pump generously past
-    // the animation and past the settle deadline.
+    // Mid-animation.
+    expect(fallbackVisible(), isTrue,
+        reason: 'coverage must follow pan motion');
     await tester.pump(const Duration(milliseconds: 175));
     await tester.pump(const Duration(milliseconds: 700));
     await tester.pump(const Duration(milliseconds: 700));
-    expect(fallbackVisible(), isFalse,
-        reason: 'post-animation regions must settle, not persist forever');
+    expect(fallbackVisible(), isTrue,
+        reason: 'post-animation regions keep coverage until their tiles '
+            'publish or the cells leave the window');
+
+    // An arriving replacement retires them for real.
+    fetcher.deliverAllPending();
+    await _drain(tester, until: () => !fallbackVisible());
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -745,7 +764,7 @@ void main() {
     manager.dispose();
   });
 
-  testWidgets('an earlier settle timer cannot suspend fallback mid-pan',
+  testWidgets('a stale zoom deadline cannot drop fallback mid-pan',
       (tester) async {
     tester.view.physicalSize = const ui.Size(360, 240);
     tester.view.devicePixelRatio = 1.0;
@@ -773,28 +792,35 @@ void main() {
         .whereType<ZoomFallbackPainter>()
         .isNotEmpty;
 
-    // Zoom with z6 blocked: coverage appears and its settle timer arms.
+    // Zoom with z6 blocked: coverage appears.
     controller.setFractionalZoom(6.25, animate: false);
     await tester.pump();
     expect(fallbackVisible(), isTrue);
 
-    // A two-second pan starts. The stale zoom timer (600 ms) must not
-    // suspend coverage mid-motion. 3° is sub-tile at z6, so the grid
-    // window itself stays stable and cannot mask the suspension by
-    // re-enabling coverage.
+    // A two-second pan starts. A deadline landing mid-motion must not
+    // gather the coverage: there is no timeout discard at all now. 3° is
+    // sub-tile at z6, so the grid window itself stays stable and cannot
+    // mask anything by re-enabling coverage.
     controller.moveTo(const LatLng(latitude: 0, longitude: 3));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 700));
     expect(fallbackVisible(), isTrue,
-        reason: 'coverage must follow pan motion, not the stale timer');
+        reason: 'coverage must follow pan motion, not the stale deadline');
 
-    // Finish the pan; the completion settle bounds the coverage again
-    // (the completion continuation may land on a later frame, so pump
-    // generously past both the motion and the re-armed deadline).
+    // After the motion, waiting past every former deadline keeps the
+    // coverage; the published-or-window-exit contract decides when it
+    // ends. Panning the covered cells out of the window retires them:
+    // 64° ≈ nine z6 tiles, every covered cell exits westward.
     await tester.pump(const Duration(milliseconds: 1300));
     await tester.pump(const Duration(milliseconds: 700));
     await tester.pump(const Duration(milliseconds: 700));
-    expect(fallbackVisible(), isFalse);
+    expect(fallbackVisible(), isTrue,
+        reason: 'still-missing covered cells are not deadline-bounded');
+    controller.moveTo(const LatLng(latitude: 0, longitude: 64),
+        animate: false);
+    await _drain(tester, until: () => !fallbackVisible());
+    expect(fallbackVisible(), isFalse,
+        reason: 'regions retire when their cells leave the window');
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
   });

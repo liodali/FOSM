@@ -106,14 +106,36 @@ void main() {
       }
       expect(fallbackPinned, greaterThan(0));
       if (blocked) {
-        controller.moveTo(const LatLng(latitude: 0.1, longitude: 0),
+        // Plan 09: no timed discard. Region-pinned imagery stays alive
+        // past the old deadline; the old grid's unpinned padding ring is
+        // free to go at any point under the zero budget. The regions'
+        // pins release only when the covered cells leave the window
+        // (64° clears every covered cell westward; the new cells have
+        // no retained imagery to fall back on).
+        await tester.pump(const Duration(milliseconds: 650));
+        final pinnedParents = <ui.Image>{};
+        for (var h = 0; h < visH; h++) {
+          for (var v = 0; v < visV; v++) {
+            final tile = grid.tiles[(h + pad) * grid.verticalTileCount + pad + v];
+            if (tile.sourceTile != null) continue;
+            final parent = oldImages[
+                '5/${tile.lngIndex ~/ 2}/${tile.latIndex ~/ 2}'];
+            if (parent == null || parent.debugDisposed) continue;
+            pinnedParents.add(parent);
+          }
+        }
+        expect(pinnedParents, isNotEmpty,
+            reason: 'covered cells keep region-pinned parents past the '
+                'old deadline');
+        controller.moveTo(const LatLng(latitude: 0.1, longitude: 64),
             animate: false);
         await tester.pump(const Duration(milliseconds: 650));
       } else {
         await _ready(tester);
         await tester.pump();
       }
-      expect(oldImages.values.every((image) => image.debugDisposed), isTrue);
+      expect(oldImages.values.every((image) => image.debugDisposed), isTrue,
+          reason: 'retired regions release their pins exactly once');
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       // Let only the caller-owned fake fetch settle; MapView has already

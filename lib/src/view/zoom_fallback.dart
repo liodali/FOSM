@@ -85,8 +85,6 @@ class ZoomFallbackCoverage {
 
   final Map<String, _FallbackRegion> _regions = {};
   int _lastReconciledRevision = -1;
-  bool _suspended = false;
-  int _suspendedGridRevision = -1;
   bool _disposed = false;
 
   /// Pin held across a zoom switch (see [beginZoomTransition]) and
@@ -150,12 +148,6 @@ class ZoomFallbackCoverage {
 
   void _reconcileRegions() {
     final manager = this.manager;
-    if (_suspended) {
-      // A settle-timeout dropped the fallback for this grid window; a new
-      // window or zoom step (grid revision bump) re-enables it.
-      if (manager.gridRevision == _suspendedGridRevision) return;
-      _suspended = false;
-    }
     final revision = manager.revision;
     if (revision == _lastReconciledRevision) return;
     _lastReconciledRevision = revision;
@@ -326,11 +318,16 @@ class ZoomFallbackCoverage {
   }
 
   /// Releases every region. Used by camera commands and teardown paths
-  /// that invalidate the fallback outright; later reconciles may rebuild
-  /// regions for still-missing cells.
+  /// that invalidate the fallback outright (and by memory-pressure
+  /// eviction, via the view): later reconciles rebuild regions for
+  /// still-missing cells from whatever imagery is still retained.
   void clear() {
     _transitionRelease?.call();
     _transitionRelease = null;
+    // The next reconcile must re-evaluate even at the same grid/content
+    // revision: clearing is an explicit invalidation, not a paint-time
+    // identity change.
+    _lastReconciledRevision = 0;
     if (_regions.isEmpty) return;
     final regions = List<_FallbackRegion>.of(_regions.values);
     _regions.clear();
@@ -338,15 +335,6 @@ class ZoomFallbackCoverage {
       region.release();
     }
     _version++;
-  }
-
-  /// Drops coverage and keeps it dropped until the grid membership
-  /// changes (settle-timeout path): the still-missing cells fall back to
-  /// checkerboards instead of holding old imagery indefinitely.
-  void suspend() {
-    clear();
-    _suspended = true;
-    _suspendedGridRevision = manager.gridRevision;
   }
 
   void dispose() {

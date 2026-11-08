@@ -693,7 +693,6 @@ class _MapViewState extends State<MapView>
       widget.fractionalZoom != null;
   AnimationController? _fractionalController;
   ZoomFallbackCoverage? _zoomFallback;
-  Timer? _zoomFallbackTimer;
   double? _scaleStartCameraZoom;
   Offset? _lastFractionalFocal;
 
@@ -1036,7 +1035,6 @@ class _MapViewState extends State<MapView>
     widget.locationController?.removeListener(_onLocationChanged);
     _tileWorkScheduler?.dispose();
     _stopFractionalAnimation();
-    _cancelZoomFallbackTimer();
     _zoomFallback?.dispose();
     _zoomFallback = null;
     _styleCancel?.cancel('Map disposed');
@@ -1064,6 +1062,14 @@ class _MapViewState extends State<MapView>
     _tileManager?.handleMemoryPressure();
     _vectorRuntime?.handleMemoryPressure();
     _shapeGeometryCache.clear();
+    // Explicit pressure eviction: drop fallback coverage and its pins —
+    // its imagery is renderable state, so pressure must be able to take
+    // it back too. Still-missing cells fall to the placeholder until new
+    // imagery arrives; the next reconcile rebuilds regions from whatever
+    // survived (plan 09: bounded ownership, no retained historical
+    // viewports survive pressure).
+    _zoomFallback?.clear();
+    if (mounted) setState(() {});
   }
 
   /// Point-in-time attribution of this map's retained memory. Exposed
@@ -1243,54 +1249,32 @@ class _MapViewState extends State<MapView>
   }
 
   void _clearZoomFallback() {
-    _cancelZoomFallbackTimer();
     _zoomFallback?.clear();
   }
 
-  void _cancelZoomFallbackTimer() {
-    _zoomFallbackTimer?.cancel();
-    _zoomFallbackTimer = null;
-  }
-
-  /// Whether any animated camera motion currently owns the camera: an
-  /// animated pan/fling (or location-follow retarget), the fractional
-  /// zoom animation, or the two-phase integer zoom transition. A zoom
-  /// fallback settle timer armed before the motion must neither fire
-  /// mid-motion nor be re-armed by it — every motion's completion path
-  /// performs its own settle.
-  bool get _cameraMotionActive =>
-      _panController != null ||
-      (_fractionalController?.isAnimating ?? false) ||
-      _isAnimating;
-
+  /// Per-region fallback settles publication-driven: every still-missing
+  /// covered cell keeps its retained imagery until its own image
+  /// publishes (or the cell leaves the window), independent of how long
+  /// that takes. `_settleZoomFallback` therefore does not arm a
+  /// timeout-driven discard — plan 09: "a timer may settle camera
+  /// animation or report prolonged loading; it must not by itself
+  /// discard valid coverage". The tile-arrival loop already reconciles
+  /// (see [build]) and retires each region the moment its replacement
+  /// publishes.
+  ///
+  /// Full cleanup happens when every visible tile of the new window is
+  /// ready: with no missing cells left there is nothing to cover.
   void _settleZoomFallback() {
     final coverage = _zoomFallback;
     if (coverage == null) return;
-    // Regions must reflect the live grid even before a build ran, so the
-    // settle decision (and any timeout) sees the current coverage.
+    // Regions must reflect the live grid even before a build ran, so
+    // the readiness decision sees the current coverage.
     coverage.reconcile();
     if (!coverage.hasRegions) return;
-    if (_interacting || _cameraMotionActive) {
-      return;
-    }
     if (_newTilesReady()) {
       _clearZoomFallback();
       if (mounted) setState(() {});
-      return;
     }
-    _cancelZoomFallbackTimer();
-    _zoomFallbackTimer = Timer(_animWaitTimeout, () {
-      // Gesture input or a camera motion that started after this timer
-      // was armed owns the camera now: its end path re-settles.
-      if (!mounted || _interacting || _cameraMotionActive) return;
-      final current = _zoomFallback;
-      if (current == null || !current.hasRegions) return;
-      // Drop remaining regions (still-missing cells fall back to
-      // checkerboards) and keep the fallback suspended until the grid
-      // membership changes again.
-      current.suspend();
-      setState(() {});
-    });
   }
 
   void _applyContinuousZoom(TileManager manager, double value, Offset focal,
@@ -1336,7 +1320,6 @@ class _MapViewState extends State<MapView>
     _clearZoomSnapshot();
     _animWaitingTiles = false;
     _pinchTransitionActive = false;
-    _cancelZoomFallbackTimer();
     final origin =
         focal ?? Offset(manager.centerCanvasX, manager.centerCanvasY);
     if (!animate ||
@@ -1500,7 +1483,6 @@ class _MapViewState extends State<MapView>
     _stopFractionalAnimation();
     // A settle timer from an earlier zoom/pan must not suspend coverage
     // while this pan owns the camera; the completion path re-settles.
-    _cancelZoomFallbackTimer();
     final target = LatLng(
       latitude: clampLatitude(latLng.latitude),
       longitude: clampLongitude(latLng.longitude),
@@ -1584,7 +1566,6 @@ class _MapViewState extends State<MapView>
     _stopPanAnimation();
     // Fling motion owns the camera until it ends; any earlier settle
     // timer is stale (the fling's completion/stop path re-settles).
-    _cancelZoomFallbackTimer();
     final direction = velocity / speed;
     final start = Offset(manager.centerTileLng, manager.centerTileLat);
     final controller = AnimationController.unbounded(vsync: this);
@@ -1954,7 +1935,6 @@ class _MapViewState extends State<MapView>
     }
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _cancelZoomFallbackTimer();
     _interacting = false;
     // A fresh gesture starts with a clean coalescing slot so its first
     // update applies immediately.
@@ -2063,7 +2043,6 @@ class _MapViewState extends State<MapView>
     }
     _stopPanAnimation();
     _stopFractionalAnimation();
-    _cancelZoomFallbackTimer();
     _scaleStartTileLng = manager.centerTileLng;
     _scaleStartTileLat = manager.centerTileLat;
     final focal = _lastAppliedGestureFocal;
