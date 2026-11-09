@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/view/render.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// One retained source image and its geographic tile coordinate.
 ///
@@ -584,6 +585,9 @@ class ZoomFallbackPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Phase-12 attribution: duration span per repaint, tagged by whether
+    // this pass pays for per-region blur layers (spans arm only).
+    final spanStart = VectorSpanLog.enabled ? VectorSpanLog.nowUs() : 0;
     // Opaque base under everything (background parity + alpha guard),
     // unblurred: ready tiles and uncovered cells keep the plain
     // background beneath them.
@@ -634,6 +638,11 @@ class ZoomFallbackPainter extends CustomPainter {
               canvas, draw, cellX, cellY, tileW, tileH, layerPaint, true);
         }
       }
+    }
+    if (VectorSpanLog.enabled) {
+      VectorSpanLog.record('paint.fallback', null, spanStart,
+          VectorSpanLog.nowUs() - spanStart,
+          source: blurSigma > 0.1 ? 'blur' : 'plain');
     }
   }
 

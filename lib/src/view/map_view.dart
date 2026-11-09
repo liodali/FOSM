@@ -27,6 +27,7 @@ import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/common/memory_attribution.dart';
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/view/marker_layer.dart';
 import 'package:fosm/src/view/polyline_layer.dart';
@@ -1932,6 +1933,14 @@ class _MapViewState extends State<MapView>
   double get _blurSigma =>
       widget.zoomAnimationStyle == ZoomAnimationStyle.crossfade ? 5.0 : 2.0;
 
+  /// Phase-12 diagnostic arm (`--dart-define=fosm.blurDiagnosticOff=true`):
+  /// forces every zoom-transition blur off — the per-region fallback layers
+  /// and the old-grid overlay — while retaining identical imagery, opacity
+  /// and transforms, so paired captures can attribute blur/saveLayer raster
+  /// cost. Diagnostic only; never a product default.
+  static const _blurDiagnosticOff =
+      bool.fromEnvironment('fosm.blurDiagnosticOff');
+
   void _onAnimTick() {
     if (!mounted) return;
     _visualScale = _scaleAnimation?.value ?? 1.0;
@@ -2451,6 +2460,11 @@ class _MapViewState extends State<MapView>
 
     return LayoutBuilder(
       builder: (context, constraints) {
+        // Phase-12 attribution: per-invocation builder cost (widget
+        // construction + grid/fallback reconciliation) as a duration span
+        // (spans arm only).
+        final viewBuildStart =
+            VectorSpanLog.enabled ? VectorSpanLog.nowUs() : 0;
         final size = Size(constraints.maxWidth, constraints.maxHeight);
         final manager = _ensureManager(size);
 
@@ -2492,7 +2506,7 @@ class _MapViewState extends State<MapView>
           alignmentY.clamp(-1.0, 1.0),
         );
 
-        return Listener(
+        final tree = Listener(
           onPointerDown: _onPointerDown,
           onPointerUp: _onPointerUp,
           onPointerCancel: (event) {
@@ -2542,8 +2556,11 @@ class _MapViewState extends State<MapView>
                               painter: ZoomFallbackPainter(
                                 coverage: coverage,
                                 manager: manager,
-                                blurSigma:
-                                    (kIsWeb || _interacting) ? 0.0 : _blurSigma,
+                                blurSigma: (_blurDiagnosticOff ||
+                                        kIsWeb ||
+                                        _interacting)
+                                    ? 0.0
+                                    : _blurSigma,
                               ),
                             ),
                           ),
@@ -2585,7 +2602,8 @@ class _MapViewState extends State<MapView>
                             visualScale: _visualScale,
                             blurSigma: _blurSigma,
                             interactionSnapshot: _pinchTransitionActive,
-                            blurEnabled: !kIsWeb && !_interacting,
+                            blurEnabled:
+                                !kIsWeb && !_interacting && !_blurDiagnosticOff,
                           ),
                         ],
                       ],
@@ -2754,6 +2772,11 @@ class _MapViewState extends State<MapView>
             ),
           ),
         );
+        if (VectorSpanLog.enabled) {
+          VectorSpanLog.record('view.build', null, viewBuildStart,
+              VectorSpanLog.nowUs() - viewBuildStart);
+        }
+        return tree;
       },
     );
   }

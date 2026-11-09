@@ -1108,8 +1108,30 @@ class TileManager with CacheTiles {
   ///
   /// Only an actual membership change bumps [revision]/[generation] and
   /// rebuilds.
+  ///
+  /// Phase-12 attribution: when the span log is on, one `grid.anchor` or
+  /// `grid.membership` span is recorded per call — the anchor-only camera
+  /// refresh versus the full membership rebuild — so motion windows can
+  /// split grid reconciliation cost by path.
   void calculate() {
     if (_disposed) return;
+    if (!VectorSpanLog.enabled) {
+      _calculateGrid();
+      return;
+    }
+    final startUs = VectorSpanLog.nowUs();
+    final membershipChanged = _calculateGrid();
+    VectorSpanLog.record(
+        membershipChanged ? 'grid.membership' : 'grid.anchor',
+        null,
+        startUs,
+        VectorSpanLog.nowUs() - startUs);
+  }
+
+  /// The [calculate] body. Returns whether grid membership was rebuilt, as
+  /// opposed to an anchor-only camera refresh.
+  bool _calculateGrid() {
+    if (_disposed) return false;
     final centerPointTileX = (centerTileLng % 1) * renderedTileWidth;
     final centerPointTileY = (centerTileLat % 1) * renderedTileHeight;
 
@@ -1171,7 +1193,7 @@ class TileManager with CacheTiles {
         _calcTopLat != topRowTilesLatIndex ||
         _calcHCount != horizontalTileCount ||
         _calcVCount != verticalTileCount;
-    if (!membershipChanged) return;
+    if (!membershipChanged) return false;
     _calcZoom = zoom;
     _calcLeftLng = leftColumnTilesLngIndex;
     _calcTopLat = topRowTilesLatIndex;
@@ -1295,6 +1317,7 @@ class TileManager with CacheTiles {
     if (preloadAdjacentZoom) {
       _scheduleAdjacentZoomPreloadDebounced();
     }
+    return true;
   }
 
   // ── Async tile loading (generation-aware priority scheduler) ────────

@@ -425,5 +425,53 @@ void main() {
         reason: 'label spans must correlate with the publishing attempt',
       );
     });
+
+    testWidgets('grid spans split anchor refreshes from rebuilds',
+        (tester) async {
+      VectorSpanLog.enabled = true;
+      final runtime = VectorTileRuntime(
+        loaded: buildLoadedStyle(),
+        namespace: 'span-grid-calc',
+        parseOffThread: false,
+      );
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 12,
+        fetcher: (z, x, y) async => buildTestTile(),
+        decoder: runtime.decoder,
+        resourceKeyBuilder: (z, x, y) => 'shared',
+        cacheNamespace: runtime.namespace,
+        tilePadding: 0,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(manager.dispose);
+      addTearDown(runtime.dispose);
+
+      manager.calculate(); // initial reconciliation builds the grid
+      manager.calculate(); // identical camera → anchor-only refresh
+      manager.setCenterFromTileCoords(
+          manager.centerTileLng + 2, manager.centerTileLat);
+      manager.calculate(); // window moved → membership rebuild
+
+      final events = VectorSpanLog.take()
+          .map((span) => span.event)
+          .where((event) => event.startsWith('grid.'))
+          .toList();
+      expect(events, ['grid.membership', 'grid.anchor', 'grid.membership'],
+          reason: 'each calculate() records exactly one path span, in order');
+      expect(
+        VectorSpanLog.take()
+            .where((span) => span.event.startsWith('grid.'))
+            .every((span) => span.durationUs >= 0),
+        isTrue,
+      );
+      // The queued fetches never complete in this test; dispose inside the
+      // body so their request timers are cancelled before the pending-timer
+      // invariant check.
+      manager.dispose();
+      runtime.dispose();
+    });
   });
 }

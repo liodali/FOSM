@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/vector/render/label_overlay.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// Paints the OSM tile grid onto a [CustomPaint] canvas.
 ///
@@ -97,6 +98,9 @@ class RenderCanvasOSM extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    // Phase-12 attribution: duration span per repaint (spans arm only; no
+    // Timeline event, the trace arm reads paint CPU from the profiler).
+    final spanStart = VectorSpanLog.enabled ? VectorSpanLog.nowUs() : 0;
     // Background fill so any sub-pixel gaps between tiles aren't black.
     if (paintBackground) {
       canvas.drawRect(Offset.zero & size, _checkerLightPaint);
@@ -150,6 +154,10 @@ class RenderCanvasOSM extends CustomPainter {
             ..restore();
         }
       }
+    }
+    if (VectorSpanLog.enabled) {
+      VectorSpanLog.record('paint.grid', null, spanStart,
+          VectorSpanLog.nowUs() - spanStart);
     }
   }
 
