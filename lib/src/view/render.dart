@@ -118,7 +118,15 @@ class RenderCanvasOSM extends CustomPainter {
         final image = tile?.sourceTile;
 
         if (image != null) {
-          if (tileScale == 1) {
+          if (tile!.isPreview) {
+            canvas.drawImageRect(
+                image,
+                ui.Rect.fromLTWH(
+                    0, 0, image.width.toDouble(), image.height.toDouble()),
+                ui.Rect.fromLTWH(tileCanvasX, tileCanvasY,
+                    tileWidth * tileScale, tileHeight * tileScale),
+                _imagePaint);
+          } else if (tileScale == 1) {
             canvas.drawImage(
                 image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
           } else {

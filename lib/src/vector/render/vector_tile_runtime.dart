@@ -50,6 +50,10 @@ class VectorTileRuntime {
   final LoadedVectorStyle loaded;
   final String namespace;
 
+  /// Experimental lower-resolution snapshots during camera motion.
+  final bool adaptiveResolution;
+  bool motionActive = false;
+
   /// Span-log identity of this runtime instance (`r3`): runtime #3.
   ///
   /// Attempts are namespaced by runtime because tile coordinates alone
@@ -78,6 +82,7 @@ class VectorTileRuntime {
     required this.loaded,
     required this.namespace,
     this.parseOffThread = true,
+    this.adaptiveResolution = false,
     this.workScheduler,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
   }) {
@@ -321,7 +326,10 @@ class VectorTileRuntime {
   /// offscreen tile's labels would be discarded by the relevance-gated
   /// label pump anyway, so preparing them is pure waste. Promotion of the
   /// pre-rendered image arranges preparation via [ensureLabelsPrepared].
-  TileDecoder get speculativeDecoder => (bytes, z, x, y) => _gated(z, x, y,
+  TileDecoder get speculativeDecoder => (bytes, z, x, y) => _gated(
+      z,
+      x,
+      y,
       (attempt) =>
           _decodeAndRender(bytes, z, x, y, attempt, speculative: true));
 
@@ -601,10 +609,13 @@ class VectorTileRuntime {
       final ParsedVectorTile parsed;
       try {
         parsed = _parsedTileFor(coord) ??
-            await VectorTrace.async('parseWait',
+            await VectorTrace.async(
+                'parseWait',
                 () => _parseAndStoreDedup(bytes, coord, z, x, y,
                     attempt: attempt, tile: tile),
-                tile: tile, attempt: attempt, source: sourceTile);
+                tile: tile,
+                attempt: attempt,
+                source: sourceTile);
       } on TileDecodeAborted {
         rethrow;
       } on VectorTileCancelled {
@@ -671,6 +682,8 @@ class VectorTileRuntime {
 
       // Use the time-budgeted renderer. It cooperatively yields between
       // layers, features, and large geometry batches on every platform.
+      final imageSize =
+          adaptiveResolution && motionActive && !speculative ? 128 : 256;
       final picture = await VectorTrace.async(
           'record',
           () => VectorTileRenderer(loaded).renderAsync(
@@ -690,6 +703,7 @@ class VectorTileRuntime {
                     : () => workScheduler!
                         .checkpoint(isRelevant: () => _isRelevant(z, x, y)),
                 traceAttempt: attempt,
+                imageSize: imageSize,
               ),
           tile: tile,
           attempt: attempt,
@@ -717,7 +731,7 @@ class VectorTileRuntime {
         }
         final scheduler = workScheduler;
         Future<ui.Image> snapshot() => VectorTrace.async(
-            'toImage', () => picture.toImage(256, 256),
+            'toImage', () => picture.toImage(imageSize, imageSize),
             tile: tile, attempt: attempt);
         final image = await VectorTrace.async(
             'imageWait',
@@ -729,11 +743,17 @@ class VectorTileRuntime {
                     isRelevant: () => _isRelevant(z, x, y),
                     // The lane drops irrelevant work before its slot;
                     // count those drops per tile/attempt in spans.
-                    onRelevanceDrop: () => VectorSpanLog.mark(
-                        'laneDiscard', tile: tile, attempt: attempt),
+                    onRelevanceDrop: () => VectorSpanLog.mark('laneDiscard',
+                        tile: tile, attempt: attempt),
                   ),
             tile: tile,
             attempt: attempt);
+        if (adaptiveResolution) {
+          VectorSpanLog.mark(
+              imageSize == 128 ? 'motionPreview' : 'fullResolution',
+              tile: tile,
+              attempt: attempt);
+        }
         // Publish the base image immediately. Label preparation runs on a
         // separate lower-priority lane afterwards and notifies only the label
         // surface when it finishes, so visible coverage and zoom readiness

@@ -89,10 +89,10 @@ const _settleSeconds =
     int.fromEnvironment('BENCHMARK_SETTLE_SECONDS', defaultValue: 25);
 
 final _center = LatLng(
-  latitude: double.parse(const String.fromEnvironment('BENCHMARK_LATITUDE',
-      defaultValue: '47')),
-  longitude: double.parse(const String.fromEnvironment('BENCHMARK_LONGITUDE',
-      defaultValue: '8')),
+  latitude: double.parse(
+      const String.fromEnvironment('BENCHMARK_LATITUDE', defaultValue: '47')),
+  longitude: double.parse(
+      const String.fromEnvironment('BENCHMARK_LONGITUDE', defaultValue: '8')),
 );
 
 /// Camera-motion family used while sampling.
@@ -388,8 +388,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _controller.moveTo(
             LatLng(
                 latitude: _center.latitude + 0.01 * math.sin(phase),
-                longitude:
-                    _center.longitude + _returnPanAmplitudeDeg * math.sin(phase)),
+                longitude: _center.longitude +
+                    _returnPanAmplitudeDeg * math.sin(phase)),
             animate: false);
       case _Motion.returnFrom:
         // Smoothstep from +offset back to the origin, then hold.
@@ -398,8 +398,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _controller.moveTo(
             LatLng(
                 latitude: _center.latitude,
-                longitude:
-                    _center.longitude + _returnFromOffsetDeg * eased),
+                longitude: _center.longitude + _returnFromOffsetDeg * eased),
             animate: false);
       case _Motion.none:
         break;
@@ -533,6 +532,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           'scenarioFilter': _scenarioFilter,
           'dashCull': const bool.fromEnvironment('fosm.vectorDashCull'),
           'speculation': const bool.fromEnvironment('fosm.vectorSpeculation'),
+          'motion128': const bool.fromEnvironment('fosm.vectorMotion128'),
         }));
 
     final scenarios = _scenarioFilter.isEmpty

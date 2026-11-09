@@ -56,6 +56,10 @@ flutter --version > "$out/flutter-version.txt" 2>/dev/null || true
 target='lib/benchmark/map_vector_benchmark.dart'
 build_defines=()
 suffix_parts=()
+if [[ "${BENCHMARK_MOTION_128:-0}" == 1 ]]; then
+  build_defines+=(--dart-define=fosm.vectorMotion128=true)
+  suffix_parts+=('motion128')
+fi
 if [[ "${BENCHMARK_DASH_CULL:-0}" == 1 ]]; then
   build_defines+=(--dart-define=fosm.vectorDashCull=true)
   suffix_parts+=('cull')

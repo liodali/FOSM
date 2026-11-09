@@ -41,6 +41,9 @@ trace_reps="${6:-1}"
 port=8787
 base="http://${lan_ip}:${port}"
 dash_args=()
+if [[ "${BENCHMARK_MOTION_128:-0}" == 1 ]]; then
+  dash_args+=(--dart-define=fosm.vectorMotion128=true)
+fi
 fixture_args=()
 if [[ -n "${BENCHMARK_FIXTURE_DIR:-}" ]]; then
   : "${BENCHMARK_FIXTURE_ID:?fixture runs require BENCHMARK_FIXTURE_ID}"

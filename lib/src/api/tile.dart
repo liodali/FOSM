@@ -14,18 +14,24 @@ class Tile {
   final int latIndex;
   final int lngIndex;
 
-  Tile(this.sourceTile, this.index, this.latIndex, this.lngIndex);
+  /// Lower-resolution vector imagery, drawn over the full logical tile.
+  final bool isPreview;
+
+  Tile(this.sourceTile, this.index, this.latIndex, this.lngIndex,
+      {this.isPreview = false});
 
   Tile.fromJson(
     String indexTile,
     Map<String, dynamic> tileJson, {
     required this.sourceTile,
+    this.isPreview = false,
   })  : index = indexTile,
         latIndex = tileJson['latIndex'] as int,
         lngIndex = tileJson['lngIndex'] as int;
 
   /// Returns a copy with [sourceTile] replaced.
-  Tile copyWithImage(ui.Image image) => Tile(image, index, latIndex, lngIndex);
+  Tile copyWithImage(ui.Image image) =>
+      Tile(image, index, latIndex, lngIndex, isPreview: isPreview);
 
   /// Serializes to a Hive-friendly map. [imageBytes] is the raw PNG data.
   Map<String, dynamic> toTileJson(Uint8List imageBytes) => {

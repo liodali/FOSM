@@ -660,19 +660,19 @@ class _MapViewState extends State<MapView>
   /// `fosm.workBudgetMs` / `fosm.imageStartsPerFrame` / `fosm.activeImages`
   /// defines override the pacing for measurement A/B captures; their
   /// defaults reproduce the shipped pacing exactly.
-  final TileWorkScheduler? _tileWorkScheduler =
-      TileWorkScheduler.disabledByDefine
-          ? null
-          : TileWorkScheduler(
-              budget: Duration(
-                  milliseconds: const int.fromEnvironment('fosm.workBudgetMs',
-                      defaultValue: 2)),
-              maxImageStartsPerFrame: const int.fromEnvironment(
-                  'fosm.imageStartsPerFrame',
-                  defaultValue: 2),
-              maxActiveImages: const int.fromEnvironment('fosm.activeImages',
-                  defaultValue: 2),
-            );
+  final TileWorkScheduler? _tileWorkScheduler = TileWorkScheduler
+          .disabledByDefine
+      ? null
+      : TileWorkScheduler(
+          budget: Duration(
+              milliseconds: const int.fromEnvironment('fosm.workBudgetMs',
+                  defaultValue: 2)),
+          maxImageStartsPerFrame: const int.fromEnvironment(
+              'fosm.imageStartsPerFrame',
+              defaultValue: 2),
+          maxActiveImages:
+              const int.fromEnvironment('fosm.activeImages', defaultValue: 2),
+        );
 
   /// Cancels the opt-in periodic memory-attribution logger
   /// (`--dart-define=fosm.traceMemory=true`), null when disabled.
@@ -710,6 +710,34 @@ class _MapViewState extends State<MapView>
 
   // ── Vector style session ────────────────────────────────────────────
   VectorTileRuntime? _vectorRuntime;
+  static const _motion128Enabled = bool.fromEnvironment('fosm.vectorMotion128');
+  Timer? _vectorResolutionTimer;
+
+  void _markVectorMotion() {
+    final runtime = _vectorRuntime;
+    if (runtime == null || !runtime.adaptiveResolution) return;
+    runtime.motionActive = true;
+    _tileManager?.setMotionActive(true);
+    _vectorResolutionTimer?.cancel();
+    _vectorResolutionTimer =
+        Timer(const Duration(milliseconds: 200), _settleVectorResolution);
+  }
+
+  void _settleVectorResolution() {
+    _vectorResolutionTimer = null;
+    if (!mounted) return;
+    if (_interacting ||
+        _panController != null ||
+        (_fractionalController?.isAnimating ?? false) ||
+        _isAnimating) {
+      _vectorResolutionTimer =
+          Timer(const Duration(milliseconds: 200), _settleVectorResolution);
+      return;
+    }
+    _vectorRuntime?.motionActive = false;
+    _tileManager?.setMotionActive(false);
+  }
+
   TileLoadException? _vectorError;
   int _styleLoadGeneration = 0;
   MapRequestSession? _styleCancel;
@@ -862,6 +890,8 @@ class _MapViewState extends State<MapView>
   }
 
   Future<void> _loadVectorStyle() async {
+    _vectorResolutionTimer?.cancel();
+    _vectorResolutionTimer = null;
     final style = widget.vectorStyle;
     if (style == null) return;
     final generation = ++_styleLoadGeneration;
@@ -880,6 +910,7 @@ class _MapViewState extends State<MapView>
       _vectorRuntime = VectorTileRuntime(
         loaded: loaded,
         namespace: style.id,
+        adaptiveResolution: _motion128Enabled,
         workScheduler: _tileWorkScheduler,
         requestTimeout: widget.requestTimeout,
       );
@@ -960,6 +991,9 @@ class _MapViewState extends State<MapView>
             widget.fractionalZoom != _tileManager?.cameraZoom;
     final externalZoom =
         widget.zoom != oldWidget.zoom && widget.zoom != _currentZoom;
+    if (externalCenter || externalFractional || externalZoom) {
+      _markVectorMotion();
+    }
     if ((!widget.enableFling && _flinging) ||
         widget.cameraBounds != oldWidget.cameraBounds ||
         externalCenter ||
@@ -1029,6 +1063,7 @@ class _MapViewState extends State<MapView>
 
   @override
   void dispose() {
+    _vectorResolutionTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _memoryTraceCancel?.call();
     _memoryTraceCancel = null;
@@ -1149,6 +1184,7 @@ class _MapViewState extends State<MapView>
   }
 
   void _notifyCamera(TileManager manager) {
+    _markVectorMotion();
     widget.onCameraChanged?.call(manager.centerLatLng, manager.zoom);
   }
 
@@ -1184,6 +1220,7 @@ class _MapViewState extends State<MapView>
       // in another image-lane reservation. This is scheduling ownership,
       // independent of the padding policy above.
       decoderOwnsImageScheduling: runtime != null,
+      adaptiveResolution: runtime?.adaptiveResolution ?? false,
       // Plan-06 idle-time preparation of nearest-ring vector padding
       // tiles. Measurement-only define until plan-06 acceptance is met;
       // the runtime provides the label-skipping decode variant and the
@@ -1213,7 +1250,8 @@ class _MapViewState extends State<MapView>
     // speculative decode skipped (no-op when labels already exist).
     manager.onTileServedFromCache = runtime == null
         ? null
-        : (z, x, y, bytes) => runtime.ensureLabelsPrepared(z, x, y, bytes: bytes);
+        : (z, x, y, bytes) =>
+            runtime.ensureLabelsPrepared(z, x, y, bytes: bytes);
     // Let the vector runtime abort decodes for tiles that leave the
     // render set before they reach render/`toImage`, and dispatch the
     // newest centre tile first from its presentation lane.
@@ -1280,6 +1318,7 @@ class _MapViewState extends State<MapView>
   void _applyContinuousZoom(TileManager manager, double value, Offset focal,
       {bool notify = true}) {
     if (value == manager.cameraZoom) return;
+    _markVectorMotion();
     final oldZoom = manager.zoom;
     // No snapshot capture here: the per-region zoom fallback derives its
     // coverage from the rendered cache at the next build, so a zoom step
@@ -1955,6 +1994,7 @@ class _MapViewState extends State<MapView>
   }
 
   void _onScaleUpdate(TileManager manager, ScaleUpdateDetails details) {
+    _markVectorMotion();
     // Mark direct manipulation only once the gesture actually moves: a
     // plain tap also raises scale-start, and that must not disable the
     // zoom transition's blur.

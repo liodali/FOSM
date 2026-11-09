@@ -110,10 +110,13 @@ class VectorTileRenderer {
     Future<void> Function()? yieldControl,
     bool Function()? isRelevant,
     String? traceAttempt,
+    int imageSize = 256,
   }) async {
+    assert(imageSize > 0);
     final recorder = ui.PictureRecorder();
-    final canvas =
-        ui.Canvas(recorder, const ui.Rect.fromLTWH(0, 0, tileSize, tileSize));
+    final canvas = ui.Canvas(recorder,
+        ui.Rect.fromLTWH(0, 0, imageSize.toDouble(), imageSize.toDouble()))
+      ..scale(imageSize / tileSize);
     final ctx = EvaluationContext(zoom: z.toDouble());
     _traceTile = '$z/$x/$y';
     _traceAttempt = traceAttempt;

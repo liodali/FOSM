@@ -145,6 +145,70 @@ class TileManager with CacheTiles {
   /// the vector parse+render pipeline in vector mode.
   final TileDecoder _decoder;
 
+  /// Internal A/B policy; enabled only for vector runtimes using motion previews.
+  final bool adaptiveResolution;
+  bool _motionActive = false;
+  bool get motionActive => _motionActive;
+
+  String _previewKey(String key) => '$key@motion128';
+  bool _hasRenderedImage(String key) =>
+      _memoryCache.containsKey(key) ||
+      (adaptiveResolution && _memoryCache.containsKey(_previewKey(key)));
+
+  /// Stop admitting upgrades when motion resumes; keep all published imagery.
+  void setMotionActive(bool moving) {
+    if (_disposed || !adaptiveResolution || moving == _motionActive) return;
+    _motionActive = moving;
+    if (moving) {
+      _loadQueue.removeWhere((job) {
+        if (job.jobClass != _JobClass.refinement) return false;
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+        return true;
+      });
+      _presentQueue.removeWhere((entry) {
+        if (entry.job.jobClass != _JobClass.refinement) return false;
+        _inFlight.remove(entry.job.key);
+        return true;
+      });
+    }
+    _pumpLoadQueue();
+  }
+
+  void _queuePreviewUpgrades() {
+    if (!adaptiveResolution || _motionActive || _disposed) return;
+    for (final tile in _renderTiles) {
+      final key = tile.index;
+      if (!tile.isPreview ||
+          !_visibleKeys.contains(key) ||
+          _memoryCache.containsKey(key) ||
+          _queued.contains(key) ||
+          _inFlight.contains(key)) {
+        continue;
+      }
+      final dx = tile.lngIndex - centerTileLng;
+      final dy = tile.latIndex - centerTileLat;
+      _enqueueJob(_LoadJob(
+          key: key,
+          resourceKey: _resourceKey(zoom, tile.lngIndex, tile.latIndex),
+          z: zoom,
+          x: tile.lngIndex,
+          y: tile.latIndex,
+          generation: _generation,
+          jobClass: _JobClass.refinement,
+          distance: dx * dx + dy * dy,
+          byteOnly: false));
+    }
+  }
+
+  Set<String> _protectedImageKeys(Iterable<String> keys) => {
+        for (final key in keys) ...[
+          key,
+          if (adaptiveResolution && !_memoryCache.containsKey(key))
+            _previewKey(key),
+        ],
+      };
+
   /// Optional map-owned frame pacing; vector image creation uses the same
   /// scheduler in VectorTileRuntime instead of gating its entire pipeline.
   final TileWorkScheduler? workScheduler;
@@ -325,7 +389,7 @@ class TileManager with CacheTiles {
     for (final key in _visibleKeys) {
       final error = _loadFailures[key];
       final job = _jobsByKey[key];
-      if (error != null && job != null && !_memoryCache.containsKey(key)) {
+      if (error != null && job != null && !_hasRenderedImage(key)) {
         failures
             .add(MapTileFailure(zoom: job.z, x: job.x, y: job.y, error: error));
       }
@@ -700,8 +764,12 @@ class TileManager with CacheTiles {
     // Speculative work ranks below every foreground class: below visible
     // tiles and below raster-mode padding decodes, so a camera change that
     // queues real work preempts it at the decode lane.
-    final classRank =
-        visible ? 3 : (inRender && !speculative ? 2 : (speculative ? 1 : 0));
+    final preview = adaptiveResolution &&
+        _renderIndex(key) != -1 &&
+        _renderTiles[_renderIndex(key)].isPreview;
+    final classRank = visible
+        ? (preview ? 2 : 3)
+        : (inRender && !speculative ? 2 : (speculative ? 1 : 0));
     var proximity = 0;
     if (z == zoom) {
       final dx = (x + 0.5) - centerTileLng;
@@ -727,6 +795,7 @@ class TileManager with CacheTiles {
     this.preloadAdjacentZoom = true,
     this.byteOnlyPadding = false,
     this.decoderOwnsImageScheduling = false,
+    this.adaptiveResolution = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
     this.speculativePrepare = false,
     this.maxSpeculativePrepares = 12,
@@ -1097,11 +1166,11 @@ class TileManager with CacheTiles {
     _speculativeSuspended = false;
     _revokeSpeculativeWork();
 
-    _memoryCache.setActiveKeys({
+    _memoryCache.setActiveKeys(_protectedImageKeys({
       for (var h = 0; h < horizontalTileCount; h++)
         for (var v = 0; v < verticalTileCount; v++)
           _key(zoom, leftColumnTilesLngIndex + h, topRowTilesLatIndex + v),
-    });
+    }));
     _renderTiles.clear();
     _visibleKeys.clear();
 
@@ -1127,9 +1196,12 @@ class TileManager with CacheTiles {
         }
 
         // Synchronous memory-cache hit → no flicker.
-        final cached = _memoryCache.get(key);
+        final fullImage = _memoryCache.get(key);
+        final cached = fullImage ??
+            (adaptiveResolution ? _memoryCache.get(_previewKey(key)) : null);
         if (cached != null) {
-          _renderTiles.add(Tile(cached, key, tileLatIndex, tileLngIndex));
+          _renderTiles.add(Tile(cached, key, tileLatIndex, tileLngIndex,
+              isPreview: adaptiveResolution && fullImage == null));
           // Promotion path for pre-rendered (speculative) images: the
           // view arranges the label preparation the speculative decode
           // deliberately skipped. Only strict-viewport tiles need it —
@@ -1221,6 +1293,7 @@ class TileManager with CacheTiles {
   /// instead of leaving it with its stale generation and priority.
   void _enqueueJob(_LoadJob job) {
     if (_disposed) return;
+    if (job.jobClass == _JobClass.refinement && _motionActive) return;
     if (!_isValidWorld(job.z, job.y)) return;
     // Record the newest descriptor even when the job is already in flight so
     // a pending retry timer can pick up the promoted priority.
@@ -1320,6 +1393,7 @@ class TileManager with CacheTiles {
   /// preparation) are preloads that may wait.
   static bool _isForeground(_LoadJob job) =>
       job.jobClass == _JobClass.visible ||
+      job.jobClass == _JobClass.refinement ||
       (job.jobClass == _JobClass.padding && !job.byteOnly);
 
   /// Whether an off-grid speculative job may still run its resource or
@@ -1515,6 +1589,7 @@ class TileManager with CacheTiles {
   /// [maxConcurrentBackgroundLoads].
   void _pumpLoadQueue() {
     if (_disposed) return;
+    _queuePreviewUpgrades();
     // Speculative admission runs on every pump: job completions and grid
     // rebuilds are exactly the moments the foreground may have settled.
     _admitSpeculativeWork();
@@ -1586,7 +1661,7 @@ class TileManager with CacheTiles {
                 TileFailureKind.decode, 'Unable to render map tile')
         : TileLoadException.from(error);
     _loadFailures[job.key] = failure;
-    if (_visibleKeys.contains(job.key)) {
+    if (_visibleKeys.contains(job.key) && !_hasRenderedImage(job.key)) {
       onTileError?.call(
           MapTileFailure(zoom: job.z, x: job.x, y: job.y, error: failure));
       _scheduleTileNotification();
@@ -2092,7 +2167,8 @@ class TileManager with CacheTiles {
       // regular decoder serves both classes.
       final decode = job.jobClass == _JobClass.speculative
           ? (speculativeDecoder ?? _decoder)
-          : _decoder;      final image = scheduler != null && !decoderOwnsImageScheduling
+          : _decoder;
+      final image = scheduler != null && !decoderOwnsImageScheduling
           ? await scheduler.image(
               () => decode(bytes, job.z, job.x, job.y),
               priority: () => tileDecodePriority(job.z, job.x, job.y),
@@ -2111,6 +2187,7 @@ class TileManager with CacheTiles {
               VectorSpanLog.nowUs() - publishStartUs);
         }
       }
+
       if (_disposed) {
         image.dispose();
         closePublishSpan();
@@ -2124,7 +2201,12 @@ class TileManager with CacheTiles {
         closePublishSpan();
         return _DecodeOutcome.aborted;
       }
-      _complete(job, Tile(image, job.key, job.y, job.x));
+      _complete(
+          job,
+          Tile(image, job.key, job.y, job.x,
+              isPreview: adaptiveResolution &&
+                  image.width == 128 &&
+                  image.height == 128));
       closePublishSpan();
       return _DecodeOutcome.ok;
     } on TileDecodeAborted {
@@ -2294,7 +2376,18 @@ class TileManager with CacheTiles {
     _jobsByKey.remove(key);
     if (_disposed || tile.sourceTile == null) return;
 
-    final image = _memoryCache.put(key, tile.sourceTile!);
+    final readyFull = tile.isPreview ? _memoryCache.get(key) : null;
+    final ui.Image image;
+    final bool preview;
+    if (tile.isPreview && readyFull != null) {
+      tile.sourceTile!.dispose();
+      image = readyFull;
+      preview = false;
+    } else {
+      image = _memoryCache.put(
+          tile.isPreview ? _previewKey(key) : key, tile.sourceTile!);
+      preview = tile.isPreview;
+    }
 
     // Speculative completion for a still-offscreen tile: the image now
     // waits in the rendered cache for a synchronous promotion when the
@@ -2303,22 +2396,28 @@ class TileManager with CacheTiles {
     // invisible tile and pollute viewport-publication markers, so the
     // offscreen case stops after the cache insert. A speculative decode
     // that finishes after its tile became visible publishes normally.
-    if (job.jobClass == _JobClass.speculative &&
-        !_visibleKeys.contains(key)) {
+    if (job.jobClass == _JobClass.speculative && !_visibleKeys.contains(key)) {
       if (VectorSpanLog.enabled) {
         VectorSpanLog.mark('specPublish',
             tile: '${job.z}/${job.x}/${job.y}',
-            attempt: VectorSpanLog.claimDecodeAttempt(
-                '${job.z}/${job.x}/${job.y}'));
+            attempt:
+                VectorSpanLog.claimDecodeAttempt('${job.z}/${job.x}/${job.y}'));
       }
       return;
     }
 
     final i = _renderIndex(key);
     if (i == -1) return;
-    if (_renderTiles[i].sourceTile != null) return;
+    if (_renderTiles[i].sourceTile != null &&
+        !(_renderTiles[i].isPreview && !preview)) {
+      return;
+    }
 
-    _renderTiles[i] = tile.copyWithImage(image);
+    _renderTiles[i] = Tile(image, key, job.y, job.x, isPreview: preview);
+    if (adaptiveResolution) {
+      _memoryCache
+          .setActiveKeys(_protectedImageKeys(_renderTiles.map((t) => t.index)));
+    }
     _contentRevision++;
     final tileId = '${job.z}/${job.x}/${job.y}';
     VectorSpanLog.mark('publish',
@@ -2523,13 +2622,19 @@ class TileManager with CacheTiles {
 
   /// Retrieves a retained rendered image, refreshing its LRU position so
   /// imagery actively serving as zoom fallback stays warm.
-  ui.Image? retainedImage(String key) => _memoryCache.get(key);
+  ui.Image? retainedImage(String key) =>
+      _memoryCache.get(key) ??
+      (adaptiveResolution ? _memoryCache.get(_previewKey(key)) : null);
 
   /// Protects rendered images keyed by [keys] until the returned callback
   /// runs. Regions of the zoom-fallback coverage pin only the images
   /// their cells actually draw.
   VoidCallback pinRenderedImages(Iterable<String> keys) =>
-      _memoryCache.pin(keys);
+      _memoryCache.pin(adaptiveResolution
+          ? {
+              for (final key in keys) ...[key, _previewKey(key)]
+            }
+          : keys);
 
   /// Canonical source identity of the logical tile at [z]/[x]/[y].
   ///
@@ -2661,6 +2766,9 @@ enum _DecodeOutcome {
 enum _JobClass {
   /// Strict-viewport tile that must decode to be displayed.
   visible,
+
+  /// Visible preview upgrade. Missing foreground imagery always wins.
+  refinement,
 
   /// Off-screen padding ring (decoded in raster mode, bytes-only in
   /// vector mode).

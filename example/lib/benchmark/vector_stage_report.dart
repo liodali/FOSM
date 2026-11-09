@@ -93,8 +93,7 @@ Map<String, Object?> buildVectorStageReport(
       truncatedTiles.add(tile);
       continue;
     }
-    final row = tiles.putIfAbsent(
-        tile, () => <String, Object?>{'tile': tile});
+    final row = tiles.putIfAbsent(tile, () => <String, Object?>{'tile': tile});
     _accumulate(row, span);
   }
 
@@ -102,8 +101,7 @@ Map<String, Object?> buildVectorStageReport(
     'spanCount': spans.length,
     'droppedSpans': dropped ?? 0,
     'markers': {
-      for (final entry in _markerCounts(spans).entries)
-        entry.key: entry.value,
+      for (final entry in _markerCounts(spans).entries) entry.key: entry.value,
     },
     'events': {
       for (final entry in events.entries)
@@ -140,6 +138,8 @@ Map<String, Object?> _finishEventStats(Map<String, Object?> stats) {
 }
 
 bool durationIsMarker(String name) =>
+    name == 'motionPreview' ||
+    name == 'fullResolution' ||
     name == 'staleAbort' ||
     name == 'snapshotDiscard' ||
     name == 'laneDiscard' ||
@@ -147,11 +147,9 @@ bool durationIsMarker(String name) =>
     name == 'payloadInvalid' ||
     name == 'publish';
 
-Map<String, Object?> _attemptRow(
-    Map<String, Object?> tileRow, String attempt) {
-  final attempts =
-      tileRow.putIfAbsent('attempts', () => <String, Object?>{})
-          as Map<String, Object?>;
+Map<String, Object?> _attemptRow(Map<String, Object?> tileRow, String attempt) {
+  final attempts = tileRow.putIfAbsent('attempts', () => <String, Object?>{})
+      as Map<String, Object?>;
   final existing = attempts[attempt];
   if (existing is Map<String, Object?>) return existing;
   final created = <String, Object?>{
@@ -189,8 +187,8 @@ void _accumulate(Map<String, Object?> row, VectorSpan span) {
   // of their triggering attempt and aggregate above.
   switch (name) {
     case 'fetch':
-      final fetch = row.putIfAbsent(
-          'fetch', () => <String, Object?>{}) as Map<String, Object?>;
+      final fetch = row.putIfAbsent('fetch', () => <String, Object?>{})
+          as Map<String, Object?>;
       fetch['totalUs'] = ((fetch['totalUs'] as int?) ?? 0) + span.durationUs;
       fetch['n'] = ((fetch['n'] as int?) ?? 0) + 1;
       final source = span.source;
@@ -198,13 +196,14 @@ void _accumulate(Map<String, Object?> row, VectorSpan span) {
         _addUnique(fetch, 'sources', source);
       }
     case 'presentationQueueWait':
-      final lane = row.putIfAbsent('presentationQueue',
-          () => <String, Object?>{}) as Map<String, Object?>;
+      final lane =
+          row.putIfAbsent('presentationQueue', () => <String, Object?>{})
+              as Map<String, Object?>;
       lane['totalUs'] = ((lane['totalUs'] as int?) ?? 0) + span.durationUs;
       lane['n'] = ((lane['n'] as int?) ?? 0) + 1;
     case 'publishWait':
-      final publish = row.putIfAbsent('publishWait',
-          () => <String, Object?>{}) as Map<String, Object?>;
+      final publish = row.putIfAbsent('publishWait', () => <String, Object?>{})
+          as Map<String, Object?>;
       publish['totalUs'] =
           ((publish['totalUs'] as int?) ?? 0) + span.durationUs;
       publish['n'] = ((publish['n'] as int?) ?? 0) + 1;
@@ -230,8 +229,8 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
   // table); zero-duration markers get their timestamp as the window.
   final name = span.event;
   final group = name.startsWith('recordChunk.') ? 'recordChunk' : name;
-  final stages =
-      row.putIfAbsent('stages', () => <String, Object?>{}) as Map<String, Object?>;
+  final stages = row.putIfAbsent('stages', () => <String, Object?>{})
+      as Map<String, Object?>;
   final existingStage = stages[group];
   final stage = existingStage is Map<String, Object?>
       ? existingStage
@@ -258,16 +257,19 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
   // Flat convenience counters (also kept per attempt).
   switch (name) {
     case 'queueWait':
-      row['queueWaitUs'] = ((row['queueWaitUs'] as int?) ?? 0) + span.durationUs;
+      row['queueWaitUs'] =
+          ((row['queueWaitUs'] as int?) ?? 0) + span.durationUs;
     case 'parseWait':
-      row['parseWaitUs'] = ((row['parseWaitUs'] as int?) ?? 0) + span.durationUs;
+      row['parseWaitUs'] =
+          ((row['parseWaitUs'] as int?) ?? 0) + span.durationUs;
       row['parseN'] = ((row['parseN'] as int?) ?? 0) + 1;
     case 'parseSharedWait':
       row['parseSharedWaitUs'] =
           ((row['parseSharedWaitUs'] as int?) ?? 0) + span.durationUs;
       row['parseSharedN'] = ((row['parseSharedN'] as int?) ?? 0) + 1;
     case 'parseHold':
-      row['parseHoldUs'] = ((row['parseHoldUs'] as int?) ?? 0) + span.durationUs;
+      row['parseHoldUs'] =
+          ((row['parseHoldUs'] as int?) ?? 0) + span.durationUs;
     case 'parseQueueWait':
       row['parseQueueWaitUs'] =
           ((row['parseQueueWaitUs'] as int?) ?? 0) + span.durationUs;
@@ -279,11 +281,13 @@ void _accumulateAttempt(Map<String, Object?> row, VectorSpan span) {
     case 'record':
       row['recordUs'] = ((row['recordUs'] as int?) ?? 0) + span.durationUs;
     case 'imageWait':
-      row['imageWaitUs'] = ((row['imageWaitUs'] as int?) ?? 0) + span.durationUs;
+      row['imageWaitUs'] =
+          ((row['imageWaitUs'] as int?) ?? 0) + span.durationUs;
     case 'toImage':
       row['toImageUs'] = ((row['toImageUs'] as int?) ?? 0) + span.durationUs;
     case 'labels.build':
-      row['labelsBuildUs'] = ((row['labelsBuildUs'] as int?) ?? 0) + span.durationUs;
+      row['labelsBuildUs'] =
+          ((row['labelsBuildUs'] as int?) ?? 0) + span.durationUs;
     case 'labels.layout':
       row['labelsLayoutUs'] =
           ((row['labelsLayoutUs'] as int?) ?? 0) + span.durationUs;
