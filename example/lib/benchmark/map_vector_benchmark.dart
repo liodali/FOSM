@@ -109,15 +109,6 @@ enum _CacheState {
 enum _Source { vector, raster }
 
 class _Scenario {
-  const _Scenario(
-    this.name, {
-    this.motion = _Motion.none,
-    this.cacheState = _CacheState.coldBytes,
-    this.source = _Source.vector,
-    this.startZoom = 10,
-    this.styleSwitch = false,
-  });
-
   final String name;
   final _Motion motion;
   final _CacheState cacheState;
@@ -127,6 +118,21 @@ class _Scenario {
   /// Switch the style variant a→b at half the sample window (measures a
   /// full runtime/style reload on identical payloads).
   final bool styleSwitch;
+
+  /// Recorded camera-idle tail after the motion window. Motion previews
+  /// have 200 ms to stop, then full-resolution upgrades race this tail;
+  /// zero preserves the historical continuously-moving protocol.
+  final int motionSettleMs;
+
+  const _Scenario(
+    this.name, {
+    this.motion = _Motion.none,
+    this.cacheState = _CacheState.coldBytes,
+    this.source = _Source.vector,
+    this.startZoom = 10,
+    this.styleSwitch = false,
+    this.motionSettleMs = 0,
+  });
 }
 
 const _scenarios = [
@@ -139,6 +145,14 @@ const _scenarios = [
   _Scenario('vector_cold_fling', motion: _Motion.fling),
   _Scenario('vector_cold_return', motion: _Motion.returnPan),
   _Scenario('vector_cold_pinch', motion: _Motion.pinch),
+  // Recorded 3s idle tails: motion previews stop at 200ms and upgrade to
+  // full-resolution while coverage sampling remains active.
+  _Scenario('vector_cold_fling_settle',
+      motion: _Motion.fling, motionSettleMs: 3000),
+  _Scenario('vector_cold_return_settle',
+      motion: _Motion.returnPan, motionSettleMs: 3000),
+  _Scenario('vector_cold_pinch_settle',
+      motion: _Motion.pinch, motionSettleMs: 3000),
   _Scenario('vector_cold_overzoom', startZoom: 16),
   // Warm rendered: motion tails without any loading cost.
   _Scenario('vector_warm_static', cacheState: _CacheState.warmRendered),
@@ -578,7 +592,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
               'motion=${scenario.motion.name} '
               'cacheState=${scenario.cacheState.name} '
               'source=${scenario.source.name} startZoom=${scenario.startZoom} '
-              'styleSwitch=${scenario.styleSwitch} settled=$settled');
+              'styleSwitch=${scenario.styleSwitch} '
+              'motionSettleMs=${scenario.motionSettleMs} '
+              'settled=$settled');
 
       final int rssBefore;
       void armRecording() {
@@ -644,6 +660,14 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       _styleSwitchTimer?.cancel();
       _styleSwitchTimer = null;
       if (!mounted) return;
+      if (scenario.motionSettleMs > 0) {
+        // Stay inside the recorded window while the camera is idle, so
+        // the 200 ms preview settle and full-resolution upgrades are
+        // measured as time-to-sharp rather than occurring after the
+        // sampler has stopped.
+        await Future<void>.delayed(
+            Duration(milliseconds: scenario.motionSettleMs));
+      }
       if (scenario.motion != _Motion.none) {
         // Let trailing decodes/presentations land inside the window.
         await Future<void>.delayed(const Duration(milliseconds: 400));
@@ -683,6 +707,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'source': scenario.source.name,
             'startZoom': scenario.startZoom,
             'styleSwitch': scenario.styleSwitch,
+            'motionSettleMs': scenario.motionSettleMs,
             'settled': settled,
             'sampleSeconds': _sampleSeconds,
             'payloadIdentity': _payloadIdentity,

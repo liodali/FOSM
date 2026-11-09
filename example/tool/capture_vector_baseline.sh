@@ -145,8 +145,16 @@ run_benchmark() {
   if [[ $wants_timeline -eq 1 ]]; then
     timeline_args=(--timeline "$out/$label-timeline.json")
   fi
+  local capture_status=0
   dart run tool/capture_benchmark.dart "$log" "${timeline_args[@]}" \
-    > "$out/$label.log" 2>&1
+    > "$out/$label.log" 2>&1 || capture_status=$?
+  # VM discovery can fail even after the app launched and completed its
+  # direct marker posts (macOS local-network/mDNS is the observed case).
+  # Let the marker-safety net below run; only propagate the failure when it
+  # did not preserve a usable result.
+  if (( capture_status != 0 )); then
+    echo "   (capture client exited $capture_status; checking marker sink)"
+  fi
   kill $flutter_pid 2>/dev/null || true
   wait $flutter_pid 2>/dev/null || true
   # The marker sink is the run's data safety net: when the wireless
@@ -174,6 +182,16 @@ run_benchmark() {
     xargs -I{} echo "   {} result lines"
   grep -c FOSM_BENCHMARK_VECTOR_STAGES "$out/$label.log" | \
     xargs -I{} echo "   {} stage lines" || true
+  if (( capture_status != 0 )); then
+    local saved_n=0
+    saved_n=$(grep -cF FOSM_BENCHMARK_RESULT "$out/$label.log" 2>/dev/null || true)
+    if (( saved_n > 0 )); then
+      echo "   (capture client failed, but $saved_n complete marker result(s) were saved)"
+    else
+      echo "capture client failed without a complete marker result for $label" >&2
+      exit 1
+    fi
+  fi
 }
 
 rep=1
