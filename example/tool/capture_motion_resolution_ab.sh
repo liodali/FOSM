@@ -18,6 +18,7 @@
 # Each cell performs CLEAN_REPS clean runs and SPAN_REPS spans runs. The
 # baseline capture script starts one payload server per cell, so runs stay
 # isolated and use the same fixture-identity controls as earlier A/Bs.
+# Set DRY_RUN=1 to print the eight cell commands without capturing.
 # Parse results afterwards with parse_motion_resolution_ab.py.
 set -euo pipefail
 
@@ -28,7 +29,13 @@ fixture_id="${BENCHMARK_FIXTURE_ID:?set BENCHMARK_FIXTURE_ID to the frozen fixtu
 lan_ip="${BENCHMARK_LAN_IP:-$(ipconfig getifaddr en0)}"
 clean_reps="${CLEAN_REPS:-2}"
 span_reps="${SPAN_REPS:-1}"
-scenarios=(${SCENARIOS:-vector_cold_static vector_cold_fling vector_cold_return vector_cold_pinch})
+if [[ -n "${SCENARIOS:-}" ]]; then
+  # zsh does not split unquoted scalar expansions by default; ${=} opts in.
+  scenarios=(${=SCENARIOS})
+else
+  scenarios=(vector_cold_static vector_cold_fling vector_cold_return
+    vector_cold_pinch)
+fi
 
 if [[ -z "$lan_ip" ]]; then
   echo "no LAN IP found; pass BENCHMARK_LAN_IP" >&2
@@ -72,9 +79,13 @@ for arm in control motion128; do
     suffix="${scenario#vector_cold_}"
     cell="$out/$arm-$suffix"
     echo "── cell: $arm/$suffix"
-    BENCHMARK_SCENARIO="$scenario" \
-    BENCHMARK_FIXTURE_DIR="$fixture_dir" \
-    BENCHMARK_FIXTURE_ID="$fixture_id" \
+    if [[ "${DRY_RUN:-0}" == 1 ]]; then
+      print -- "BENCHMARK_SCENARIO=$scenario BENCHMARK_FIXTURE_DIR=$fixture_dir BENCHMARK_FIXTURE_ID=$fixture_id zsh $here/capture_vector_baseline.sh $device $cell $lan_ip $clean_reps $span_reps 0"
+      continue
+    fi
+    env BENCHMARK_SCENARIO="$scenario" \
+        BENCHMARK_FIXTURE_DIR="$fixture_dir" \
+        BENCHMARK_FIXTURE_ID="$fixture_id" \
       zsh "$here/capture_vector_baseline.sh" \
       "$device" "$cell" "$lan_ip" "$clean_reps" "$span_reps" 0
   done
