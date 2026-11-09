@@ -451,6 +451,33 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     }
   }
 
+  /// Motion duration before a recorded settle tail. It stops on an exact
+  /// motion-period boundary so pinch/return end back at the start zoom and
+  /// fling ends at a segment boundary; otherwise a fractional endpoint can
+  /// select a zoom absent from a bounded fixture and the tail measures
+  /// fallback, not preview upgrade.
+  Duration get _motionWindow {
+    final settleMs = _scenario.motionSettleMs;
+    if (settleMs == 0) return Duration(seconds: _sampleSeconds);
+    final sampleMs = _sampleSeconds * 1000;
+    switch (_scenario.motion) {
+      case _Motion.pinch:
+        final periods = sampleMs ~/ (_pinchPeriodSeconds * 1000);
+        return Duration(
+            milliseconds: (periods * _pinchPeriodSeconds * 1000).round());
+      case _Motion.returnPan:
+        final periods = sampleMs ~/ (_returnPanPeriodSeconds * 1000);
+        return Duration(
+            milliseconds: (periods * _returnPanPeriodSeconds * 1000).round());
+      case _Motion.fling:
+        final segments = sampleMs ~/ (_flingSegmentSeconds * 1000);
+        return Duration(
+            milliseconds: (segments * _flingSegmentSeconds * 1000).round());
+      default:
+        return Duration(milliseconds: sampleMs);
+    }
+  }
+
   Future<void> _clearDiskCache() async {
     try {
       if (MapDiskCache.isInitialized) await MapDiskCache.clear();
@@ -656,7 +683,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         });
       }
 
-      await _runWindow(sample);
+      await _runWindow(_motionWindow);
       _styleSwitchTimer?.cancel();
       _styleSwitchTimer = null;
       if (!mounted) return;
