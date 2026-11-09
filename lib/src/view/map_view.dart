@@ -249,6 +249,59 @@ class _OldGridOverlay extends StatelessWidget {
   }
 }
 
+/// Retained-grid-layer capture state (plan-12 candidate, `fosm.gridLayer`).
+///
+/// Everything that determines what the grid painter draws: content
+/// identity (revision, membership window, tile scale, background/placeholder
+/// flags and the owning manager) plus the paint anchors captured at the last
+/// repaint. While [matches] holds between builds, the painter receives
+/// identical fields, `RenderCanvasOSM.shouldRepaint` stays false, and the
+/// repaint boundary's retained layer is moved by a paint transform instead
+/// of redrawing every tile image.
+class _GridLayerCapture {
+  final TileManager manager;
+  final int revision;
+  final int zoom;
+  final int leftLngIndex;
+  final int topLatIndex;
+  final int horizontalCount;
+  final int verticalCount;
+  final double tileScale;
+  final bool background;
+  final bool placeholders;
+  final double anchorX;
+  final double anchorY;
+
+  const _GridLayerCapture({
+    required this.manager,
+    required this.revision,
+    required this.zoom,
+    required this.leftLngIndex,
+    required this.topLatIndex,
+    required this.horizontalCount,
+    required this.verticalCount,
+    required this.tileScale,
+    required this.background,
+    required this.placeholders,
+    required this.anchorX,
+    required this.anchorY,
+  });
+
+  /// Whether [next] describes the same grid content, so the retained layer
+  /// stays valid and only the camera offset changed.
+  bool matches(_GridLayerCapture next) =>
+      identical(manager, next.manager) &&
+      revision == next.revision &&
+      zoom == next.zoom &&
+      leftLngIndex == next.leftLngIndex &&
+      topLatIndex == next.topLatIndex &&
+      horizontalCount == next.horizontalCount &&
+      verticalCount == next.verticalCount &&
+      tileScale == next.tileScale &&
+      background == next.background &&
+      placeholders == next.placeholders;
+}
+
 /// How the old tile grid animates out during a zoom transition
 /// ([MapView.zoomAnimationStyle]).
 ///
@@ -377,6 +430,16 @@ class MapView extends StatefulWidget {
   /// arrivals in one frame produce a single map update.
   @visibleForTesting
   static int debugBuildCount = 0;
+
+  /// Plan-12 candidate: retained grid layer. When on, the tile grid paints
+  /// into a repaint boundary only when its content identity changes
+  /// (revision, membership window, tile scale, background flags); sub-tile
+  /// camera motion moves the retained layer with a paint transform instead
+  /// of redrawing every tile image. Off by default; enabled with
+  /// `--dart-define=fosm.gridLayer=true`, mutable at runtime for tests.
+  static const gridLayerByDefine = bool.fromEnvironment('fosm.gridLayer');
+  static bool gridLayerEnabled = gridLayerByDefine;
+
 
   /// Counts zoom-transition starts. Test hook used to prove a multi-level
   /// pinch creates one transition rather than one per crossed integer zoom.
@@ -697,6 +760,11 @@ class _MapViewState extends State<MapView>
       widget.fractionalZoom != null;
   AnimationController? _fractionalController;
   ZoomFallbackCoverage? _zoomFallback;
+
+  /// Retained-grid-layer capture state (`fosm.gridLayer`); null until the
+  /// first layer build. Cleared on dispose so a disposed manager is not
+  /// retained.
+  _GridLayerCapture? _gridCapture;
   double? _scaleStartCameraZoom;
   Offset? _lastFractionalFocal;
 
@@ -1076,6 +1144,7 @@ class _MapViewState extends State<MapView>
     _stopFractionalAnimation();
     _zoomFallback?.dispose();
     _zoomFallback = null;
+    _gridCapture = null;
     _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
     _animController.removeListener(_onAnimTick);
@@ -2451,6 +2520,104 @@ class _MapViewState extends State<MapView>
         ),
       );
 
+  /// Builds the tile-grid child of the map Stack.
+  ///
+  /// With [MapView.gridLayerEnabled] off this is the direct viewport-sized
+  /// CustomPaint (historical behavior). When on, the grid paints into a
+  /// repaint boundary whose content identity is [_GridLayerCapture]:
+  /// the painter receives the anchors captured at the last identity
+  /// change, so unchanged content keeps `shouldRepaint` false and the
+  /// retained layer is moved by a paint transform for sub-tile motion.
+  ///
+  /// Geometry: the boundary box extends one rendered tile beyond the
+  /// viewport on every side and its origin sits at screen (−tw, −th), so
+  /// the painter (which offsets content by +tw/+th into box coordinates)
+  /// never paints at negative coordinates. The per-frame translation is
+  /// `live anchors − captured anchors`, strictly within one rendered tile
+  /// per axis between captures (crossing the bound changes the membership
+  /// window and recaptures), so the padded content always covers the
+  /// viewport. Overflow beyond the viewport is clipped by the Stack,
+  /// matching the historical painter's output.
+  Widget _buildTileGrid(TileManager manager, Size size, bool fallbackActive) {
+    if (!MapView.gridLayerEnabled) {
+      return Positioned.fill(
+        child: CustomPaint(
+          size: size,
+          painter: RenderCanvasOSM(
+            horizontalTileCount: manager.horizontalTileCount,
+            verticalTileCount: manager.verticalTileCount,
+            leftColumnTilesLngIndex: manager.leftColumnTilesLngIndex,
+            topRowTilesLatIndex: manager.topRowTilesLatIndex,
+            leftColumnTilesCanvasX: manager.leftColumnTilesCanvasX,
+            topRowTilesCanvasY: manager.topRowTilesCanvasY,
+            tiles: manager.renderTiles,
+            revision: manager.revision,
+            tileScale: manager.zoomScale,
+            paintBackground: !fallbackActive,
+            paintPlaceholders: !fallbackActive,
+          ),
+        ),
+      );
+    }
+
+    final capture = _GridLayerCapture(
+      manager: manager,
+      revision: manager.revision,
+      zoom: manager.zoom,
+      leftLngIndex: manager.leftColumnTilesLngIndex,
+      topLatIndex: manager.topRowTilesLatIndex,
+      horizontalCount: manager.horizontalTileCount,
+      verticalCount: manager.verticalTileCount,
+      tileScale: manager.zoomScale,
+      background: !fallbackActive,
+      placeholders: !fallbackActive,
+      anchorX: manager.leftColumnTilesCanvasX,
+      anchorY: manager.topRowTilesCanvasY,
+    );
+    if (_gridCapture == null || !_gridCapture!.matches(capture)) {
+      _gridCapture = capture;
+    }
+    final cap = _gridCapture!;
+    final dx = manager.leftColumnTilesCanvasX - cap.anchorX;
+    final dy = manager.topRowTilesCanvasY - cap.anchorY;
+    final tileW = manager.renderedTileWidth;
+    final tileH = manager.renderedTileHeight;
+    final boxWidth = size.width + 2 * tileW;
+    final boxHeight = size.height + 2 * tileH;
+    final painter = RenderCanvasOSM(
+      horizontalTileCount: cap.horizontalCount,
+      verticalTileCount: cap.verticalCount,
+      leftColumnTilesLngIndex: cap.leftLngIndex,
+      topRowTilesLatIndex: cap.topLatIndex,
+      // Box coordinates: the box origin sits one rendered tile up-left of
+      // the viewport, so the captured anchors shift by (+tileW, +tileH).
+      leftColumnTilesCanvasX: cap.anchorX + tileW,
+      topRowTilesCanvasY: cap.anchorY + tileH,
+      tiles: manager.renderTiles,
+      revision: cap.revision,
+      tileScale: cap.tileScale,
+      paintBackground: cap.background,
+      paintPlaceholders: cap.placeholders,
+    );
+    return Positioned(
+      left: -tileW,
+      top: -tileH,
+      width: boxWidth,
+      height: boxHeight,
+      child: Transform.translate(
+        offset: Offset(dx, dy),
+        // The repaint boundary retains the grid raster: an offset-only
+        // transform change recomposites this layer without repainting it.
+        child: RepaintBoundary(
+          child: CustomPaint(
+            size: Size(boxWidth, boxHeight),
+            painter: painter,
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     MapView.debugBuildCount++;
@@ -2565,26 +2732,7 @@ class _MapViewState extends State<MapView>
                             ),
                           ),
                         // ── Current tile grid ─
-                        Positioned.fill(
-                          child: CustomPaint(
-                            size: size,
-                            painter: RenderCanvasOSM(
-                              horizontalTileCount: manager.horizontalTileCount,
-                              verticalTileCount: manager.verticalTileCount,
-                              leftColumnTilesLngIndex:
-                                  manager.leftColumnTilesLngIndex,
-                              topRowTilesLatIndex: manager.topRowTilesLatIndex,
-                              leftColumnTilesCanvasX:
-                                  manager.leftColumnTilesCanvasX,
-                              topRowTilesCanvasY: manager.topRowTilesCanvasY,
-                              tiles: manager.renderTiles,
-                              revision: manager.revision,
-                              tileScale: manager.zoomScale,
-                              paintBackground: !fallbackActive,
-                              paintPlaceholders: !fallbackActive,
-                            ),
-                          ),
-                        ),
+                        _buildTileGrid(manager, size, fallbackActive),
 
                         // ── OLD zoom tiles (overlay, animated out) ─────
                         // Keyed: this child inserts/removes mid-animation,

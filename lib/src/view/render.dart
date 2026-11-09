@@ -19,6 +19,12 @@ import 'package:fosm/src/vector/render/vector_trace.dart';
 /// one, while camera-only motion (no revision bump) still repaints at its
 /// new position.
 class RenderCanvasOSM extends CustomPainter {
+  /// Total `paint` invocations across the process. Diagnostics only:
+  /// the plan-12 retained-grid-layer candidate asserts this counter stays
+  /// flat across sub-tile camera motion, and device captures cross-check
+  /// it against the `paint.grid` span count.
+  static int debugPaintCount = 0;
+
   final int horizontalTileCount;
   final int verticalTileCount;
   final int leftColumnTilesLngIndex;
@@ -98,6 +104,7 @@ class RenderCanvasOSM extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
+    debugPaintCount++;
     // Phase-12 attribution: duration span per repaint (spans arm only; no
     // Timeline event, the trace arm reads paint CPU from the profiler).
     final spanStart = VectorSpanLog.enabled ? VectorSpanLog.nowUs() : 0;
