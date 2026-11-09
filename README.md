@@ -630,6 +630,38 @@ if (kIsWeb) {
 // But we yield between operations to keep UI responsive
 ```
 
+#### Web vector pacing
+
+Tile work is paced by a shared cooperative scheduler. Native keeps a 2 ms work
+slice per frame; the JS-compiled web build (`flutter build web`, CanvasKit)
+uses **8 ms**, because Canvas/Path calls cost more across the JS boundary and
+a 2 ms slice made each tile wait dozens of frames between checkpoints while
+the frame itself stayed idle. Override for measurement with
+`--dart-define=fosm.workBudgetMs=<ms>`.
+
+Measured on Chrome 157 / macOS, production Zurich z10 tiles, interleaved
+runs (`docs/performance/vector-render-improvement/web-renderer-ab.md`):
+
+| Cold load scenario | 2 ms slice: 95 % sharp | 8 ms slice: 95 % sharp |
+|---|---|---|
+| static view | not reached in 10 s | 0.87 s |
+| fling / return pan | not reached in 10 s | 0.76–0.88 s |
+| reload with warm bytes | not reached in 10 s | 0.75 s |
+
+Frames over the 16.7 ms budget stay at 0–2 per 10 s window in both.
+
+Zoom preloading: after the camera has been idle for 500 ms the tile manager
+fetches the bytes of the tiles one zoom level in/out (center-first, at most 20
+outstanding requests, never more than 60 % of the 100 MB byte cache). On the
+web the background fetch lane is 6 wide (native: 2). Zooming in one level at
+400 ms latency then reaches 95 % sharp in ~0.5 s instead of ~1.7 s
+(`docs/performance/vector-render-improvement/web-pacing-and-preload.md`).
+`--dart-define=fosm.preloadZoomDepth=N` changes the depth; ±2 is not
+enabled by default (a z+2 level is ~16× the tiles). The
+WebAssembly build (`flutter build web --wasm`, skwasm) reaches the same
+coverage times but adds 5–11 slow frames per window while tiles first appear
+(its snapshot raster runs on a worker), so it is optional, not required.
+
 ## 🎨 Vector Tile Rendering
 
 ### Rendering Pipeline
@@ -786,7 +818,7 @@ does not include compressed bytes, parsed vector data, or labels.
 
 ```dart
 final Map<String, Uint8List> _byteCache = {};
-static const int maxByteCacheBytes = 50 * 1024 * 1024; // 50MB
+static const int maxByteCacheBytes = 100 * 1024 * 1024; // 100MB
 
 void _storeInByteCache(String key, Uint8List bytes) {
   _byteCache[key] = bytes;

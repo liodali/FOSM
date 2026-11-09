@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart' show kIsWasm, kIsWeb;
 import 'package:flutter/scheduler.dart';
 
 import '../api/tile_source.dart' show TileDecodeAborted;
@@ -19,6 +20,22 @@ class TileWorkScheduler {
   /// in the binary identical — the before/after comparison then changes
   /// only the feature under test. Never ship a build with this enabled.
   static const bool disabledByDefine = bool.fromEnvironment('fosm.unpaced');
+
+  /// Shipped cooperative slice per frame. Native and the wasm (skwasm) web
+  /// build keep the 2 ms slice (a tile records in ~1 ms there and never
+  /// yields). On the JS-compiled web build (dart2js + CanvasKit, where
+  /// Canvas/Path calls cross the JS boundary and a vector tile records in
+  /// ~3-5 ms) a 2 ms
+  /// slice made each tile wait dozens of frames between checkpoints while
+  /// the frame itself stayed idle: 8 ms reaches 95 % sharp coverage in
+  /// ~0.9 s instead of never within 10 s on production z10 tiles with the
+  /// same frame-budget misses (plan 07, web-renderer-ab.md). 16 ms was
+  /// tried and regressed frame tails on heavy tiles.
+  static Duration defaultBudgetFor({required bool jsWeb}) =>
+      Duration(milliseconds: jsWeb ? 8 : 2);
+
+  /// Whether this build is the JS-compiled web target.
+  static const bool isJsWeb = kIsWeb && !kIsWasm;
 
   TileWorkScheduler({
     this.budget = const Duration(milliseconds: 2),
@@ -223,8 +240,8 @@ abstract class _ImageWork {
 }
 
 class _TypedImageWork<T> extends _ImageWork {
-  _TypedImageWork(this.create, super.priority, super.isRelevant,
-      super.onRelevanceDrop);
+  _TypedImageWork(
+      this.create, super.priority, super.isRelevant, super.onRelevanceDrop);
   final Future<T> Function() create;
   final result = Completer<T>();
 

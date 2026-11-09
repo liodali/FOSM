@@ -658,15 +658,18 @@ class _MapViewState extends State<MapView>
   /// the measurement-only `fosm.unpaced` define (unpaced pre-scheduler
   /// behaviour). See [TileWorkScheduler.disabledByDefine]. The
   /// `fosm.workBudgetMs` / `fosm.imageStartsPerFrame` / `fosm.activeImages`
-  /// defines override the pacing for measurement A/B captures; their
-  /// defaults reproduce the shipped pacing exactly.
+  /// defines override the pacing for measurement A/B captures; unset they
+  /// reproduce the shipped pacing (2 ms slice native/wasm, 8 ms on JS web — see
+  /// [TileWorkScheduler.defaultBudgetFor]).
   final TileWorkScheduler? _tileWorkScheduler = TileWorkScheduler
           .disabledByDefine
       ? null
       : TileWorkScheduler(
-          budget: Duration(
-              milliseconds: const int.fromEnvironment('fosm.workBudgetMs',
-                  defaultValue: 2)),
+          budget: const int.fromEnvironment('fosm.workBudgetMs') > 0
+              ? Duration(
+                  milliseconds: const int.fromEnvironment('fosm.workBudgetMs'))
+              : TileWorkScheduler.defaultBudgetFor(
+                  jsWeb: TileWorkScheduler.isJsWeb),
           maxImageStartsPerFrame: const int.fromEnvironment(
               'fosm.imageStartsPerFrame',
               defaultValue: 2),

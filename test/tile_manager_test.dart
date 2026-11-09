@@ -681,6 +681,74 @@ void main() {
       manager.dispose();
     });
 
+    testWidgets('preloadZoomDepth 2 also pre-loads z±2; 0 disables',
+        (tester) async {
+      Future<Set<int>> fetchedWith(int depth, Set<int> expected) async {
+        final zooms = <int>{};
+        final manager = TileManager.init(
+          width: 256,
+          height: 256,
+          centerLatLng: LatLng(latitude: 0, longitude: 0),
+          zoom: 5,
+          fetcher: (z, x, y) async {
+            zooms.add(z);
+            return fakeTilePng;
+          },
+          tilePadding: 0,
+          preloadAdjacentZoom: true,
+          preloadZoomDepth: depth,
+          // Non-zero debounce enables the continuation timer: one pass is
+          // capped at maxConcurrentPreloads (z±1 alone is 20 tiles here).
+          preloadDebounce: const Duration(milliseconds: 1),
+        );
+        addTearDown(manager.dispose);
+        manager.calculate();
+        final clock = Stopwatch()..start();
+        while (clock.elapsed < const Duration(seconds: 15) &&
+            (expected.isEmpty
+                ? clock.elapsed < const Duration(seconds: 1)
+                : !zooms.containsAll(expected))) {
+          await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 5)));
+          await tester.pump(const Duration(milliseconds: 400));
+        }
+        manager.dispose();
+        return zooms;
+      }
+
+      expect(await fetchedWith(0, {}), {5},
+          reason: 'depth 0 must fetch only the visible zoom');
+      expect(await fetchedWith(1, {4, 5, 6}), {4, 5, 6});
+      expect(await fetchedWith(2, {3, 4, 5, 6, 7}), {3, 4, 5, 6, 7});
+    });
+
+    testWidgets('preload is center-first when the pass is capped',
+        (tester) async {
+      final z6 = <String>[];
+      final manager = TileManager.init(
+        width: 1024,
+        height: 768,
+        centerLatLng: LatLng(latitude: 0, longitude: 0),
+        zoom: 5,
+        fetcher: (z, x, y) async {
+          if (z == 6) z6.add('$x/$y');
+          return fakeTilePng;
+        },
+        tilePadding: 0,
+        preloadAdjacentZoom: true,
+        preloadDebounce: Duration.zero,
+      );
+      addTearDown(manager.dispose);
+      manager.calculate();
+      await _settleUntil(tester, () => z6.length >= 15,
+          timeout: const Duration(seconds: 10));
+      // Four z6 tiles meet at the world center (0,0) = tile corner 32/32;
+      // a capped pass must include them before the viewport corners.
+      expect(z6, containsAll(<String>['31/31', '32/31', '31/32', '32/32']));
+      expect(z6.length, lessThanOrEqualTo(TileManager.maxConcurrentPreloads));
+      expect(z6.length, lessThan(48), reason: 'the pass is capped');
+    });
+
     testWidgets('zoom change uses cached tiles from pre-load', (tester) async {
       var fetchCount = 0;
       Future<Uint8List> countingFetcher(int z, int x, int y) async {
@@ -2962,8 +3030,7 @@ void main() {
       await _settleUntil(tester, () => counts.spec >= ringCount);
       // Drain the presentation lane so every ring image is actually in the
       // rendered cache before the promotion assertions.
-      await _settleUntil(
-          tester, () => manager.pendingPresentationCount == 0);
+      await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
 
       // Only strict-viewport tiles ever reach the regular decoder.
       expect(counts.regularCount, lessThanOrEqualTo(visibleH * visibleV));
@@ -3000,9 +3067,8 @@ void main() {
               latitude: center.latitude,
               longitude: center.longitude + tileDeg));
       manager.calculate();
-      final promotedImages = manager.renderTiles
-          .where((t) => t.sourceTile != null)
-          .length;
+      final promotedImages =
+          manager.renderTiles.where((t) => t.sourceTile != null).length;
       expect(promoted, isNotEmpty,
           reason: 'cache-served visible tiles must fire the promotion hook');
       // The cached bytes reach the runtime so label recovery can reparse
@@ -3048,7 +3114,8 @@ void main() {
       manager.dispose();
     });
 
-    testWidgets('memory pressure suspends speculative admission', (tester) async {
+    testWidgets('memory pressure suspends speculative admission',
+        (tester) async {
       final counts = _SpecCounts();
       final gate = Completer<void>();
       counts.specGate = gate;
@@ -3128,7 +3195,8 @@ void main() {
       manager.dispose();
     });
 
-    testWidgets('camera change revokes speculative relevance immediately: '
+    testWidgets(
+        'camera change revokes speculative relevance immediately: '
         'stale relevance dies and revoked results neither publish nor '
         'promote', (tester) async {
       final counts = _SpecCounts();
@@ -3155,8 +3223,8 @@ void main() {
       manager.calculate();
       // Park the background-lane speculative decodes on the gate; two run
       // concurrently (the lane limit), any further admission stays queued.
-      await _settleUntil(
-          tester, () => counts.calls.where((c) => c.startsWith('spec:')).length >= 2);
+      await _settleUntil(tester,
+          () => counts.calls.where((c) => c.startsWith('spec:')).length >= 2);
       final observed = counts.calls
           .where((c) => c.startsWith('spec:'))
           .map((c) => c.substring('spec:'.length))
@@ -3168,25 +3236,24 @@ void main() {
       int yOf(String tile) => int.parse(tile.split('/')[2]);
 
       // Camera change while speculative decodes are in flight and queued.
-      manager.setCenterTile(
-          latLng: const LatLng(latitude: 60, longitude: 120));
+      manager.setCenterTile(latLng: const LatLng(latitude: 60, longitude: 120));
       manager.calculate();
       // The core P1 invariant: revocation is synchronous. In-flight
       // speculative decodes lose their relevance extension right here,
       // before they can keep holding decode slots after foreground demand
       // returned, and the trace records the queued-work drop.
       expect(
-          manager.isTileRelevant(zOf(observed[0]), xOf(observed[0]),
-              yOf(observed[0])),
+          manager.isTileRelevant(
+              zOf(observed[0]), xOf(observed[0]), yOf(observed[0])),
           isFalse,
           reason: '$observed was decoded speculatively');
       expect(
-          manager.isTileRelevant(zOf(observed[1]), xOf(observed[1]),
-              yOf(observed[1])),
+          manager.isTileRelevant(
+              zOf(observed[1]), xOf(observed[1]), yOf(observed[1])),
           isFalse);
       expect(
-          trace.any((line) => line.startsWith('revoke:') &&
-              !line.contains('nothing admitted')),
+          trace.any((line) =>
+              line.startsWith('revoke:') && !line.contains('nothing admitted')),
           isTrue,
           reason: 'the camera revocation must record the dropped work, '
               'not a no-op');
@@ -3200,16 +3267,14 @@ void main() {
       });
       await tester.pump();
       for (final tile in observed) {
-        expect(
-            manager.isTileRelevant(
-                zOf(tile), xOf(tile), yOf(tile)),
-            isFalse,
+        expect(manager.isTileRelevant(zOf(tile), xOf(tile), yOf(tile)), isFalse,
             reason: '$tile stays irrelevant for the far ring');
       }
       manager.dispose();
     });
 
-    testWidgets('corrupt speculative bytes recover once the tile becomes '
+    testWidgets(
+        'corrupt speculative bytes recover once the tile becomes '
         'visible', (tester) async {
       final counts = _SpecCounts();
       final gate = Completer<void>();
@@ -3269,9 +3334,8 @@ void main() {
       await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
 
       final renderKey = '${parts[0]}/${parts[1]}/${parts[2]}';
-      final slot = manager.renderTiles
-          .where((t) => t.index == renderKey)
-          .toList();
+      final slot =
+          manager.renderTiles.where((t) => t.index == renderKey).toList();
       expect(slot, hasLength(1));
       expect(slot.first.sourceTile, isNotNull,
           reason: 'the refetched presentation must publish into the now-'
@@ -3337,8 +3401,7 @@ void main() {
       // entered, not that their `ui.Image` work resolved — a pending
       // engine decode whose tile got revoked by the pan below would abort
       // its result instead of publishing it.
-      await _settleUntil(
-          tester, () => manager.pendingPresentationCount == 0);
+      await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
       await tester.pump();
 
       // Pan one deep tile west so it becomes visible: the pre-rendered
@@ -3444,8 +3507,7 @@ void main() {
       expect(manager.isTileRelevant(3, 1, 4), isTrue,
           reason: 'the in-flight deep fetch holds its relevance extension');
 
-      manager.setCenterTile(
-          latLng: const LatLng(latitude: 60, longitude: 120));
+      manager.setCenterTile(latLng: const LatLng(latitude: 60, longitude: 120));
       manager.calculate();
       expect(manager.isTileRelevant(3, 1, 4), isFalse,
           reason: 'revocation drops deep work exactly like ring-1 work');

@@ -12,6 +12,15 @@ Future<void> _flush() async {
 }
 
 void main() {
+  test('default work slice is 8 ms only for the JS-compiled web build', () {
+    expect(TileWorkScheduler.defaultBudgetFor(jsWeb: true),
+        const Duration(milliseconds: 8));
+    expect(TileWorkScheduler.defaultBudgetFor(jsWeb: false),
+        const Duration(milliseconds: 2));
+    // The VM test runner is neither web nor wasm.
+    expect(TileWorkScheduler.isJsWeb, isFalse);
+  });
+
   test('render and label checkpoints share one budget and frame wait',
       () async {
     var elapsed = Duration.zero;
@@ -175,9 +184,7 @@ void main() {
     final dropped = scheduler.image(() async {
       created = true;
       return 2;
-    },
-        isRelevant: () => relevant,
-        onRelevanceDrop: () => drops++);
+    }, isRelevant: () => relevant, onRelevanceDrop: () => drops++);
     final expectation = expectLater(dropped, throwsA(isA<TileDecodeAborted>()));
     await _flush();
     relevant = false;
@@ -189,8 +196,7 @@ void main() {
     // Disposal aborts are teardown, not relevance drops: a queued relevant
     // image that never runs must not fire the callback.
     var disposalDrops = 0;
-    scheduler.image(() async => 3,
-        onRelevanceDrop: () => disposalDrops++);
+    scheduler.image(() async => 3, onRelevanceDrop: () => disposalDrops++);
     await _flush();
     scheduler.dispose();
     await _flush();

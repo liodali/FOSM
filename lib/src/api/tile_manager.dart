@@ -38,7 +38,7 @@ class _PendingFetch {
 class TileManager with CacheTiles {
   @Deprecated('Rendered images now use maxRenderedCacheBytes instead.')
   static const int maxMemoryCachedTiles = 200;
-  static const int maxByteCacheBytes = 50 * 1024 * 1024; // 50MB compressed
+  static const int maxByteCacheBytes = 100 * 1024 * 1024; // 100MB compressed
   static const Duration failureBackoff = Duration(seconds: 5);
   static const int defaultTilePadding = 2;
 
@@ -62,7 +62,17 @@ class TileManager with CacheTiles {
   /// work is bytes-only vector padding, adjacent-zoom preloading and (when
   /// enabled) speculative preparation; it only starts when no foreground
   /// download or presentation is queued or active.
-  static const int maxConcurrentBackgroundLoads = 2;
+  static const int maxConcurrentBackgroundLoads =
+      _backgroundLoadsDefine > 0 ? _backgroundLoadsDefine : (kIsWeb ? 6 : 2);
+
+  /// `--dart-define=fosm.backgroundLoads=N` overrides the lane width for
+  /// measurement A/B runs (0 = shipped default). On the web the lane is 6
+  /// wide (the browser's per-host connection limit): idle-time adjacent-zoom
+  /// preloads at 2 wide filled too slowly to matter at realistic latency
+  /// (400 ms RTT: no zoom-in gain; 6 wide: 1.68 s → ~0.5 s to 95 % sharp).
+  /// Native keeps 2 (not re-measured).
+  static const int _backgroundLoadsDefine =
+      int.fromEnvironment('fosm.backgroundLoads');
 
   /// Test/debug hook: receives a compact trace line for every
   /// speculative admission decision, revocation and camera-generation
@@ -95,6 +105,13 @@ class TileManager with CacheTiles {
   /// shipped 12. 0 keeps the constructor default.
   static const int speculativeBudgetByDefine =
       int.fromEnvironment('fosm.vectorSpeculationBudget');
+
+  /// Adjacent-zoom byte preload depth: tiles at `zoom ± 1 … ± depth` are
+  /// fetched (bytes only) during idle time. `0` disables the preload.
+  /// `--dart-define=fosm.preloadZoomDepth=N` overrides it for measurement
+  /// A/B runs; the default keeps the shipped ±1.
+  static const int preloadZoomDepthByDefine =
+      int.fromEnvironment('fosm.preloadZoomDepth', defaultValue: 1);
 
   /// Whether to speculatively prepare nearest-ring vector padding tiles
   /// during idle time: their bytes are already cached bytes-only, and a
@@ -420,6 +437,10 @@ class TileManager with CacheTiles {
   final int tilePadding;
   final bool preloadAdjacentZoom;
 
+  /// Adjacent-zoom byte preload depth (levels either side). See
+  /// [preloadZoomDepthByDefine].
+  final int preloadZoomDepth;
+
   /// Optional hard bounding box the camera can never leave. `null`
   /// disables the constraint.
   LatLngBounds? cameraBounds;
@@ -448,6 +469,10 @@ class TileManager with CacheTiles {
   /// The tile coords of the center when pre-loading last ran.
   int _lastPreloadCenterX = 0;
   int _lastPreloadCenterY = 0;
+
+  /// True while a preload pass left candidates unqueued (cap or byte-cache
+  /// share reached); a continuation timer re-runs it as the lane drains.
+  bool _preloadPending = false;
 
   // ── Strict viewport (Phase 1) ───────────────────────────────────────
   //
@@ -793,6 +818,7 @@ class TileManager with CacheTiles {
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
+    this.preloadZoomDepth = preloadZoomDepthByDefine,
     this.byteOnlyPadding = false,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
@@ -2459,7 +2485,8 @@ class TileManager with CacheTiles {
     final cy = centerTileLat.floor();
     if (_lastPreloadedZoom == zoom &&
         _lastPreloadCenterX == cx &&
-        _lastPreloadCenterY == cy) {
+        _lastPreloadCenterY == cy &&
+        !_preloadPending) {
       return;
     }
 
@@ -2481,13 +2508,25 @@ class TileManager with CacheTiles {
   }
 
   /// Actually runs the pre-loading. Called only after the debounce timer
-  /// fires (user has stopped panning).
+  /// fires (user has stopped panning), and again by the continuation timer
+  /// while candidates remain.
+  ///
+  /// Candidates are every tile covering the visible area at `zoom ± k`
+  /// (k = 1…[preloadZoomDepth]), ordered nearest zoom level first and then
+  /// nearest the viewport center, so a capped pass preloads what the next
+  /// zoom gesture needs first. At most [maxConcurrentPreloads] preload jobs
+  /// are outstanding (queued or in flight) at once, and the pass stops
+  /// admitting work once preloaded bytes use more than
+  /// [_preloadByteShare] of the byte cache so it cannot evict the tiles of
+  /// the zoom level being viewed.
   void _runAdjacentZoomPreload() {
     if (_disposed) return;
-
     _lastPreloadedZoom = zoom;
     _lastPreloadCenterX = centerTileLng.floor();
     _lastPreloadCenterY = centerTileLat.floor();
+    _preloadPending = false;
+    final depth = preloadZoomDepth;
+    if (depth <= 0) return;
 
     // Visible area (before padding).
     final visibleLeftLng = leftColumnTilesLngIndex + tilePadding;
@@ -2495,64 +2534,84 @@ class TileManager with CacheTiles {
     final visibleHCount = (horizontalTileCount - 2 * tilePadding).clamp(0, 100);
     final visibleVCount = (verticalTileCount - 2 * tilePadding).clamp(0, 100);
 
-    // Only preload ±1 zoom (±2 creates 1000+ tiles that compete with
-    // visible tile fetches and freeze the UI, especially in vector mode).
-    // Priority: closest zoom levels first.
-    final zoomDeltas = <int>[];
-    for (final dz in [1, -1]) {
-      final z = zoom + dz;
-      if (z >= 0 && z <= 19) zoomDeltas.add(dz);
-    }
-
-    // Bound how many adjacent-zoom preloads a single run enqueues (the
-    // next idle debounce enqueues more). Without this cap a low zoom or
-    // large viewport would queue hundreds of background fetches at once.
-    var enqueued = 0;
-
-    outer:
-    for (final dz in zoomDeltas) {
-      final z = zoom + dz;
-      // For zoom-in (dz > 0), one tile at current zoom maps to 2^dz × 2^dz tiles at target zoom.
-      // For zoom-out (dz < 0), multiple tiles at current zoom map to one tile at target zoom.
-      final tileMultiplier = dz > 0 ? (1 << dz) : 1;
-
-      for (var h = 0; h < visibleHCount; h++) {
-        for (var v = 0; v < visibleVCount; v++) {
-          final lngIndex = visibleLeftLng + h;
-          final latIndex = visibleTopLat + v;
-
-          // Map this tile's top-left corner to the target zoom.
-          final lng = tileX2Lng(lngIndex.toDouble(), zoom);
-          final lat = tileY2Lat(latIndex.toDouble(), zoom);
-          final otherX = lon2TileX(lng, z).floor();
-          final otherY = lat2TileY(lat, z).floor();
-
-          // Load all tiles that cover this geographic area at target zoom.
-          for (var dx = 0; dx < tileMultiplier; dx++) {
-            for (var dy = 0; dy < tileMultiplier; dy++) {
-              final tx = otherX + dx;
-              final ty = otherY + dy;
-              final key = _key(z, tx, ty);
-
-              // Skip if already cached, in-flight, or queued. The memory
-              // cache is per slot; source bytes are per resource.
-              if (_memoryCache.containsKey(key)) continue;
-              if (_byteCache.containsKey(_resourceKey(z, tx, ty))) continue;
-              if (_inFlight.contains(key)) continue;
-              if (_queued.contains(key)) continue;
-              if (ty < 0 || ty >= (1 << z)) continue;
-
-              if (enqueued >= maxConcurrentPreloads) break outer;
-              _preloadTile(key, z, tx, ty);
-              enqueued++;
+    final candidates = <_PreloadCandidate>[];
+    final seen = <String>{};
+    for (var k = 1; k <= depth; k++) {
+      for (final dz in [k, -k]) {
+        final z = zoom + dz;
+        if (z < 0 || z > 19) continue;
+        // Zoom-in: one visible tile covers 2^dz × 2^dz tiles at the target
+        // zoom. Zoom-out: several visible tiles share one target tile.
+        final tileMultiplier = dz > 0 ? (1 << dz) : 1;
+        for (var h = 0; h < visibleHCount; h++) {
+          for (var v = 0; v < visibleVCount; v++) {
+            final lngIndex = visibleLeftLng + h;
+            final latIndex = visibleTopLat + v;
+            final lng = tileX2Lng(lngIndex.toDouble(), zoom);
+            final lat = tileY2Lat(latIndex.toDouble(), zoom);
+            final otherX = lon2TileX(lng, z).floor();
+            final otherY = lat2TileY(lat, z).floor();
+            final dx = lngIndex + 0.5 - centerTileLng;
+            final dy = latIndex + 0.5 - centerTileLat;
+            final distance = dx * dx + dy * dy;
+            for (var ox = 0; ox < tileMultiplier; ox++) {
+              for (var oy = 0; oy < tileMultiplier; oy++) {
+                final tx = otherX + ox;
+                final ty = otherY + oy;
+                if (ty < 0 || ty >= (1 << z)) continue;
+                final key = _key(z, tx, ty);
+                if (!seen.add(key)) continue;
+                candidates.add(_PreloadCandidate(
+                    key: key, z: z, x: tx, y: ty, dz: k, distance: distance));
+              }
             }
           }
         }
       }
     }
+    candidates.sort((a, b) {
+      final level = a.dz.compareTo(b.dz);
+      return level != 0 ? level : a.distance.compareTo(b.distance);
+    });
+
+    var outstanding = 0;
+    for (final c in candidates) {
+      if (_inFlight.contains(c.key) || _queued.contains(c.key)) outstanding++;
+    }
+    final byteBudget = (maxByteCacheBytes * _preloadByteShare).round();
+    var remaining = false;
+    for (final c in candidates) {
+      // Skip if already cached, in-flight, or queued. The memory cache is
+      // per slot; source bytes are per resource.
+      if (_memoryCache.containsKey(c.key)) continue;
+      if (_byteCache.containsKey(_resourceKey(c.z, c.x, c.y))) continue;
+      if (_inFlight.contains(c.key) || _queued.contains(c.key)) continue;
+      if (outstanding >= maxConcurrentPreloads ||
+          _byteCacheSize >= byteBudget) {
+        remaining = true;
+        break;
+      }
+      _preloadTile(c.key, c.z, c.x, c.y);
+      outstanding++;
+    }
 
     _pumpLoadQueue();
+
+    if (remaining &&
+        _byteCacheSize < byteBudget &&
+        preloadDebounce != Duration.zero) {
+      // The lane is full, not exhausted: look again as it drains. Camera
+      // changes cancel this timer (and re-evaluate from the new view).
+      _preloadPending = true;
+      _preloadTimer?.cancel();
+      _preloadTimer = Timer(const Duration(milliseconds: 750), () {
+        if (!_disposed) _runAdjacentZoomPreload();
+      });
+    }
   }
+
+  /// Share of [maxByteCacheBytes] adjacent-zoom preloading may fill.
+  static const double _preloadByteShare = 0.6;
 
   /// Enqueues a background, bytes-only preload for an adjacent-zoom tile.
   ///
@@ -2871,5 +2930,28 @@ class _CorruptResourceState {
   _CorruptResourceState({
     required this.rejectedPayloadId,
     required this.rejectedBytes,
+  });
+}
+
+/// One adjacent-zoom preload candidate (see `_runAdjacentZoomPreload`).
+class _PreloadCandidate {
+  final String key;
+  final int z;
+  final int x;
+  final int y;
+
+  /// Zoom distance from the current level (1 = nearest).
+  final int dz;
+
+  /// Squared distance of the originating visible tile from the center.
+  final double distance;
+
+  const _PreloadCandidate({
+    required this.key,
+    required this.z,
+    required this.x,
+    required this.y,
+    required this.dz,
+    required this.distance,
   });
 }
