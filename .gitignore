@@ -86,7 +86,13 @@ build/
 /docs/performance/
 
 # Local-only benchmark usage artifacts and experiment harnesses.
+# New benchmark Dart files are usage-only; historically tracked benchmark
+# Dart sources remain tracked until explicitly removed from the index.
 /example/benchmark/
+/example/lib/benchmark/*.dart
+/example/test/benchmark/*.dart
+/example/tool/*benchmark*.dart
+/example/tool/vector_payload_server.dart
 /example/lib/benchmark/web_snapshot_microbench.dart
 /example/tool/capture_web_ab.sh
 /example/tool/capture_web_snapshot_microbench.sh
