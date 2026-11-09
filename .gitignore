@@ -84,3 +84,10 @@ build/
 # Performance reports and raw captures are local-only; commits carry code
 # and tooling only (dart/sh). See docs/performance/README.md on disk.
 /docs/performance/
+
+# Local-only benchmark usage artifacts and experiment harnesses.
+/example/benchmark/
+/example/lib/benchmark/web_snapshot_microbench.dart
+/example/tool/capture_web_ab.sh
+/example/tool/capture_web_snapshot_microbench.sh
+/example/tool/serve_coi.py
