@@ -39,10 +39,14 @@ set -euo pipefail
 
 device="${1:?device id}"
 out="${2:?output dir}"
-lan_ip="${3:-$(ipconfig getifaddr en0)}"
-clean_reps="${4:-3}"
-span_reps="${5:-2}"
-trace_reps="${6:-1}"
+shift 2
+lan_ip="${1:-$(ipconfig getifaddr en0)}"
+clean_reps="${2:-3}"
+span_reps="${3:-2}"
+trace_reps="${4:-1}"
+# Optional positional repetitions are consumed above; everything left in
+# "$@" is forwarded verbatim to every run as extra dart-defines.
+shift $(( $# < 4 ? $# : 4 ))
 port=8787
 base="http://${lan_ip}:${port}"
 dash_args=()
