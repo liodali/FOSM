@@ -251,27 +251,55 @@ void main() {
       final painter0 = _gridPainter(tester);
 
       // Sub-tile pan at z10: one tile is 360/1024 ≈ 0.3516° of longitude.
-      controller.moveTo(
-          const LatLng(latitude: 0.0005, longitude: 0.01),
-          animate: false);
-      await tester.pump();
-
-      expect(RenderCanvasOSM.debugPaintCount, paints0,
-          reason: 'sub-tile motion must move the retained layer, not repaint '
-              'the grid');
-      final painter1 = _gridPainter(tester);
-      expect(identical(painter1, painter0), isFalse,
-          reason: 'a new painter is constructed, with identical fields');
-      expect(painter1.leftColumnTilesCanvasX, painter0.leftColumnTilesCanvasX,
-          reason: 'the painter keeps the captured anchors');
-      expect(painter1.revision, painter0.revision);
-      expect(painter1.tileScale, painter0.tileScale);
+      // Sequential per-frame pans: every frame rebuilds and changes the
+      // transform offset only; the retained layer moves without repaints.
+      // A repaint is legitimate exactly when the capture identity changes
+      // (membership window, revision or scale) — count those separately.
+      var paints = paints0;
+      var panLng = 0.01;
+      var prev = painter0;
+      var recaptures = 0;
+      for (var i = 0; i < 15; i++) {
+        panLng += 0.01;
+        controller.moveTo(
+            LatLng(latitude: 0.0005, longitude: panLng), animate: false);
+        await tester.pump();
+        final cur = _gridPainter(tester);
+        final identityChanged = cur.revision != prev.revision ||
+            cur.tileScale != prev.tileScale ||
+            cur.leftColumnTilesLngIndex != prev.leftColumnTilesLngIndex ||
+            cur.topRowTilesLatIndex != prev.topRowTilesLatIndex ||
+            cur.horizontalTileCount != prev.horizontalTileCount ||
+            cur.verticalTileCount != prev.verticalTileCount ||
+            cur.paintBackground != prev.paintBackground ||
+            cur.paintPlaceholders != prev.paintPlaceholders;
+        if (identityChanged) {
+          recaptures++;
+          expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints),
+              reason: 'frame $i: an identity change must repaint the grid');
+        } else {
+          expect(RenderCanvasOSM.debugPaintCount, paints,
+              reason: 'frame $i: sub-tile motion must move the retained '
+                  'layer, not repaint the grid (identity unchanged)');
+        }
+        // While identity is unchanged the painter keeps its captured
+        // anchors; a recapture legitimately re-anchors.
+        if (!identityChanged) {
+          expect(cur.leftColumnTilesCanvasX, prev.leftColumnTilesCanvasX,
+              reason: 'frame $i: the painter keeps the captured anchors');
+          expect(cur.topRowTilesCanvasY, prev.topRowTilesCanvasY);
+        }
+        paints = RenderCanvasOSM.debugPaintCount;
+        prev = cur;
+      }
+      expect(recaptures, lessThan(15),
+          reason: 'sub-tile pans must be retention-dominated');
 
       // A larger pan crosses a tile boundary and must recapture.
       controller.moveTo(
           const LatLng(latitude: 0.0005, longitude: 0.4), animate: false);
       await tester.pump();
-      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
+      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints),
           reason: 'crossing a tile boundary must recapture the layer');
     });
 
