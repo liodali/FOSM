@@ -1,7 +1,12 @@
 #!/bin/zsh
 # Plan-01 vector-render baseline captures (attribution + user-visible arms).
 # Usage: zsh tool/capture_vector_baseline.sh DEVICE_ID OUTPUT_DIR \
-#          [LAN_IP] [CLEAN_REPS] [SPAN_REPS] [TRACE_REPS]
+#          [LAN_IP] [CLEAN_REPS] [SPAN_REPS] [TRACE_REPS] \
+#          [EXTRA_DART_DEFINES...]
+#
+# EXTRA_DART_DEFINES (everything after the positional arguments) are
+# forwarded verbatim to every run — e.g. candidate arms:
+#   --dart-define=fosm.gridLayer=true
 #
 # Starts the deterministic payload server on the LAN IP, then runs the
 # vector benchmark app on the device in profile mode:
@@ -196,19 +201,19 @@ run_benchmark() {
 
 rep=1
 while [[ $rep -le $clean_reps ]]; do
-  run_benchmark "vector-clean-r$rep"
+  run_benchmark "vector-clean-r$rep" "$@"
   rep=$((rep + 1))
 done
 rep=1
 while [[ $rep -le $span_reps ]]; do
-  run_benchmark "vector-spans-r$rep" --dart-define=fosm.vectorSpans=true
+  run_benchmark "vector-spans-r$rep" --dart-define=fosm.vectorSpans=true "$@"
   rep=$((rep + 1))
 done
 rep=1
 while [[ $rep -le $trace_reps ]]; do
   run_benchmark "vector-trace-r$rep" \
     --dart-define=fosm.vectorSpans=true --dart-define=fosm.traceVector=true \
-    --dart-define=fosm.vectorTraceChunks=false
+    --dart-define=fosm.vectorTraceChunks=false "$@"
   rep=$((rep + 1))
 done
 
