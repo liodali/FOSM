@@ -431,13 +431,18 @@ class MapView extends StatefulWidget {
   @visibleForTesting
   static int debugBuildCount = 0;
 
-  /// Plan-12 candidate: retained grid layer. When on, the tile grid paints
-  /// into a repaint boundary only when its content identity changes
-  /// (revision, membership window, tile scale, background flags); sub-tile
-  /// camera motion moves the retained layer with a paint transform instead
-  /// of redrawing every tile image. Off by default; enabled with
-  /// `--dart-define=fosm.gridLayer=true`, mutable at runtime for tests.
-  static const gridLayerByDefine = bool.fromEnvironment('fosm.gridLayer');
+  /// Plan-12 candidate: retained grid layer, **enabled by default**
+  /// (2026-11-10 device A/B: warm-fling median frame 4.59→1.35 ms, grid
+  /// paint ~10× lower, zero over-budget frames, pinch equivalent; full
+  /// tables in docs/performance/vector-render-improvement/canvas-pipeline.md).
+  /// The tile grid paints into a repaint boundary only when its content
+  /// identity changes (revision, membership window, tile scale, background
+  /// flags); sub-tile camera motion moves the retained layer with a paint
+  /// transform instead of redrawing every tile image. Disable with
+  /// `--dart-define=fosm.gridLayer=false`; the static stays mutable for
+  /// tests.
+  static const gridLayerByDefine =
+      bool.fromEnvironment('fosm.gridLayer', defaultValue: true);
   static bool gridLayerEnabled = gridLayerByDefine;
 
 

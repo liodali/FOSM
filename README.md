@@ -662,6 +662,24 @@ WebAssembly build (`flutter build web --wasm`, skwasm) reaches the same
 coverage times but adds 5–11 slow frames per window while tiles first appear
 (its snapshot raster runs on a worker), so it is optional, not required.
 
+#### Retained grid layer (native pan headroom)
+
+The tile grid paints into a repaint boundary whose raster is retained while
+its content is unchanged (revision, membership window, tile scale and
+background flags). Sub-tile camera motion — pan and fling — then moves the
+retained layer with a paint transform instead of redrawing every tile image;
+fractional zoom, tile arrivals and membership changes recapture normally.
+On the measured device (iPhone, production Zurich z10 tiles) this lowers the
+median pan frame from 4.59 ms to **1.35 ms** and total grid paint work about
+**10×**, with zero over-budget frames, unchanged reveal/label latency, and
+unchanged pinch behavior (fractional zoom repaints per frame there by
+design). The retained layer costs one compositor texture of the padded
+viewport (roughly one tile of slack per side) — on the test device about
+44 MB GPU at DPR 3, on top of the image cache. Enabled by default; disable
+with `--dart-define=fosm.gridLayer=false`.
+`docs/performance/vector-render-improvement/canvas-pipeline.md` holds the
+attribution and paired-capture tables.
+
 ## 🎨 Vector Tile Rendering
 
 ### Rendering Pipeline
