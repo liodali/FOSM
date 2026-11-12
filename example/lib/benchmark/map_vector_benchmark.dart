@@ -84,6 +84,10 @@ const _sampleSeconds =
 /// Optional exact scenario name for short, paired candidate captures.
 const _scenarioFilter = String.fromEnvironment('BENCHMARK_SCENARIO');
 
+/// `BENCHMARK_SCENARIO` may list several exact names, comma-separated.
+final _scenarioFilterNames =
+    _scenarioFilter.isEmpty ? const <String>[] : _scenarioFilter.split(',');
+
 /// Upper bound for the settle phase that establishes warm cache states.
 const _settleSeconds =
     int.fromEnvironment('BENCHMARK_SETTLE_SECONDS', defaultValue: 25);
@@ -96,7 +100,7 @@ final _center = LatLng(
 );
 
 /// Camera-motion family used while sampling.
-enum _Motion { none, fling, pinch, returnPan, returnFrom }
+enum _Motion { none, fling, pinch, pinchPan, returnPan, returnFrom }
 
 /// How each scenario's cache state is established (see file comment).
 enum _CacheState {
@@ -124,6 +128,31 @@ class _Scenario {
   /// zero preserves the historical continuously-moving protocol.
   final int motionSettleMs;
 
+  /// Zoom-step protocol (adjacent-zoom preload A/B): cold bytes are cleared,
+  /// the map mounts and settles at [startZoom], idles [idleBeforeMs] (the
+  /// preload debounce plus background fetches run), then the window is armed
+  /// and the camera jumps [zoomStep] levels (positive = in). Time-to-sharp
+  /// of the new zoom is the measurement. 0 keeps the historical protocols.
+  final int zoomStep;
+  final int idleBeforeMs;
+
+  /// With [zoomStep] != 0 and [legHoldMs] > 0, the window records a second
+  /// leg: after holding the stepped zoom for [legHoldMs] the camera jumps
+  /// back to [startZoom], measuring zoom-reversal reuse (plan 13). The
+  /// hold must exceed the rendered cache's 20 s inactive retention for
+  /// the `_expired` variants to measure expiry misses rather than reuse.
+  final int legHoldMs;
+
+  /// Animated controller zoom executed right after arming (levels,
+  /// positive = in). Exercises the animated-zoom overlay/reveal path with
+  /// whatever cache state the scenario establishes.
+  final int animatedZoom;
+
+  /// Per-scenario window length override; 0 uses the global
+  /// `BENCHMARK_SAMPLE_SECONDS` default. Two-leg cycle windows need more
+  /// than the default 10 s.
+  final int sampleSeconds;
+
   const _Scenario(
     this.name, {
     this.motion = _Motion.none,
@@ -132,7 +161,15 @@ class _Scenario {
     this.startZoom = 10,
     this.styleSwitch = false,
     this.motionSettleMs = 0,
+    this.zoomStep = 0,
+    this.idleBeforeMs = 0,
+    this.legHoldMs = 0,
+    this.animatedZoom = 0,
+    this.sampleSeconds = 0,
   });
+
+  /// Effective recorded-window length for this scenario.
+  int get windowSeconds => sampleSeconds > 0 ? sampleSeconds : _sampleSeconds;
 }
 
 const _scenarios = [
@@ -154,10 +191,40 @@ const _scenarios = [
   _Scenario('vector_cold_pinch_settle',
       motion: _Motion.pinch, motionSettleMs: 3000),
   _Scenario('vector_cold_overzoom', startZoom: 16),
+  // Zoom steps after an idle period (adjacent-zoom byte preload A/B; pair
+  // with the payload server's --delay-ms to model network latency).
+  _Scenario('vector_zoomstep_in1', zoomStep: 1, idleBeforeMs: 4000),
+  _Scenario('vector_zoomstep_in2', zoomStep: 2, idleBeforeMs: 4000),
+  _Scenario('vector_zoomstep_out2', zoomStep: -2, idleBeforeMs: 4000),
+  // Zoom round trips (plan 13 Phase A): jump out, hold briefly past the
+  // settle, jump back — leg 2 measures retained-image reuse on reversal.
+  _Scenario('vector_zoomcycle_in1',
+      zoomStep: 1, idleBeforeMs: 4000, legHoldMs: 5000, sampleSeconds: 20),
+  _Scenario('vector_zoomcycle_out1',
+      zoomStep: -1, idleBeforeMs: 4000, legHoldMs: 5000, sampleSeconds: 20),
+  // Same round trips after the 20 s inactive-image retention has expired
+  // everything: leg 2 measures the full reproduction path.
+  _Scenario('vector_zoomcycle_in1_expired',
+      zoomStep: 1, idleBeforeMs: 4000, legHoldMs: 22000, sampleSeconds: 40),
+  _Scenario('vector_zoomcycle_out1_expired',
+      zoomStep: -1, idleBeforeMs: 4000, legHoldMs: 22000, sampleSeconds: 40),
   // Warm rendered: motion tails without any loading cost.
   _Scenario('vector_warm_static', cacheState: _CacheState.warmRendered),
   _Scenario('vector_warm_fling',
       cacheState: _CacheState.warmRendered, motion: _Motion.fling),
+  // Warm fractional pinch (plan 13 Phase B control: the retained grid
+  // layer recaptures every frame while the tile scale changes).
+  _Scenario('vector_warm_pinch',
+      cacheState: _CacheState.warmRendered, motion: _Motion.pinch),
+  // Combined pinch + pan around an off-center focal point.
+  _Scenario('vector_warm_pinch_pan',
+      cacheState: _CacheState.warmRendered, motion: _Motion.pinchPan),
+  // Animated controller zoom with warm caches (the animated overlay/reveal
+  // path plan 12 could not capture).
+  _Scenario('vector_warm_animated_zoom_in',
+      cacheState: _CacheState.warmRendered, animatedZoom: 1),
+  _Scenario('vector_warm_animated_zoom_out',
+      cacheState: _CacheState.warmRendered, animatedZoom: -1),
   // Warm bytes, fresh runtime: disk-hit loads with cold parsed data.
   _Scenario('vector_warm_bytes_static',
       cacheState: _CacheState.warmBytesColdParsed),
@@ -181,6 +248,14 @@ final _flingMaxTravelDeg = _flingV0DegPerSec *
 // Pinch-reversal cadence (identical to map_benchmark.dart).
 const _pinchPeriodSeconds = 1.5;
 const _pinchAmplitudeLevels = 0.75;
+
+/// Off-center focal point for the pinch+pan motion: longitude/latitude of
+/// the geographic point the gesture keeps anchored, ~1.4 tiles east and
+/// half a tile north of the center at z10 (one z10 tile ≈ 0.35° lng).
+const _pinchFocalLngOffset = 0.5;
+const _pinchFocalLatOffset = 0.18;
+double get _pinchFocalLng => _center.longitude + _pinchFocalLngOffset;
+double get _pinchFocalLat => _center.latitude + _pinchFocalLatOffset;
 
 /// Return-pan amplitude: ~1.4 tiles east at z10, away and back.
 const _returnPanAmplitudeDeg = 0.5;
@@ -397,6 +472,24 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                 _pinchAmplitudeLevels *
                     math.sin(t * 2 * math.pi / _pinchPeriodSeconds),
             animate: false);
+      case _Motion.pinchPan:
+        // Continuous zoom around an off-center focal point: the geographic
+        // point under the focal stays fixed, so the camera center orbits
+        // while the zoom oscillates — a combined pinch/pan gesture. The
+        // focal sits ~1.4 tiles east, half a tile north of the center at
+        // the start zoom.
+        final delta = _pinchAmplitudeLevels *
+            math.sin(t * 2 * math.pi / _pinchPeriodSeconds);
+        final shrink = math.pow(2, -delta).toDouble();
+        _controller.moveTo(
+            LatLng(
+              latitude: _pinchFocalLat +
+                  (_center.latitude - _pinchFocalLat) * shrink,
+              longitude: _pinchFocalLng +
+                  (_center.longitude - _pinchFocalLng) * shrink,
+            ),
+            animate: false);
+        _controller.setFractionalZoom(_startZoom + delta, animate: false);
       case _Motion.returnPan:
         final phase = 2 * math.pi * t / _returnPanPeriodSeconds;
         _controller.moveTo(
@@ -458,8 +551,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   /// fallback, not preview upgrade.
   Duration get _motionWindow {
     final settleMs = _scenario.motionSettleMs;
-    if (settleMs == 0) return Duration(seconds: _sampleSeconds);
-    final sampleMs = _sampleSeconds * 1000;
+    if (settleMs == 0) return Duration(seconds: _scenario.windowSeconds);
+    final sampleMs = _scenario.windowSeconds * 1000;
     switch (_scenario.motion) {
       case _Motion.pinch:
         final periods = sampleMs ~/ (_pinchPeriodSeconds * 1000);
@@ -484,6 +577,79 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     } catch (_) {
       _emitPayload('FOSM_BENCHMARK_INVALID', 'disk-cache clear failed');
     }
+  }
+
+  /// Coverage-clock timestamps (ms) of every zoom leg jump, in order,
+  /// plus the first sample recorded after each jump. Leg metrics measure
+  /// from that first post-jump sample, not from the jump call: a frame
+  /// already in flight when the jump fires can carry the pre-jump state,
+  /// which would otherwise fake a near-instant all-sharp.
+  /// The coverage report splits time-to-sharp per leg from these.
+  final List<double> _legJumpAtMs = [];
+  final List<double> _legBaseAtMs = [];
+
+  /// Drives the zoom legs of a [zoomStep] scenario after arming: jump to
+  /// `startZoom + zoomStep` at t≈0, hold [legHoldMs], jump back to
+  /// [startZoom]. Leg boundaries are recorded on the coverage clock and
+  /// emitted as payload lines for log-level attribution.
+  Future<void> _driveZoomLegs(_Scenario scenario) async {
+    Future<void> jump(int levels, String label) async {
+      final atMs = _coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
+      _legJumpAtMs.add(atMs);
+      unawaited(_emitPayload('FOSM_BENCHMARK_LEG_JUMP',
+          '${scenario.name} leg=${_legJumpAtMs.length} levels=$label '
+          'atMs=${atMs.round()}'));
+      _timelineMark('legJump${_legJumpAtMs.length}.${scenario.name}');
+      _controller.setZoom(scenario.startZoom + levels, animate: false);
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+    await jump(scenario.zoomStep, '${scenario.zoomStep}');
+    if (scenario.legHoldMs > 0) {
+      await Future<void>.delayed(Duration(milliseconds: scenario.legHoldMs));
+      if (!mounted) return;
+      await jump(0, 'back');
+    }
+  }
+
+  /// Disk-cache stats snapshot (delta-reported across the window); null
+  /// when the disk cache is unavailable.
+  Future<MapDiskCacheStats?> _diskStats() async {
+    try {
+      if (!MapDiskCache.isInitialized) return null;
+      return await MapDiskCache.stats();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Cache-eviction counter snapshot at arming; the RESULT reports the
+  /// delta across the window (plan 13 attribution).
+  Map<String, Object?>? _cacheAttributionAtArm;
+
+  Map<String, Object?>? _cacheAttributionDelta() {
+    final before = _cacheAttributionAtArm;
+    final now = _controller.cacheAttribution?.toJson();
+    if (before == null || now == null) return null;
+    int delta(Map before, Map now, String key) =>
+        (now[key] as int? ?? 0) - (before[key] as int? ?? 0);
+    final renderedBefore = before['renderedMisses'] as Map;
+    final renderedNow = now['renderedMisses'] as Map;
+    return {
+      'renderedExpired': delta(renderedBefore, renderedNow, 'expired'),
+      'renderedBudgetEvicted':
+          delta(renderedBefore, renderedNow, 'budgetEvicted'),
+      'renderedPressureFlushed':
+          delta(renderedBefore, renderedNow, 'pressureFlushed'),
+      'byteCacheEvictions':
+          delta(before, now, 'byteCacheEvictions'),
+      'parsedEvictions':
+          now.containsKey('parsedEvictions')
+              ? delta(before, now, 'parsedEvictions')
+              : null,
+      'byteCacheEntriesEnd': now['byteCacheEntries'],
+      'parsedTilesEnd': now['parsedTiles'],
+    };
   }
 
   /// Waits until the mounted map is visually settled: every strict
@@ -578,7 +744,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
 
     final scenarios = _scenarioFilter.isEmpty
         ? _scenarios
-        : _scenarios.where((s) => s.name == _scenarioFilter).toList();
+        : _scenarios
+            .where((s) => _scenarioFilterNames.contains(s.name))
+            .toList();
     if (scenarios.isEmpty) {
       throw StateError('Unknown benchmark scenario: $_scenarioFilter');
     }
@@ -598,6 +766,19 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         await WidgetsBinding.instance.endOfFrame;
         if (scenario.cacheState == _CacheState.coldBytes) {
           await _clearDiskCache();
+        }
+        if (scenario.zoomStep != 0) {
+          // Mount, settle at the start zoom and idle so the preload runs
+          // before the window arms (not part of the measurement).
+          if (!mounted) return;
+          setState(() {
+            _mapMounted = true;
+            _mapGeneration++;
+          });
+          await WidgetsBinding.instance.endOfFrame;
+          settled = await _settle(Duration(seconds: _settleSeconds));
+          await Future<void>.delayed(
+              Duration(milliseconds: scenario.idleBeforeMs));
         }
       } else {
         // Mounted warm states: park the camera at the scenario pose and
@@ -624,6 +805,9 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
               'settled=$settled');
 
       final int rssBefore;
+      // Disk-cache stats at arming; armRecording reassigns it. Awaited at
+      // window end for the delta report.
+      var diskBefore = Future<MapDiskCacheStats?>.value();
       void armRecording() {
         _timings.clear();
         _coverageSamples.clear();
@@ -631,6 +815,10 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _emptyGridFrames = 0;
         _cellFirstSeenMs.clear();
         _cellSharpAtMs.clear();
+        _legJumpAtMs.clear();
+        _legBaseAtMs.clear();
+        _cacheAttributionAtArm = _controller.cacheAttribution?.toJson();
+        diskBefore = _diskStats();
         _peakRenderedBytes = 0;
         _peakEstimatedTotalBytes = 0;
         _peakParsedTiles = 0;
@@ -647,8 +835,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         unawaited(_emitPayload('FOSM_BENCHMARK_SAMPLE_START', scenario.name));
       }
 
-      final sample = Duration(seconds: _sampleSeconds);
-      if (unmountFirst) {
+      final sample = Duration(seconds: scenario.windowSeconds);
+      if (unmountFirst && scenario.zoomStep == 0) {
         // Arm before mounting: the replacement's first load frame is the
         // first measured frame (cold and warm-bytes loads alike).
         if (!mounted) return;
@@ -668,6 +856,17 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         // leave the window without a single coverage sample. Force one
         // rebuild so the sampler records a t≈0 baseline row.
         setState(() {});
+        if (scenario.zoomStep != 0) {
+          // Legs continue asynchronously while the window records: the
+          // single-step scenarios jump once; the cycle scenarios jump,
+          // hold, and jump back (plan 13 zoom-reversal reuse).
+          unawaited(_driveZoomLegs(scenario));
+        }
+        if (scenario.animatedZoom != 0) {
+          _timelineMark('animatedZoom.${scenario.name}');
+          _controller.setZoom(scenario.startZoom + scenario.animatedZoom,
+              animate: true);
+        }
       }
 
       if (scenario.cacheState == _CacheState.warmParsedColdImages) {
@@ -710,6 +909,25 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
           : null;
       await _emitPayload('FOSM_BENCHMARK_SAMPLE_END', scenario.name);
 
+      // Disk-cache deltas across the window: reuse that avoided a network
+      // request shows up as hits; a first visit shows misses.
+      Map<String, Object?>? diskDelta;
+      try {
+        final before = await diskBefore;
+        final after = await _diskStats();
+        if (before != null && after != null) {
+          diskDelta = {
+            'hits': after.hits - before.hits,
+            'misses': after.misses - before.misses,
+            'evictions': after.evictions - before.evictions,
+            'entryCountEnd': after.entryCount,
+            'sizeBytesEnd': after.sizeBytes,
+          };
+        }
+      } catch (_) {
+        diskDelta = null;
+      }
+
       final uiMs = _timings
           .map((f) => f.buildDuration.inMicroseconds / 1000)
           .toList()
@@ -736,7 +954,10 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'styleSwitch': scenario.styleSwitch,
             'motionSettleMs': scenario.motionSettleMs,
             'settled': settled,
-            'sampleSeconds': _sampleSeconds,
+            'sampleSeconds': scenario.windowSeconds,
+            'zoomStep': scenario.zoomStep,
+            'legHoldMs': scenario.legHoldMs,
+            'animatedZoom': scenario.animatedZoom,
             'payloadIdentity': _payloadIdentity,
             'payloadProfile': _profileName,
             'payloadSeed':
@@ -764,6 +985,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                 .length,
             'coverage':
                 _coverageReport(vector: scenario.source == _Source.vector),
+            'cacheAttribution': _cacheAttributionDelta(),
+            'diskCache': diskDelta,
             'peakRenderedBytes': _peakRenderedBytes,
             'peakEstimatedTotalBytes': _peakEstimatedTotalBytes,
             'peakParsedTiles': _peakParsedTiles,
@@ -837,6 +1060,13 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             coverage.sharpAreaFraction,
             labelReady,
           ]);
+          // Stamp the first sample recorded after each pending leg jump:
+          // leg metrics measure from here (see [_legBaseAtMs]).
+          if (_legJumpAtMs.isNotEmpty &&
+              _legBaseAtMs.length < _legJumpAtMs.length) {
+            final jumpMs = _legJumpAtMs[_legBaseAtMs.length];
+            if (nowMs >= jumpMs) _legBaseAtMs.add(nowMs);
+          }
         }
       }
       _chainCoverageSample();
@@ -934,6 +1164,34 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       return values;
     }
 
+    // Zoom-leg splits (plan 13 cycle scenarios): time-to-sharp measured
+    // from the first post-jump sample of each leg (see [_legBaseAtMs] —
+    // a frame in flight at the jump can carry pre-jump state). Leg 2 of a
+    // cycle returns to [startZoom]; its allSharpMs is the reversal-reuse
+    // or reproduction metric.
+    final legs = <Map<String, Object?>>[];
+    for (var k = 0; k < _legJumpAtMs.length; k++) {
+      final baseMs =
+          k < _legBaseAtMs.length ? _legBaseAtMs[k] : _legJumpAtMs[k];
+      int? legFirst(bool Function(List<double> s) test) {
+        for (final s in samples) {
+          if (s[0] < baseMs) continue;
+          if (test(s)) return (s[0] - baseMs).round();
+        }
+        return null;
+      }
+
+      legs.add({
+        'jumpMs': _legJumpAtMs[k].round(),
+        'baseMs': baseMs.round(),
+        'allCoveredMs': legFirst((s) => s[1] >= 1),
+        'allSharpMs': legFirst((s) => s[2] >= 1),
+        if (vector)
+          'labelsViewportReadyMs':
+              legFirst((s) => s[2] >= 1 && s[6] == 0 && s[9] >= 1),
+      });
+    }
+
     return {
       'samples': samples.length,
       'emptyGridFrames': _emptyGridFrames,
@@ -980,6 +1238,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       'seriesCoveredArea': ensureLast(7),
       'seriesSharpArea': ensureLast(8),
       'seriesLabelReady': ensureLast(9),
+      if (legs.isNotEmpty) 'legs': legs,
     };
   }
 

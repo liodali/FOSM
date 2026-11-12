@@ -25,8 +25,11 @@
 //   GET /tiles/{z}/{x}/{y}.mvt         synthetic MVT (?profile=|&seed=)
 //   GET /raster/{z}/{x}/{y}.png        raster control tile
 //   POST /log?label=<label>            benchmark marker sink (browser)
+//   GET /stats[?reset=1]               tile request/byte counters
 //   GET /healthz                       liveness probe
+// Options: --delay-ms N adds N ms latency to every tile response.
 
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -40,6 +43,9 @@ Future<void> main(List<String> arguments) async {
   var seed = BenchPayloads.defaultSeed;
   var markerLogDir = '';
   var fixtureDir = '';
+  var delayMs = 0;
+  var tileRequests = 0;
+  var tileBytes = 0;
   for (var i = 0; i < arguments.length; i++) {
     switch (arguments[i]) {
       case '--host':
@@ -56,6 +62,9 @@ Future<void> main(List<String> arguments) async {
         markerLogDir = arguments[++i];
       case '--fixture-dir':
         fixtureDir = arguments[++i];
+      case '--delay-ms':
+        // Artificial per-request latency for tile requests (network model).
+        delayMs = int.parse(arguments[++i]);
     }
   }
 
@@ -76,7 +85,7 @@ Future<void> main(List<String> arguments) async {
       '${fixtureDir.isEmpty ? '(payload ${BenchPayloads.identity}, '
           'profile ${profile.name}, seed $seed)' : '(fixture $fixtureDir)'}');
 
-  await for (final request in server) {
+  Future<void> handle(HttpRequest request) async {
     try {
       final path = request.uri.pathSegments;
       if (request.method == 'OPTIONS') {
@@ -86,7 +95,21 @@ Future<void> main(List<String> arguments) async {
           ..headers.set('Access-Control-Allow-Headers',
               request.headers.value('Access-Control-Request-Headers') ?? '*');
         await request.response.close();
-        continue;
+        return;
+      }
+      if (request.uri.path == '/stats') {
+        // Tile request/byte counters (preload A/B cost accounting).
+        final body = '{"tileRequests":$tileRequests,"tileBytes":$tileBytes}';
+        if (request.uri.queryParameters['reset'] == '1') {
+          tileRequests = 0;
+          tileBytes = 0;
+        }
+        request.response
+          ..statusCode = 200
+          ..headers.set('Access-Control-Allow-Origin', '*')
+          ..write(body);
+        await request.response.close();
+        return;
       }
       if (request.uri.path == '/healthz') {
         request.response
@@ -94,7 +117,7 @@ Future<void> main(List<String> arguments) async {
           ..headers.set('Access-Control-Allow-Origin', '*')
           ..write('ok');
         await request.response.close();
-        continue;
+        return;
       }
       if (request.uri.path == '/log') {
         // Browser marker sink: the app cannot print to a console worth
@@ -109,7 +132,7 @@ Future<void> main(List<String> arguments) async {
             ..statusCode = 400
             ..headers.set('Access-Control-Allow-Origin', '*');
           await request.response.close();
-          continue;
+          return;
         }
         final dir = Directory(markerLogDir)..createSync(recursive: true);
         final sink = File('${dir.path}/markers-$label.log')
@@ -124,7 +147,7 @@ Future<void> main(List<String> arguments) async {
           ..statusCode = 204
           ..headers.set('Access-Control-Allow-Origin', '*');
         await request.response.close();
-        continue;
+        return;
       }
 
       // Styles advertise the tile template on the host the client used, so
@@ -139,7 +162,7 @@ Future<void> main(List<String> arguments) async {
           () => _bytes(benchStyleJson('http://$hostHeader', variant: variant)),
         );
         await _respond(request, body, 'application/json');
-        continue;
+        return;
       }
 
       if (path.length == 4) {
@@ -156,6 +179,9 @@ Future<void> main(List<String> arguments) async {
                   ? BenchProfile.denseCity
                   : profile);
           if (family == 'tiles') {
+            if (delayMs > 0) {
+              await Future<void>.delayed(Duration(milliseconds: delayMs));
+            }
             if (fixtureDir.isNotEmpty) {
               // Fail closed: missing recorded tiles must never be replaced
               // silently with synthetic data in a production comparison.
@@ -166,24 +192,28 @@ Future<void> main(List<String> arguments) async {
                   ..statusCode = 404
                   ..headers.set('Access-Control-Allow-Origin', '*');
                 await request.response.close();
-                continue;
+                return;
               }
-              await _respond(request, await fixture.readAsBytes(),
-                  'application/vnd.mapbox-vector-tile');
-              continue;
+              final fixtureBytes = await fixture.readAsBytes();
+              tileRequests++;
+              tileBytes += fixtureBytes.length;
+              await _respond(
+                  request, fixtureBytes, 'application/vnd.mapbox-vector-tile');
+              return;
             }
+            final synth = cached(
+                'mvt/$z/$x/$y/$tileProfile.name/$tileSeed',
+                () => BenchPayloads.tile(z, x, y,
+                    profile: tileProfile, seed: tileSeed));
+            tileRequests++;
+            tileBytes += synth.length;
             await _respond(
-                request,
-                cached(
-                    'mvt/$z/$x/$y/$tileProfile.name/$tileSeed',
-                    () => BenchPayloads.tile(z, x, y,
-                        profile: tileProfile, seed: tileSeed)),
-                'application/vnd.mapbox-vector-tile');
-            continue;
+                request, synth, 'application/vnd.mapbox-vector-tile');
+            return;
           }
           if (family == 'raster') {
             await _respond(request, raster, 'image/png');
-            continue;
+            return;
           }
         }
       }
@@ -199,6 +229,11 @@ Future<void> main(List<String> arguments) async {
         await request.response.close();
       } catch (_) {}
     }
+  }
+
+  await for (final request in server) {
+    // Concurrent handling so `--delay-ms` models latency, not a serial queue.
+    unawaited(handle(request));
   }
 }
 
