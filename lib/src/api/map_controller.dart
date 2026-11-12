@@ -93,6 +93,15 @@ abstract class MapWorkloadDelegate {
   Set<String> get labelPreparedTileKeys;
 }
 
+/// Optional plan-13 attribution capability implemented by MapView:
+/// lifetime cache-eviction counters for measurement harnesses.
+abstract class MapCacheAttributionDelegate {
+  /// Point-in-time snapshot of the attached map's cache-eviction
+  /// counters (rendered-image expiry/budget/pressure, compressed-byte
+  /// and parsed-tile capacity evictions).
+  FosmCacheMissAttribution get cacheAttribution;
+}
+
 /// Programmatic control surface for a [MapView].
 ///
 /// Create a controller outside the widget tree, pass it to [MapView],
@@ -228,6 +237,21 @@ class MapController extends ChangeNotifier {
     return delegate is MapWorkloadDelegate
         ? (delegate as MapWorkloadDelegate).labelPreparedTileKeys
         : const <String>{};
+  }
+
+  /// Point-in-time snapshot of the attached map's lifetime cache-eviction
+  /// counters (plan-13 attribution), or `null` when detached.
+  ///
+  /// Snapshot before and after a measurement window and diff: rendered
+  /// images leave via expiry, byte budget or memory pressure; compressed
+  /// bytes and parsed tiles leave via their capacity bounds. Manager
+  /// recreation (style switches) resets the counters — snapshot around
+  /// the recreation, not across it.
+  FosmCacheMissAttribution? get cacheAttribution {
+    final delegate = _delegate;
+    return delegate is MapCacheAttributionDelegate
+        ? (delegate as MapCacheAttributionDelegate).cacheAttribution
+        : null;
   }
 
   /// Follow/recenter on the latest supplied location; waits if no fix exists.

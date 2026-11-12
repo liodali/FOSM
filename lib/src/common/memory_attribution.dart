@@ -145,6 +145,53 @@ String _kb(int? bytes) {
   return '${(bytes / 1024).round()}K';
 }
 
+/// Point-in-time snapshot of lifetime cache-eviction counters (plan-13
+/// Phase A attribution). Every counter is monotonic per manager/runtime,
+/// so a workload harness snapshots before and after its measurement
+/// window and reports the deltas: how many rendered images left via
+/// expiry vs byte budget vs memory pressure, and how much compressed /
+/// parsed data was dropped by its capacity bound. Manager recreation
+/// (style switches) resets them — snapshot around the recreation, not
+/// across it.
+class FosmCacheMissAttribution {
+  const FosmCacheMissAttribution({
+    required this.renderedMisses,
+    required this.byteCacheEvictions,
+    required this.byteCacheEntries,
+    required this.byteCacheBytes,
+    this.parsedEvictions,
+    this.parsedTiles,
+  });
+
+  /// Rendered-image cache eviction reasons since the manager was created.
+  final RenderedTileCacheMisses renderedMisses;
+
+  /// Compressed-byte cache entries dropped by the capacity trim.
+  final int byteCacheEvictions;
+
+  /// Entries currently retained in the compressed byte cache.
+  final int byteCacheEntries;
+
+  /// Compressed payload bytes currently retained.
+  final int byteCacheBytes;
+
+  /// Parsed source tiles dropped by the LRU bound, or `null` in raster
+  /// mode.
+  final int? parsedEvictions;
+
+  /// Parsed source tiles currently retained, or `null` in raster mode.
+  final int? parsedTiles;
+
+  Map<String, Object?> toJson() => {
+        'renderedMisses': renderedMisses.toJson(),
+        'byteCacheEvictions': byteCacheEvictions,
+        'byteCacheEntries': byteCacheEntries,
+        'byteCacheBytes': byteCacheBytes,
+        if (parsedEvictions != null) 'parsedEvictions': parsedEvictions,
+        if (parsedTiles != null) 'parsedTiles': parsedTiles,
+      };
+}
+
 /// Opt-in periodic attribution logging for long-session memory captures.
 ///
 /// Enable in profile builds with `--dart-define=fosm.traceMemory=true` and

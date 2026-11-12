@@ -289,6 +289,10 @@ class TileManager with CacheTiles {
   /// Point-in-time attribution of the rendered-image cache.
   RenderedTileCacheStats get renderedCacheStats => _memoryCache.stats;
 
+  /// Lifetime rendered-cache eviction reasons (expiry, byte budget,
+  /// memory pressure). Monotonic; diff snapshots across a workload.
+  RenderedTileCacheMisses get renderedCacheMisses => _memoryCache.misses;
+
   /// Compressed payload bytes currently retained in memory.
   int get byteCacheBytes => _byteCacheSize;
 
@@ -388,6 +392,15 @@ class TileManager with CacheTiles {
   /// Checked in [_scheduleLoad] for instant decode when a tile becomes visible.
   final LinkedHashMap<String, Uint8List> _byteCache = LinkedHashMap();
   int _byteCacheSize = 0;
+
+  /// Lifetime count of byte-cache entries evicted by the capacity trim
+  /// (plan-13 attribution: distinguishes capacity pressure from
+  /// deliberate removals such as invalidation and disposal).
+  int _byteCacheEvictions = 0;
+
+  /// Evictions [_trimByteCache] performed because the compressed-byte
+  /// budget was exceeded. Monotonic; diff snapshots across a workload.
+  int get byteCacheEvictions => _byteCacheEvictions;
 
   /// Tile keys currently being fetched or decoded.
   final Set<String> _inFlight = {};
@@ -2686,6 +2699,7 @@ class TileManager with CacheTiles {
       final oldestKey = _byteCache.keys.first;
       final oldestBytes = _byteCache.remove(oldestKey);
       if (oldestBytes != null) _byteCacheSize -= oldestBytes.length;
+      _byteCacheEvictions++;
     }
   }
 

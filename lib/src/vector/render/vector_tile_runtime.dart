@@ -114,6 +114,15 @@ class VectorTileRuntime {
   static const int maxParsedTiles = 32;
   final LinkedHashMap<String, ParsedVectorTile> _parsedTiles = LinkedHashMap();
 
+  /// Lifetime count of parsed tiles dropped by the LRU capacity bound
+  /// (plan-13 attribution: measures reparsing pressure when a source
+  /// footprint exceeds [maxParsedTiles]).
+  int _parsedEvictions = 0;
+
+  /// Parsed tiles evicted by the capacity bound so far. Monotonic; diff
+  /// snapshots across a workload window.
+  int get parsedEvictions => _parsedEvictions;
+
   /// Parsed source tiles currently retained.
   int get parsedTileCount => _parsedTiles.length;
 
@@ -910,6 +919,7 @@ class VectorTileRuntime {
       ..[key] = parsed;
     while (_parsedTiles.length > maxParsedTiles) {
       _parsedTiles.remove(_parsedTiles.keys.first);
+      _parsedEvictions++;
     }
     return parsed;
   }

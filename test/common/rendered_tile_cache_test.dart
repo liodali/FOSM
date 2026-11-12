@@ -150,6 +150,53 @@ void main() {
       cache.dispose();
     });
 
+    testWidgets('misses attribute expiry separately from budget and pressure',
+        (tester) async {
+      var now = DateTime(2026);
+      final cache = RenderedTileCache(now: () => now, maxBytes: 8);
+      addTearDown(cache.dispose);
+
+      // Expiry: retention elapses on an unused entry.
+      cache.setActiveKeys({'aged'});
+      final aged = _image(1, 1);
+      cache.put('aged', aged);
+      cache.setActiveKeys({});
+      now = now.add(const Duration(seconds: 21));
+      await tester.pump(const Duration(seconds: 21));
+      expect(aged.debugDisposed, isTrue);
+      expect(cache.misses.expired, 1);
+      expect(cache.misses.budgetEvicted, 0);
+      expect(cache.misses.pressureFlushed, 0);
+
+      // Budget: a fresh entry is dropped only because the byte budget is
+      // exceeded (the retained one is protected as active).
+      cache.setActiveKeys({'kept'});
+      final kept = _image(1, 1);
+      cache.put('kept', kept);
+      final fresh = _image(2, 2);
+      cache.put('fresh', fresh);
+      expect(fresh.debugDisposed, isTrue);
+      expect(cache.misses.budgetEvicted, 1);
+      expect(cache.misses.expired, 1);
+      expect(cache.misses.pressureFlushed, 0);
+
+      // Pressure: flushUnused drops every unprotected entry — both the
+      // former active key (released above) and the fresh spare — even
+      // though both are inside retention and the budget is not exceeded.
+      cache.setActiveKeys({});
+      final spare = _image(1, 1);
+      cache.put('spare', spare);
+      cache.flushUnused();
+      expect(spare.debugDisposed, isTrue);
+      expect(cache.misses.pressureFlushed, 2);
+      expect(cache.misses.expired, 1);
+      expect(cache.misses.budgetEvicted, 1);
+
+      // Deliberate disposal is not an eviction reason.
+      cache.dispose();
+      expect(cache.misses.pressureFlushed, 2);
+    });
+
     testWidgets('stats attribute protected and evictable memory separately',
         (tester) async {
       final cache = RenderedTileCache();

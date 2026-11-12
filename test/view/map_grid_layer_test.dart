@@ -352,6 +352,52 @@ void main() {
           reason: 'an identical camera must keep the layer retained');
     });
 
+    testWidgets('recapture counters classify scale, content and membership',
+        (tester) async {
+      MapView.gridLayerEnabled = true;
+      final completers = <String, Completer<Uint8List>>{};
+      final controller =
+          await _pumpSettledMap(tester, completers: completers, hold: '10/512/511');
+
+      // Fractional zoom: scale-driven recapture (Phase B's target — the
+      // counters make the per-frame recapture cost visible).
+      var recaptures = MapView.debugGridRecaptures.total;
+      controller.setFractionalZoom(10.25, animate: false);
+      await tester.pump();
+      expect(MapView.debugGridRecaptures.total - recaptures, 1,
+          reason: 'one fractional zoom step, one recapture');
+
+      // Sub-tile pan: no recapture at all.
+      recaptures = MapView.debugGridRecaptures.total;
+      controller.moveTo(
+          const LatLng(latitude: 0.0005, longitude: 0.01), animate: false);
+      await tester.pump();
+      expect(MapView.debugGridRecaptures.total - recaptures, 0,
+          reason: 'sub-tile motion must keep the retained layer');
+
+      // Tile arrival: content-driven recapture.
+      final content0 = MapView.debugGridRecaptures.content;
+      completers['10/512/511']!.complete(_tinyPng);
+      final watch = Stopwatch()..start();
+      while (MapView.debugGridRecaptures.content == content0 &&
+          watch.elapsed < const Duration(seconds: 5)) {
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(MapView.debugGridRecaptures.content, greaterThan(content0),
+          reason: 'publishing an image must count a content recapture');
+
+      // Boundary-crossing pan: membership-driven recapture.
+      final membership0 = MapView.debugGridRecaptures.membership;
+      controller.moveTo(
+          const LatLng(latitude: 0.0005, longitude: 0.4), animate: false);
+      await tester.pump();
+      expect(MapView.debugGridRecaptures.membership, greaterThan(membership0),
+          reason: 'crossing a tile boundary must count a membership change');
+    });
+
     testWidgets('define-off keeps the historical repaint-per-frame painter',
         (tester) async {
       MapView.gridLayerEnabled = false;

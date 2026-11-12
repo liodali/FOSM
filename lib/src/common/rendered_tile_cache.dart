@@ -43,6 +43,40 @@ class RenderedTileCacheStats {
   int get evictableBytes => bytes - protectedBytes;
 }
 
+/// Lifetime counts of why retained images left the cache without a
+/// deliberate release. Plan-13 attribution: a logical tile that must be
+/// re-rendered after a zoom reversal maps its miss to one of these
+/// reasons (or to plain absence — never stored, e.g. a first visit).
+class RenderedTileCacheMisses {
+  const RenderedTileCacheMisses({
+    required this.expired,
+    required this.budgetEvicted,
+    required this.pressureFlushed,
+  });
+
+  const RenderedTileCacheMisses.zero()
+      : expired = 0,
+        budgetEvicted = 0,
+        pressureFlushed = 0;
+
+  /// Evicted because the inactive retention elapsed.
+  final int expired;
+
+  /// Evicted while still inside retention because the byte budget was
+  /// exceeded (LRU order among unprotected entries).
+  final int budgetEvicted;
+
+  /// Dropped by an explicit memory-pressure flush while still inside
+  /// retention.
+  final int pressureFlushed;
+
+  Map<String, Object?> toJson() => {
+        'expired': expired,
+        'budgetEvicted': budgetEvicted,
+        'pressureFlushed': pressureFlushed,
+      };
+}
+
 /// Owns decoded tile images, retaining unused tiles briefly for return pans
 /// and zooms. Active grid and snapshot images are never evicted. Their memory
 /// can exceed the budget; unused images are evicted first in LRU order.
@@ -68,6 +102,9 @@ class RenderedTileCache {
   int _bytes = 0;
   Timer? _expiryTimer;
   bool _disposed = false;
+  int _expired = 0;
+  int _budgetEvicted = 0;
+  int _pressureFlushed = 0;
 
   /// Estimated RGBA pixel memory, including protected images.
   int get bytes => _bytes;
@@ -96,6 +133,14 @@ class RenderedTileCache {
   }
 
   bool containsKey(String key) => _entries.containsKey(key);
+
+  /// Lifetime eviction counters (expired/budget/pressure). Monotonic, so
+  /// a workload harness can diff snapshots across a measurement window.
+  RenderedTileCacheMisses get misses => RenderedTileCacheMisses(
+        expired: _expired,
+        budgetEvicted: _budgetEvicted,
+        pressureFlushed: _pressureFlushed,
+      );
 
   ui.Image? get(String key) {
     final entry = _entries.remove(key);
@@ -177,6 +222,7 @@ class RenderedTileCache {
       if (_activeKeys.contains(key) || entry.pins > 0) continue;
       _entries.remove(key);
       _bytes -= entry.bytes;
+      _pressureFlushed++;
       entry.image.dispose();
     }
   }
@@ -192,6 +238,13 @@ class RenderedTileCache {
       if (_activeKeys.contains(key) || entry.pins > 0) continue;
       final remaining = _retention - now.difference(entry.lastUsed);
       if (_bytes > _maxBytes || remaining <= Duration.zero) {
+        // Attribution: retention elapsed → expiry; still fresh → the byte
+        // budget forced the eviction.
+        if (remaining <= Duration.zero) {
+          _expired++;
+        } else {
+          _budgetEvicted++;
+        }
         _entries.remove(key);
         _bytes -= entry.bytes;
         entry.image.dispose();

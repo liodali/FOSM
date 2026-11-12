@@ -300,6 +300,67 @@ class _GridLayerCapture {
       tileScale == next.tileScale &&
       background == next.background &&
       placeholders == next.placeholders;
+
+  /// Every capture-identity field that changed between this capture and
+  /// [next], classified into the plan-13 recapture reasons: content
+  /// arrival (revision), integer zoom switch, membership window (indices
+  /// or grid counts), fractional scale, and background/placeholder flags.
+  void accumulateChangedFields(_GridLayerCapture next) {
+    final stats = MapView.debugGridRecaptures;
+    stats.total++;
+    if (!identical(manager, next.manager)) stats.runtime++;
+    if (revision != next.revision) stats.content++;
+    if (zoom != next.zoom) stats.zoom++;
+    if (leftLngIndex != next.leftLngIndex ||
+        topLatIndex != next.topLatIndex ||
+        horizontalCount != next.horizontalCount ||
+        verticalCount != next.verticalCount) {
+      stats.membership++;
+    }
+    if (tileScale != next.tileScale) stats.scale++;
+    if (background != next.background || placeholders != next.placeholders) {
+      stats.flags++;
+    }
+  }
+}
+
+/// Process-lifetime counts of retained-grid-layer recaptures by reason
+/// (plan-13 Phase A attribution). Mutable accumulator, matching the
+/// `debugPaintCount`/`debugBuildCount` diagnostic-counter precedent; see
+/// [MapView.debugGridRecaptures].
+class GridLayerRecaptureStats {
+  GridLayerRecaptureStats.zero();
+
+  /// Every capture-identity change (one recapture each).
+  int total = 0;
+
+  /// The owning manager was replaced (runtime/style recreation).
+  int runtime = 0;
+
+  /// Membership kept, content changed (tile image arrivals).
+  int content = 0;
+
+  /// The integer source zoom changed.
+  int zoom = 0;
+
+  /// The membership window changed (grid indices or counts).
+  int membership = 0;
+
+  /// The fractional tile scale changed (continuous zoom recaptures).
+  int scale = 0;
+
+  /// Background/placeholder painting flags flipped (fallback transitions).
+  int flags = 0;
+
+  Map<String, Object?> toJson() => {
+        'total': total,
+        'runtime': runtime,
+        'content': content,
+        'zoom': zoom,
+        'membership': membership,
+        'scale': scale,
+        'flags': flags,
+      };
 }
 
 /// How the old tile grid animates out during a zoom transition
@@ -444,6 +505,16 @@ class MapView extends StatefulWidget {
   static const gridLayerByDefine =
       bool.fromEnvironment('fosm.gridLayer', defaultValue: true);
   static bool gridLayerEnabled = gridLayerByDefine;
+
+  /// Plan-13 attribution: why the retained grid layer recaptured since
+  /// process start. One capture-identity change can match several
+  /// reasons (e.g. a zoom switch changes both [GridLayerRecaptureStats.zoom]
+  /// and membership); every changed field is counted. Monotonic
+  /// process-lifetime counters — a workload harness snapshots
+  /// before/after its measurement window and diffs. Zero cost beyond
+  /// integer increments.
+  static GridLayerRecaptureStats debugGridRecaptures =
+      GridLayerRecaptureStats.zero();
 
 
   /// Counts zoom-transition starts. Test hook used to prove a multi-level
@@ -643,7 +714,8 @@ class _MapViewState extends State<MapView>
         LocationMapControllerDelegate,
         MapMemoryDelegate,
         MapCoverageDelegate,
-        MapWorkloadDelegate {
+        MapWorkloadDelegate,
+        MapCacheAttributionDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -1250,6 +1322,20 @@ class _MapViewState extends State<MapView>
   @override
   Set<String> get labelPreparedTileKeys =>
       _vectorRuntime?.labelOverlayPreparedTileKeys ?? const <String>{};
+
+  /// Lifetime cache-eviction counters of the attached map (plan-13
+  /// attribution). Exposed through [MapController.cacheAttribution].
+  @override
+  FosmCacheMissAttribution get cacheAttribution => FosmCacheMissAttribution(
+        renderedMisses:
+            _tileManager?.renderedCacheMisses ??
+                const RenderedTileCacheMisses.zero(),
+        byteCacheEvictions: _tileManager?.byteCacheEvictions ?? 0,
+        byteCacheEntries: _tileManager?.byteCacheEntries ?? 0,
+        byteCacheBytes: _tileManager?.byteCacheBytes ?? 0,
+        parsedEvictions: _vectorRuntime?.parsedEvictions,
+        parsedTiles: _vectorRuntime?.parsedTileCount,
+      );
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;
@@ -2580,6 +2666,11 @@ class _MapViewState extends State<MapView>
       anchorY: manager.topRowTilesCanvasY,
     );
     if (_gridCapture == null || !_gridCapture!.matches(capture)) {
+      if (_gridCapture != null) {
+        // Plan-13 attribution: classify why the retained content is
+        // invalid (arrival, zoom switch, scale, membership, flags).
+        _gridCapture!.accumulateChangedFields(capture);
+      }
       _gridCapture = capture;
     }
     final cap = _gridCapture!;
