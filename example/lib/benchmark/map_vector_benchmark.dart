@@ -627,6 +627,20 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   /// delta across the window (plan 13 attribution).
   Map<String, Object?>? _cacheAttributionAtArm;
 
+  /// Grid-recapture reason counters at arming (process-lifetime statics;
+  /// the window delta attributes this scenario's recaptures).
+  Map<String, Object?>? _gridRecapturesAtArm;
+
+  Map<String, Object?>? _gridRecaptureDelta() {
+    final before = _gridRecapturesAtArm;
+    if (before == null) return null;
+    final now = MapView.debugGridRecaptures.toJson();
+    return {
+      for (final key in now.keys)
+        key: (now[key] as int? ?? 0) - (before[key] as int? ?? 0),
+    };
+  }
+
   Map<String, Object?>? _cacheAttributionDelta() {
     final before = _cacheAttributionAtArm;
     final now = _controller.cacheAttribution?.toJson();
@@ -818,6 +832,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _legJumpAtMs.clear();
         _legBaseAtMs.clear();
         _cacheAttributionAtArm = _controller.cacheAttribution?.toJson();
+        _gridRecapturesAtArm = MapView.debugGridRecaptures.toJson();
         diskBefore = _diskStats();
         _peakRenderedBytes = 0;
         _peakEstimatedTotalBytes = 0;
@@ -986,6 +1001,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'coverage':
                 _coverageReport(vector: scenario.source == _Source.vector),
             'cacheAttribution': _cacheAttributionDelta(),
+            'gridRecaptures': _gridRecaptureDelta(),
             'diskCache': diskDelta,
             'peakRenderedBytes': _peakRenderedBytes,
             'peakEstimatedTotalBytes': _peakEstimatedTotalBytes,
