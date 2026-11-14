@@ -261,6 +261,12 @@ class _OldGridOverlay extends StatelessWidget {
 class _GridLayerCapture {
   final TileManager manager;
   final int revision;
+
+  /// Imagery-only revision ([TileManager.contentRevision]). Attribution
+  /// compares this — not [revision], which also moves on membership
+  /// rebuilds — so a membership change is never counted as a tile
+  /// arrival (plan-13 review fix).
+  final int contentRevision;
   final int zoom;
   final int leftLngIndex;
   final int topLatIndex;
@@ -275,6 +281,7 @@ class _GridLayerCapture {
   const _GridLayerCapture({
     required this.manager,
     required this.revision,
+    required this.contentRevision,
     required this.zoom,
     required this.leftLngIndex,
     required this.topLatIndex,
@@ -302,14 +309,15 @@ class _GridLayerCapture {
       placeholders == next.placeholders;
 
   /// Every capture-identity field that changed between this capture and
-  /// [next], classified into the plan-13 recapture reasons: content
-  /// arrival (revision), integer zoom switch, membership window (indices
-  /// or grid counts), fractional scale, and background/placeholder flags.
+  /// [next], classified into the plan-13 recapture reasons. Content
+  /// compares the imagery-only revision: a membership rebuild without
+  /// new imagery counts as membership only, and an arrival without a
+  /// membership change counts as content only.
   void accumulateChangedFields(_GridLayerCapture next) {
     final stats = MapView.debugGridRecaptures;
     stats.total++;
     if (!identical(manager, next.manager)) stats.runtime++;
-    if (revision != next.revision) stats.content++;
+    if (contentRevision != next.contentRevision) stats.content++;
     if (zoom != next.zoom) stats.zoom++;
     if (leftLngIndex != next.leftLngIndex ||
         topLatIndex != next.topLatIndex ||
@@ -2654,6 +2662,7 @@ class _MapViewState extends State<MapView>
     final capture = _GridLayerCapture(
       manager: manager,
       revision: manager.revision,
+      contentRevision: manager.contentRevision,
       zoom: manager.zoom,
       leftLngIndex: manager.leftColumnTilesLngIndex,
       topLatIndex: manager.topRowTilesLatIndex,

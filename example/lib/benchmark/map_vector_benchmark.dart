@@ -148,6 +148,14 @@ class _Scenario {
   /// whatever cache state the scenario establishes.
   final int animatedZoom;
 
+  /// Mount the map WITHOUT continuous zoom, so controller zooms route
+  /// through the integer snapshot-overlay animation
+  /// (`_startZoomAnimation`) instead of the fractional tween. The
+  /// fractional variants exercise the continuous path; both must be
+  /// captured before claiming the animated paths are covered
+  /// (plan-13 review P2).
+  final bool integerZoom;
+
   /// Per-scenario window length override; 0 uses the global
   /// `BENCHMARK_SAMPLE_SECONDS` default. Two-leg cycle windows need more
   /// than the default 10 s.
@@ -165,6 +173,7 @@ class _Scenario {
     this.idleBeforeMs = 0,
     this.legHoldMs = 0,
     this.animatedZoom = 0,
+    this.integerZoom = false,
     this.sampleSeconds = 0,
   });
 
@@ -196,12 +205,16 @@ const _scenarios = [
   _Scenario('vector_zoomstep_in1', zoomStep: 1, idleBeforeMs: 4000),
   _Scenario('vector_zoomstep_in2', zoomStep: 2, idleBeforeMs: 4000),
   _Scenario('vector_zoomstep_out2', zoomStep: -2, idleBeforeMs: 4000),
-  // Zoom round trips (plan 13 Phase A): jump out, hold briefly past the
-  // settle, jump back — leg 2 measures retained-image reuse on reversal.
+  // Zoom round trips (plan 13 Phase A): jump out, hold past the settle,
+  // jump back — leg 2 measures retained-image reuse on reversal. The
+  // hold is 15 s: long enough for leg 1's production to complete (the
+  // review found z11 production outlasts a 5 s hold, which made leg 1
+  // report null) while staying inside the 20 s inactive-image retention
+  // so leg 2 still measures reuse rather than expiry.
   _Scenario('vector_zoomcycle_in1',
-      zoomStep: 1, idleBeforeMs: 4000, legHoldMs: 5000, sampleSeconds: 20),
+      zoomStep: 1, idleBeforeMs: 4000, legHoldMs: 15000, sampleSeconds: 30),
   _Scenario('vector_zoomcycle_out1',
-      zoomStep: -1, idleBeforeMs: 4000, legHoldMs: 5000, sampleSeconds: 20),
+      zoomStep: -1, idleBeforeMs: 4000, legHoldMs: 15000, sampleSeconds: 30),
   // Same round trips after the 20 s inactive-image retention has expired
   // everything: leg 2 measures the full reproduction path.
   _Scenario('vector_zoomcycle_in1_expired',
@@ -219,12 +232,22 @@ const _scenarios = [
   // Combined pinch + pan around an off-center focal point.
   _Scenario('vector_warm_pinch_pan',
       cacheState: _CacheState.warmRendered, motion: _Motion.pinchPan),
-  // Animated controller zoom with warm caches (the animated overlay/reveal
-  // path plan 12 could not capture).
-  _Scenario('vector_warm_animated_zoom_in',
+  // Animated controller zoom with warm caches. The fractional variants
+  // run the continuous tween; the `_int_` variants mount without
+  // continuous zoom so controller zooms take the integer snapshot-overlay
+  // animation — both paths, captured separately (plan-13 review).
+  _Scenario('vector_warm_animated_zoom_frac_in',
       cacheState: _CacheState.warmRendered, animatedZoom: 1),
-  _Scenario('vector_warm_animated_zoom_out',
+  _Scenario('vector_warm_animated_zoom_frac_out',
       cacheState: _CacheState.warmRendered, animatedZoom: -1),
+  _Scenario('vector_warm_animated_zoom_int_in',
+      cacheState: _CacheState.warmRendered,
+      animatedZoom: 1,
+      integerZoom: true),
+  _Scenario('vector_warm_animated_zoom_int_out',
+      cacheState: _CacheState.warmRendered,
+      animatedZoom: -1,
+      integerZoom: true),
   // Warm bytes, fresh runtime: disk-hit loads with cold parsed data.
   _Scenario('vector_warm_bytes_static',
       cacheState: _CacheState.warmBytesColdParsed),
@@ -386,6 +409,11 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   int _mapGeneration = 0;
   bool _mapMounted = true;
   double _motionSeconds = 1;
+
+  /// Camera mode the currently mounted map was created with: switching
+  /// continuous zoom on/off requires a fresh map state (widget
+  /// parameter bound at mount).
+  bool _mountedIntegerZoom = false;
 
   /// Style variant mounted into the map ('a' | 'b'); the style-switch
   /// scenario flips it mid-window.
@@ -623,6 +651,34 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     }
   }
 
+  /// Visits every cell a warm scenario's recorded camera path will touch,
+  /// unrecorded, so the recorded window measures camera cost only
+  /// (plan-13 review P2). Pinch/pinch-pan drive one full sine period —
+  /// the amplitude footprint is periodic and the camera ends back at the
+  /// start pose. Animated scenarios visit the zoom target and return.
+  Future<void> _warmMotionFootprint(_Scenario scenario) async {
+    if (scenario.animatedZoom != 0) {
+      _controller.setZoom(
+          scenario.startZoom + scenario.animatedZoom,
+          animate: false);
+      if (!await _settle(Duration(seconds: _settleSeconds))) return;
+      _controller.setZoom(scenario.startZoom, animate: false);
+      await WidgetsBinding.instance.endOfFrame;
+      return;
+    }
+    switch (scenario.motion) {
+      case _Motion.pinch:
+      case _Motion.pinchPan:
+        await _drive(
+            Duration(milliseconds: (_pinchPeriodSeconds * 1000).round()));
+      case _Motion.none:
+      case _Motion.fling:
+      case _Motion.returnPan:
+      case _Motion.returnFrom:
+        break;
+    }
+  }
+
   /// Cache-eviction counter snapshot at arming; the RESULT reports the
   /// delta across the window (plan 13 attribution).
   Map<String, Object?>? _cacheAttributionAtArm;
@@ -772,6 +828,21 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       _startZoom = scenario.startZoom;
       var settled = true;
 
+      // Switching the camera mode (fractional ↔ integer) requires a
+      // fresh map state; the next mount rebuilds its warm state through
+      // the scenario's settle/warm-up path.
+      if (_mountedIntegerZoom != scenario.integerZoom) {
+        setState(() => _mapMounted = false);
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+        setState(() {
+          _mapMounted = true;
+          _mapGeneration++;
+        });
+        await WidgetsBinding.instance.endOfFrame;
+        _mountedIntegerZoom = scenario.integerZoom;
+      }
+
       final unmountFirst = scenario.cacheState == _CacheState.coldBytes ||
           scenario.cacheState == _CacheState.warmBytesColdParsed;
       if (unmountFirst) {
@@ -806,6 +877,13 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             !settled) {
           throw StateError('Warm-parsed capture requires a settled viewport');
         }
+        // Plan-13 review P2: a warm camera control must not race tile
+        // arrivals in the recorded window, so warm the WHOLE motion
+        // footprint first (unrecorded), then settle before arming.
+        if (scenario.cacheState == _CacheState.warmRendered) {
+          await _warmMotionFootprint(scenario);
+          settled = await _settle(Duration(seconds: _settleSeconds));
+        }
       }
 
       await _emitPayload(
@@ -816,6 +894,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
               'source=${scenario.source.name} startZoom=${scenario.startZoom} '
               'styleSwitch=${scenario.styleSwitch} '
               'motionSettleMs=${scenario.motionSettleMs} '
+              'integerZoom=${scenario.integerZoom} '
               'settled=$settled');
 
       final int rssBefore;
@@ -973,6 +1052,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
             'zoomStep': scenario.zoomStep,
             'legHoldMs': scenario.legHoldMs,
             'animatedZoom': scenario.animatedZoom,
+            'integerZoom': scenario.integerZoom,
             'payloadIdentity': _payloadIdentity,
             'payloadProfile': _profileName,
             'payloadSeed':
@@ -1184,20 +1264,29 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     // from the first post-jump sample of each leg (see [_legBaseAtMs] —
     // a frame in flight at the jump can carry pre-jump state). Leg 2 of a
     // cycle returns to [startZoom]; its allSharpMs is the reversal-reuse
-    // or reproduction metric.
+    // or reproduction metric. Each leg's search stops at the next jump:
+    // a later leg's samples belong to that leg, and the sharp restoration
+    // after the following jump must never masquerade as this leg's
+    // completion (plan-13 review P1 — a leg whose imagery never arrives
+    // reports null, not the next leg's recovery).
     final legs = <Map<String, Object?>>[];
     for (var k = 0; k < _legJumpAtMs.length; k++) {
       final baseMs =
           k < _legBaseAtMs.length ? _legBaseAtMs[k] : _legJumpAtMs[k];
+      final endMs = k + 1 < _legBaseAtMs.length
+          ? _legBaseAtMs[k + 1]
+          : double.infinity;
       int? legFirst(bool Function(List<double> s) test) {
         for (final s in samples) {
           if (s[0] < baseMs) continue;
+          if (s[0] >= endMs) return null;
           if (test(s)) return (s[0] - baseMs).round();
         }
         return null;
       }
 
       legs.add({
+        'boundedToNextJump': true,
         'jumpMs': _legJumpAtMs[k].round(),
         'baseMs': baseMs.round(),
         'allCoveredMs': legFirst((s) => s[1] >= 1),
@@ -1273,7 +1362,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
               child: MapView(
                 latLng: _center,
                 zoom: _startZoom,
-                enableFractionalZoom: true,
+                enableFractionalZoom: !_scenario.integerZoom,
                 controller: _controller,
                 vectorStyle: _scenario.source == _Source.vector
                     ? VectorMapStyle(

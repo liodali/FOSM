@@ -389,13 +389,22 @@ void main() {
       expect(MapView.debugGridRecaptures.content, greaterThan(content0),
           reason: 'publishing an image must count a content recapture');
 
-      // Boundary-crossing pan: membership-driven recapture.
+      // Boundary-crossing pan: membership-driven recapture, and — the
+      // plan-13 review fix — a membership change alone must NOT count as
+      // a tile arrival even though the combined revision moves.
       final membership0 = MapView.debugGridRecaptures.membership;
+      final contentBeforePan = MapView.debugGridRecaptures.content;
       controller.moveTo(
           const LatLng(latitude: 0.0005, longitude: 0.4), animate: false);
       await tester.pump();
       expect(MapView.debugGridRecaptures.membership, greaterThan(membership0),
           reason: 'crossing a tile boundary must count a membership change');
+      // Give any pending tile completions a chance to land; the held and
+      // pending fetchers never complete, so no imagery can arrive here.
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(MapView.debugGridRecaptures.content, contentBeforePan,
+          reason: 'a membership rebuild without new imagery must not '
+              'count as a content (tile-arrival) recapture');
     });
 
     testWidgets('define-off keeps the historical repaint-per-frame painter',
