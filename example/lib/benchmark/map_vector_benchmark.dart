@@ -662,8 +662,11 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   /// warm.
   Future<void> _warmPinchFootprint(_Scenario scenario) async {
     final isPan = scenario.motion == _Motion.pinchPan;
+    // Two poses per grid side: the membership window shifts with the
+    // tile scale within a grid (camera 9.6 renders the z10 grid at
+    // 2^−0.4), so the far ends of each side cover both window shifts.
     final poses = <(double, LatLng)>[
-      for (final d in [-0.74, -0.51, 0.0, 0.51, 0.74])
+      for (final d in [-0.74, -0.51, -0.49, 0.0, 0.49, 0.51, 0.74])
         (
           _startZoom + d,
           isPan ? _pinchPanCenter(d) : _center,
