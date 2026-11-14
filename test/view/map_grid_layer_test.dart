@@ -7,6 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart'
+    show lat2TileY, lon2TileX;
+import 'package:fosm/src/common/utils.dart' show tileHeight, tileWidth;
 import 'package:fosm/src/view/render.dart';
 
 /// Minimal valid 1×1 RGBA PNG — decodable by Flutter's image codec.
@@ -103,11 +106,14 @@ RenderCanvasOSM _gridPainter(WidgetTester tester) {
 
 /// Pumps a map whose fetchers resolve through [completers] (completed on
 /// first request unless [hold] names a key that must stay pending) and
-/// waits until every unheld foreground tile published.
+/// waits until every unheld foreground tile published. [settleBudget]
+/// bounds the wait; large test surfaces admit hundreds of tiles and the
+/// publish pipeline needs longer than the default under suite load.
 Future<MapController> _pumpSettledMap(
   WidgetTester tester, {
   required Map<String, Completer<Uint8List>> completers,
   String? hold,
+  Duration settleBudget = const Duration(seconds: 5),
 }) async {
   final controller = MapController();
   await tester.pumpWidget(
@@ -147,7 +153,7 @@ Future<MapController> _pumpSettledMap(
   final target = completers.length - (hold == null ? 0 : 1);
   final watch = Stopwatch()..start();
   while (loadedCount() < target &&
-      watch.elapsed < const Duration(seconds: 5)) {
+      watch.elapsed < settleBudget) {
     await tester.runAsync(() async {
       final turn = Stopwatch()..start();
       while (loadedCount() < target &&
@@ -419,6 +425,275 @@ void main() {
       await tester.pump();
       expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
           reason: 'without the candidate every camera frame repaints');
+    });
+  });
+
+  group('retained-scale grid (plan-13 Phase B)', () {
+    setUp(() {
+      MapView.gridLayerEnabled = true;
+      MapView.gridRetainedScaleEnabled = true;
+    });
+
+    tearDown(() {
+      MapView.gridRetainedScaleEnabled = MapView.gridRetainedScaleByDefine;
+      MapView.gridLayerEnabled = MapView.gridLayerByDefine;
+    });
+
+    /// Logical viewport size of the test surface.
+    Size viewSize(WidgetTester tester) => Size(
+          tester.view.physicalSize.width / tester.view.devicePixelRatio,
+          tester.view.physicalSize.height / tester.view.devicePixelRatio,
+        );
+
+    /// The camera Transform applied outside the grid repaint boundary.
+    Transform gridTransform(WidgetTester tester) {
+      final grid = find.byWidgetPredicate(
+          (widget) => widget is CustomPaint && widget.painter is RenderCanvasOSM);
+      final transforms = tester.widgetList<Transform>(
+          find.ancestor(of: grid.first, matching: find.byType(Transform)));
+      expect(transforms, hasLength(1),
+          reason: 'the grid layer sits under exactly one outer transform '
+              '(no zoom-snapshot overlay in these tests)');
+      return transforms.single;
+    }
+
+    testWidgets(
+        'fractional zoom within one source zoom keeps the layer retained',
+        (tester) async {
+      final completers = <String, Completer<Uint8List>>{};
+      final controller = await _pumpSettledMap(tester, completers: completers);
+
+      final painter0 = _gridPainter(tester);
+      final paints0 = RenderCanvasOSM.debugPaintCount;
+
+      // A pinch sweep inside zoom 10: every frame rebuilds the widget and
+      // changes the outer transform only; the captured raster must never
+      // repaint, and the painter keeps its captured identity (tileScale,
+      // anchors, tile snapshot) — the fractional scale lives entirely in
+      // the outer transform.
+      for (final zoom in const [10.15, 10.3, 10.42, 10.49]) {
+        controller.setFractionalZoom(zoom, animate: false);
+        await tester.pump();
+        expect(RenderCanvasOSM.debugPaintCount, paints0,
+            reason: 'zoom $zoom: retained scale must recomposite the layer '
+                'without repainting the grid');
+        final painter = _gridPainter(tester);
+        expect(painter.tileScale, painter0.tileScale,
+            reason: 'zoom $zoom: the painter keeps the captured tile scale');
+        expect(painter.leftColumnTilesCanvasX, painter0.leftColumnTilesCanvasX,
+            reason: 'zoom $zoom: the painter keeps the captured anchors');
+        expect(painter.topRowTilesCanvasY, painter0.topRowTilesCanvasY);
+        expect(painter.tiles, same(painter0.tiles),
+            reason: 'zoom $zoom: the painter keeps the captured tile '
+                'snapshot');
+      }
+    });
+
+    testWidgets(
+        'the outer transform matches the manager camera mapping '
+        '(focal and center preservation)', (tester) async {
+      final completers = <String, Completer<Uint8List>>{};
+      final controller = await _pumpSettledMap(tester, completers: completers);
+
+      // Pan first so the camera center is not tile-aligned; the captured
+      // grid then sits at a non-integer anchor and the check exercises
+      // both the scale and the translation terms.
+      controller.moveTo(
+          const LatLng(latitude: 0.0005, longitude: 0.01), animate: false);
+      await tester.pump();
+      final painter0 = _gridPainter(tester);
+
+      final leftLng = painter0.leftColumnTilesLngIndex;
+      final topLat = painter0.topRowTilesLatIndex;
+      final anchorBoxX = painter0.leftColumnTilesCanvasX;
+      final anchorBoxY = painter0.topRowTilesCanvasY;
+      final tileScaleCaptured = painter0.tileScale;
+      final twCaptured = tileWidth * tileScaleCaptured;
+      final thCaptured = tileHeight * tileScaleCaptured;
+
+      const zoomLive = 10.3;
+      controller.setFractionalZoom(zoomLive, animate: false);
+      await tester.pump();
+      final transform = gridTransform(tester).transform;
+      final ratio =
+          math.pow(2, zoomLive - 10).toDouble(); // 2^(live − captured at 10.0)
+
+      // Independent expectation: the manager maps a zoom-10 tile
+      // coordinate t to screen centerCanvas + (t − centerTile) · TW_live.
+      // A non-focal fractional zoom keeps the geographic center fixed at
+      // the moved-to lat/lng, so centerTile is its z10 projection.
+      const center = LatLng(latitude: 0.0005, longitude: 0.01);
+      final centerLngTile = lon2TileX(center.longitude, 10);
+      final centerLatTile = lat2TileY(center.latitude, 10);
+      final twLive = twCaptured * ratio;
+      final thLive = thCaptured * ratio;
+      final size = viewSize(tester);
+      Offset expectedScreen(double tileX, double tileY) => Offset(
+            size.width / 2 + (tileX - centerLngTile) * twLive,
+            size.height / 2 + (tileY - centerLatTile) * thLive,
+          );
+
+      // Actual: box origin (−tw_c, −th_c) plus the transform applied to
+      // the captured painter's box coordinates. Two probes: the first
+      // window tile's top-left corner and its bottom-right corner.
+      final m = transform.storage;
+      Offset actualScreen(Offset boxPoint) => Offset(
+            -twCaptured + m[0] * boxPoint.dx + m[12],
+            -thCaptured + m[5] * boxPoint.dy + m[13],
+          );
+
+      final topLeft = actualScreen(Offset(anchorBoxX, anchorBoxY));
+      final expectedTopLeft = expectedScreen(
+          leftLng.toDouble(), topLat.toDouble());
+      expect(topLeft.dx, closeTo(expectedTopLeft.dx, 0.01),
+          reason: 'the transformed captured content must land exactly '
+              'where the manager camera projects it (x)');
+      expect(topLeft.dy, closeTo(expectedTopLeft.dy, 0.01),
+          reason: 'the transformed captured content must land exactly '
+              'where the manager camera projects it (y)');
+
+      final bottomRight = actualScreen(Offset(
+        anchorBoxX + twCaptured,
+        anchorBoxY + thCaptured,
+      ));
+      final expectedBottomRight = expectedScreen(
+          (leftLng + 1).toDouble(), (topLat + 1).toDouble());
+      expect(bottomRight.dx, closeTo(expectedBottomRight.dx, 0.01),
+          reason: 'the scale ratio must be exactly 2^(live − captured)');
+      expect(bottomRight.dy, closeTo(expectedBottomRight.dy, 0.01));
+    });
+
+    testWidgets('integer source-zoom switch recaptures the grid',
+        (tester) async {
+      final completers = <String, Completer<Uint8List>>{};
+      final controller = await _pumpSettledMap(tester, completers: completers);
+
+      final paints0 = RenderCanvasOSM.debugPaintCount;
+      controller.setFractionalZoom(10.6, animate: false);
+      await tester.pump();
+      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
+          reason: 'crossing the .5 boundary switches the source zoom and '
+              'must recapture (content invalidation)');
+
+      // Let any zoom-snapshot overlay retire, then confirm the new
+      // capture paints at the live pose: source zoom 11 with cameraZoom
+      // 10.6 → tileScale 2^−0.4 (the fractional pose is preserved by the
+      // recapture; the legacy path would recapture identically here).
+      await tester.pumpAndSettle(const Duration(seconds: 2));
+      final painter = tester
+          .widgetList<CustomPaint>(find.byType(CustomPaint))
+          .map((paint) => paint.painter)
+          .whereType<RenderCanvasOSM>()
+          .last;
+      expect(painter.tileScale,
+          closeTo(math.pow(2, 10.6 - 11).toDouble(), 1e-9),
+          reason: 'the recapture paints at the new source zoom and the '
+              'live fractional pose');
+    });
+
+    testWidgets('zooming out past the captured window recaptures and keeps '
+        'the viewport covered', (tester) async {
+      // A phone-sized viewport never exhausts the captured pad inside a
+      // ±0.5 band: the manager window leaves tilePadding(2) + ceil
+      // friction (up to ~3 tiles per side) of slack, more than the √2
+      // worst-case extent growth unless the half-extent exceeds ~7.3
+      // tiles. At 4000 logical px (half-extent 7.8) the gate fires in
+      // the last sweep steps.
+      tester.view.devicePixelRatio = 3.0;
+      tester.view.physicalSize = const Size(12000, 9000);
+      addTearDown(() {
+        tester.view.resetDevicePixelRatio();
+        tester.view.resetPhysicalSize();
+      });
+
+      final completers = <String, Completer<Uint8List>>{};
+      final controller = await _pumpSettledMap(tester,
+          completers: completers, settleBudget: const Duration(seconds: 30));
+
+      var paints = RenderCanvasOSM.debugPaintCount;
+      var recaptures = 0;
+      var prevTileScale = _gridPainter(tester).tileScale;
+
+      // A fractional zoom-out sweep: the live viewport's tile extent
+      // grows; once it outgrows the captured painted window the capture
+      // must be rebuilt (and stays rebuilt around the live camera), so
+      // after every frame the live viewport stays inside the captured
+      // coverage.
+      for (final zoom in const [
+        9.95, 9.9, 9.85, 9.8, 9.75, 9.7, 9.65, 9.6, 9.55,
+      ]) {
+        controller.setFractionalZoom(zoom, animate: false);
+        await tester.pump();
+        final painter = _gridPainter(tester);
+        if (RenderCanvasOSM.debugPaintCount > paints ||
+            painter.tileScale != prevTileScale) {
+          recaptures++;
+          paints = RenderCanvasOSM.debugPaintCount;
+          prevTileScale = painter.tileScale;
+        }
+        // Coverage invariant, checked against the captured painter.
+        final size = viewSize(tester);
+        final twLive = tileWidth * math.pow(2, zoom - 10).toDouble();
+        final thLive = tileHeight * math.pow(2, zoom - 10).toDouble();
+        final centerLngTile = lon2TileX(0.0, 10);
+        final centerLatTile = lat2TileY(0.0, 10);
+        final halfW = size.width / (2 * twLive);
+        final halfH = size.height / (2 * thLive);
+        expect(
+            centerLngTile - halfW,
+            greaterThanOrEqualTo(painter.leftColumnTilesLngIndex - 1e-6),
+            reason: 'zoom $zoom: the live viewport must stay inside the '
+                'captured painted window (left)');
+        expect(
+            centerLngTile + halfW,
+            lessThanOrEqualTo(painter.leftColumnTilesLngIndex +
+                painter.horizontalTileCount +
+                1e-6),
+            reason: 'zoom $zoom: captured window covers the viewport (right)');
+        expect(
+            centerLatTile - halfH,
+            greaterThanOrEqualTo(painter.topRowTilesLatIndex - 1e-6),
+            reason: 'zoom $zoom: captured window covers the viewport (top)');
+        expect(
+            centerLatTile + halfH,
+            lessThanOrEqualTo(painter.topRowTilesLatIndex +
+                painter.verticalTileCount +
+                1e-6),
+            reason: 'zoom $zoom: captured window covers the viewport '
+                '(bottom)');
+      }
+      expect(recaptures, greaterThanOrEqualTo(1),
+          reason: 'a fractional zoom-out must recapture once the viewport '
+              'outgrows the captured coverage');
+    });
+
+    testWidgets('an imagery arrival during a fractional zoom recaptures',
+        (tester) async {
+      final completers = <String, Completer<Uint8List>>{};
+      final controller =
+          await _pumpSettledMap(tester, completers: completers, hold: '10/512/511');
+
+      final held = completers['10/512/511']!;
+      final paints0 = RenderCanvasOSM.debugPaintCount;
+
+      // Fractional zoom first: the layer stays retained (imagery stale
+      // but unchanged).
+      controller.setFractionalZoom(10.25, animate: false);
+      await tester.pump();
+      expect(RenderCanvasOSM.debugPaintCount, paints0);
+
+      // The arrival publishes → contentRevision → recapture.
+      held.complete(_tinyPng);
+      final watch = Stopwatch()..start();
+      while (RenderCanvasOSM.debugPaintCount == paints0 &&
+          watch.elapsed < const Duration(seconds: 5)) {
+        await tester.runAsync(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        });
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
+          reason: 'an arrival must recapture promptly, also mid-gesture');
     });
   });
 }

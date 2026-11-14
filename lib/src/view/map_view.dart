@@ -278,6 +278,36 @@ class _GridLayerCapture {
   final double anchorX;
   final double anchorY;
 
+  /// Fractional camera zoom at capture (`TileManager.cameraZoom`). The
+  /// retained-scale transform's ratio is 2^(live − this); [tileScale] is
+  /// its value relative to the integer [zoom] at capture.
+  final double cameraZoom;
+
+  /// Camera center at capture, in [zoom]-unit tile coordinates. The outer
+  /// translation re-anchors the captured content to the live center.
+  final double centerLng;
+  final double centerLat;
+
+  /// Viewport size at capture. The captured box keeps this geometry
+  /// between recaptures; a resize invalidates it.
+  final double viewportWidth;
+  final double viewportHeight;
+
+  /// Rendered tile size at capture (`tileWidth * tileScale`). Stable box
+  /// dimensions for the captured raster.
+  final double renderedTileWidth;
+  final double renderedTileHeight;
+
+  /// Snapshot of the manager's render tiles at capture. Between
+  /// recaptures the live membership may move on while the captured
+  /// painter keeps drawing exactly these cells. Images are pinned via
+  /// [release], mirroring `_GridSnapshot`.
+  final List<Tile> tiles;
+
+  /// Releases the rendered-image pins on [tiles]. Null on the legacy
+  /// path, whose painter reads the live `manager.renderTiles` list.
+  final VoidCallback? release;
+
   const _GridLayerCapture({
     required this.manager,
     required this.revision,
@@ -292,6 +322,15 @@ class _GridLayerCapture {
     required this.placeholders,
     required this.anchorX,
     required this.anchorY,
+    required this.cameraZoom,
+    required this.centerLng,
+    required this.centerLat,
+    required this.viewportWidth,
+    required this.viewportHeight,
+    required this.renderedTileWidth,
+    required this.renderedTileHeight,
+    this.tiles = const [],
+    this.release,
   });
 
   /// Whether [next] describes the same grid content, so the retained layer
@@ -329,6 +368,77 @@ class _GridLayerCapture {
     if (background != next.background || placeholders != next.placeholders) {
       stats.flags++;
     }
+  }
+
+  /// Whether the captured grid can still stand in for [live] through the
+  /// retained-scale transform (plan-13 Phase B): same runtime, integer
+  /// source zoom, imagery revision and paint flags, an unchanged viewport
+  /// size, and a live strict viewport that stays inside the captured
+  /// painted window. This replaces the legacy `matches` role of
+  /// `tileScale` — fractional scale changes are absorbed by the outer
+  /// transform, while the geographic checks that `tileScale` equality
+  /// implicitly guaranteed (window coverage at the painted scale) are
+  /// now explicit in [coversViewport].
+  bool retainedHolds(
+    TileManager live,
+    Size viewport,
+    bool nextBackground,
+    bool nextPlaceholders,
+  ) {
+    if (!identical(manager, live)) return false;
+    if (zoom != live.zoom) return false;
+    if (contentRevision != live.contentRevision) return false;
+    if (background != nextBackground || placeholders != nextPlaceholders) {
+      return false;
+    }
+    if (viewportWidth != viewport.width || viewportHeight != viewport.height) {
+      return false;
+    }
+    return coversViewport(live);
+  }
+
+  /// Whether the live strict viewport, expressed in [zoom]-unit tile
+  /// coordinates, fits inside the captured painted window
+  /// `[leftLngIndex, leftLngIndex + horizontalCount) ×
+  /// [topLatIndex, topLatIndex + verticalCount)`. Zooming out exposes
+  /// geography the capture never painted; zooming in shrinks the live
+  /// extent and only ever widens the margin. Panning shifts the live
+  /// extent; once it reaches the window edge the pad is exhausted and
+  /// the capture must be rebuilt around the live camera. The tiny
+  /// tolerance keeps a margin that is zero to float precision from
+  /// oscillating between holds and recaptures.
+  bool coversViewport(TileManager live) {
+    const epsilon = 1e-6;
+    final halfW = viewportWidth / (2 * live.renderedTileWidth);
+    final halfH = viewportHeight / (2 * live.renderedTileHeight);
+    return live.centerTileLng - halfW >= leftLngIndex - epsilon &&
+        live.centerTileLng + halfW <= leftLngIndex + horizontalCount + epsilon &&
+        live.centerTileLat - halfH >= topLatIndex - epsilon &&
+        live.centerTileLat + halfH <= topLatIndex + verticalCount + epsilon;
+  }
+
+  /// The plan-13 Phase B outer camera transform for [live]: scale ratio
+  /// `2^(liveCameraZoom − capturedCameraZoom)` and the translation that
+  /// re-anchors the captured content to the live camera center, applied
+  /// outside the repaint boundary.
+  ///
+  /// Derivation: the manager maps a tile coordinate t to canvas
+  /// `centerCanvas + (t − centerTile) · renderedTile`, so the same
+  /// geographic point sits at `r · captured + K` with
+  /// `r = 2^(live − captured)` and `K = (1 − r) · (viewport/2 +
+  /// renderedTile)` + the center-difference term — see the widget build
+  /// in [_MapState._buildRetainedScaleGrid]. Because both sides map tile
+  /// coordinates consistently, the geographic point under the gesture's
+  /// focal point stays fixed: the focal logic lives in the manager's
+  /// live center, and the transform follows it.
+  Matrix4 retainedScaleTransform(TileManager live) {
+    final ratio =
+        math.pow(2, live.cameraZoom - cameraZoom).toDouble();
+    final kx = (1 - ratio) * (viewportWidth / 2 + renderedTileWidth) +
+        (centerLng - live.centerTileLng) * live.renderedTileWidth;
+    final ky = (1 - ratio) * (viewportHeight / 2 + renderedTileHeight) +
+        (centerLat - live.centerTileLat) * live.renderedTileHeight;
+    return Matrix4.identity()..translate(kx, ky)..scale(ratio, ratio);
   }
 }
 
@@ -513,6 +623,22 @@ class MapView extends StatefulWidget {
   static const gridLayerByDefine =
       bool.fromEnvironment('fosm.gridLayer', defaultValue: true);
   static bool gridLayerEnabled = gridLayerByDefine;
+
+  /// Plan-13 Phase B candidate: keep the captured grid raster in stable
+  /// captured coordinates and move it with an outer camera scale +
+  /// translation, so fractional zoom no longer repaints the grid every
+  /// frame (the plan-12 translate-only layer still recaptures on every
+  /// `tileScale` change). The captured pose, coverage window and tile
+  /// images are pinned; recapture happens on imagery arrival, source-zoom
+  /// switch, paint-flag or viewport change, or when the live viewport
+  /// outgrows the captured window (zoom-out exposes area the capture
+  /// never painted). Scaling a retained raster trades sharpness during
+  /// the gesture — accepted for this prototype, judged in the phone A/B.
+  /// Off by default: `--dart-define=fosm.gridRetainedScale=true`, the
+  /// static stays mutable for tests and the benchmark harness.
+  static const gridRetainedScaleByDefine =
+      bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: false);
+  static bool gridRetainedScaleEnabled = gridRetainedScaleByDefine;
 
   /// Plan-13 attribution: why the retained grid layer recaptured since
   /// process start. One capture-identity change can match several
@@ -1229,6 +1355,7 @@ class _MapViewState extends State<MapView>
     _stopFractionalAnimation();
     _zoomFallback?.dispose();
     _zoomFallback = null;
+    _gridCapture?.release?.call();
     _gridCapture = null;
     _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
@@ -2627,6 +2754,9 @@ class _MapViewState extends State<MapView>
   /// the painter receives the anchors captured at the last identity
   /// change, so unchanged content keeps `shouldRepaint` false and the
   /// retained layer is moved by a paint transform for sub-tile motion.
+  /// With [MapView.gridRetainedScaleEnabled] on, [_buildRetainedScaleGrid]
+  /// takes over: the capture also fixes the fractional camera pose and the
+  /// window coverage, and the outer transform scales as well as moves.
   ///
   /// Geometry: the boundary box extends one rendered tile beyond the
   /// viewport on every side and its origin sits at screen (−tw, −th), so
@@ -2658,6 +2788,9 @@ class _MapViewState extends State<MapView>
         ),
       );
     }
+    if (MapView.gridRetainedScaleEnabled) {
+      return _buildRetainedScaleGrid(manager, size, fallbackActive);
+    }
 
     final capture = _GridLayerCapture(
       manager: manager,
@@ -2673,6 +2806,15 @@ class _MapViewState extends State<MapView>
       placeholders: !fallbackActive,
       anchorX: manager.leftColumnTilesCanvasX,
       anchorY: manager.topRowTilesCanvasY,
+      // Legacy translate-only capture: pose fields are unused (the
+      // identity keeps tileScale, so every scale change recaptures).
+      cameraZoom: manager.cameraZoom,
+      centerLng: manager.centerTileLng,
+      centerLat: manager.centerTileLat,
+      viewportWidth: size.width,
+      viewportHeight: size.height,
+      renderedTileWidth: manager.renderedTileWidth,
+      renderedTileHeight: manager.renderedTileHeight,
     );
     if (_gridCapture == null || !_gridCapture!.matches(capture)) {
       if (_gridCapture != null) {
@@ -2680,7 +2822,7 @@ class _MapViewState extends State<MapView>
         // invalid (arrival, zoom switch, scale, membership, flags).
         _gridCapture!.accumulateChangedFields(capture);
       }
-      _gridCapture = capture;
+      _replaceGridCapture(capture);
     }
     final cap = _gridCapture!;
     final dx = manager.leftColumnTilesCanvasX - cap.anchorX;
@@ -2721,6 +2863,117 @@ class _MapViewState extends State<MapView>
         ),
       ),
     );
+  }
+
+  /// Plan-13 Phase B (`fosm.gridRetainedScale`): the captured grid keeps
+  /// its stable captured geometry — box dimensions, anchors, tile scale,
+  /// tile snapshot — and the live camera is applied as an outer scale +
+  /// translation [outside] the repaint boundary, so a fractional pinch
+  /// recomposites the retained raster instead of repainting the grid
+  /// every frame (the plan-12 translate-only layer above recaptures on
+  /// every `tileScale` change).
+  ///
+  /// Recapture policy: imagery arrival ([TileManager.contentRevision]),
+  /// integer source-zoom switch, fallback flag change, viewport resize,
+  /// or the live viewport outgrowing the captured painted window —
+  /// zooming out exposes geography the capture never painted, so the
+  /// legacy one-tile pad assumption is replaced by an explicit coverage
+  /// check ([_GridLayerCapture.retainedHolds]). The transform follows the
+  /// manager's own camera mapping, so the geographic point under the
+  /// gesture focal point stays fixed. Captured cells are pinned until the
+  /// next recapture, so cache eviction cannot dispose content the
+  /// painter still draws; the pin adds at most one window of images
+  /// between recaptures, on top of the cache budget.
+  ///
+  /// Sampling is the accepted trade: between recaptures the captured
+  /// raster is resampled by the compositor (up to 2^±0.5 within a source
+  /// zoom) instead of re-rendered at the live scale.
+  Widget _buildRetainedScaleGrid(
+    TileManager manager,
+    Size size,
+    bool fallbackActive,
+  ) {
+    final background = !fallbackActive;
+    final placeholders = !fallbackActive;
+    if (_gridCapture == null ||
+        !_gridCapture!.retainedHolds(manager, size, background, placeholders)) {
+      final capture = _GridLayerCapture(
+        manager: manager,
+        revision: manager.revision,
+        contentRevision: manager.contentRevision,
+        zoom: manager.zoom,
+        leftLngIndex: manager.leftColumnTilesLngIndex,
+        topLatIndex: manager.topRowTilesLatIndex,
+        horizontalCount: manager.horizontalTileCount,
+        verticalCount: manager.verticalTileCount,
+        tileScale: manager.zoomScale,
+        background: background,
+        placeholders: placeholders,
+        anchorX: manager.leftColumnTilesCanvasX,
+        anchorY: manager.topRowTilesCanvasY,
+        cameraZoom: manager.cameraZoom,
+        centerLng: manager.centerTileLng,
+        centerLat: manager.centerTileLat,
+        viewportWidth: size.width,
+        viewportHeight: size.height,
+        renderedTileWidth: manager.renderedTileWidth,
+        renderedTileHeight: manager.renderedTileHeight,
+        tiles: List<Tile>.from(manager.renderTiles),
+        release: manager.retainSnapshot(manager.renderTiles),
+      );
+      if (_gridCapture != null) {
+        // Plan-13 attribution with the same field comparison; in this
+        // mode `scale` counts only recaptures whose captured tile scale
+        // happened to change (the transform absorbs scale between them).
+        _gridCapture!.accumulateChangedFields(capture);
+      }
+      _replaceGridCapture(capture);
+    }
+    final cap = _gridCapture!;
+    final boxWidth = cap.viewportWidth + 2 * cap.renderedTileWidth;
+    final boxHeight = cap.viewportHeight + 2 * cap.renderedTileHeight;
+    final painter = RenderCanvasOSM(
+      horizontalTileCount: cap.horizontalCount,
+      verticalTileCount: cap.verticalCount,
+      leftColumnTilesLngIndex: cap.leftLngIndex,
+      topRowTilesLatIndex: cap.topLatIndex,
+      // Box coordinates: the box origin sits one captured tile up-left of
+      // the viewport, so the captured anchors shift by (+tw, +th).
+      leftColumnTilesCanvasX: cap.anchorX + cap.renderedTileWidth,
+      topRowTilesCanvasY: cap.anchorY + cap.renderedTileHeight,
+      tiles: cap.tiles,
+      revision: cap.revision,
+      tileScale: cap.tileScale,
+      paintBackground: cap.background,
+      paintPlaceholders: cap.placeholders,
+    );
+    return Positioned(
+      left: -cap.renderedTileWidth,
+      top: -cap.renderedTileHeight,
+      width: boxWidth,
+      height: boxHeight,
+      child: Transform(
+        // The repaint boundary retains the captured raster; the outer
+        // scale + translation recomposites it for the live camera without
+        // repainting. Coverage between recaptures is guaranteed by
+        // [retainedHolds].
+        transform: cap.retainedScaleTransform(manager),
+        child: RepaintBoundary(
+          child: CustomPaint(
+            size: Size(boxWidth, boxHeight),
+            painter: painter,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Swaps the retained-grid capture, releasing any rendered-image pins
+  /// the previous capture holds (retained-scale mode pins its tile
+  /// snapshot; the legacy translate-only path holds none).
+  void _replaceGridCapture(_GridLayerCapture capture) {
+    _gridCapture?.release?.call();
+    _gridCapture = capture;
   }
 
   @override
