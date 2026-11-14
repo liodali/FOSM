@@ -651,31 +651,86 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     }
   }
 
-  /// Visits every cell a warm scenario's recorded camera path will touch,
-  /// unrecorded, so the recorded window measures camera cost only
-  /// (plan-13 review P2). Pinch/pinch-pan drive one full sine period —
-  /// the amplitude footprint is periodic and the camera ends back at the
-  /// start pose. Animated scenarios visit the zoom target and return.
-  Future<void> _warmMotionFootprint(_Scenario scenario) async {
-    if (scenario.animatedZoom != 0) {
-      _controller.setZoom(
-          scenario.startZoom + scenario.animatedZoom,
-          animate: false);
-      if (!await _settle(Duration(seconds: _settleSeconds))) return;
-      _controller.setZoom(scenario.startZoom, animate: false);
-      await WidgetsBinding.instance.endOfFrame;
-      return;
+  /// Visits every (zoom, camera pose) the recorded pinch will select and
+  /// settles each to completion, so the recorded window measures camera
+  /// cost only (plan-13 review round 2): the sweep crosses integer zoom
+  /// boundaries (`zoom = cameraZoom.round()`), and settling only the
+  /// final viewport leaves the other grids' imagery stale-pruned and
+  /// unrendered — the recorded window then races production and drops to
+  /// fallback coverage. Each pose must settle or the capture is rejected
+  /// loudly: a warm control that failed preparation must not pass as
+  /// warm.
+  Future<void> _warmPinchFootprint(_Scenario scenario) async {
+    final isPan = scenario.motion == _Motion.pinchPan;
+    final poses = <(double, LatLng)>[
+      for (final d in [-0.74, -0.51, 0.0, 0.51, 0.74])
+        (
+          _startZoom + d,
+          isPan ? _pinchPanCenter(d) : _center,
+        ),
+    ];
+    for (final (zoom, center) in poses) {
+      _controller.moveTo(center, animate: false);
+      _controller.setFractionalZoom(zoom, animate: false);
+      final settled = await _settle(Duration(seconds: _settleSeconds));
+      if (!settled) {
+        throw StateError(
+            'warm footprint failed to settle at zoom $zoom — rejecting '
+            'the capture: the warm control would be contaminated');
+      }
     }
+    _controller.moveTo(isPan ? _pinchPanCenter(0) : _center, animate: false);
+    _controller.setFractionalZoom(_startZoom.toDouble(), animate: false);
+    final settled = await _settle(Duration(seconds: _settleSeconds));
+    if (!settled) {
+      throw StateError(
+          'warm footprint failed to settle at the start pose — rejecting '
+          'the capture: the warm control would be contaminated');
+    }
+  }
+
+  /// Camera center of the pinch-pan gesture at sine delta [delta]: the
+  /// geographic point under the off-center focal stays fixed, so the
+  /// center orbits it by 2^−delta (see [_Motion.pinchPan]).
+  LatLng _pinchPanCenter(double delta) {
+    final shrink = math.pow(2, -delta).toDouble();
+    return LatLng(
+      latitude: _pinchFocalLat + (_center.latitude - _pinchFocalLat) * shrink,
+      longitude:
+          _pinchFocalLng + (_center.longitude - _pinchFocalLng) * shrink,
+    );
+  }
+
+  /// Warms a warm scenario's whole recorded footprint, unrecorded, and
+  /// verifies preparation before the window arms (plan-13 review rounds
+  /// 1-2). Pinch scenarios settle every (zoom, pose) the sweep selects;
+  /// animated scenarios visit the zoom target and return; anything that
+  /// fails to settle rejects the capture.
+  Future<void> _warmMotionFootprint(_Scenario scenario) async {
     switch (scenario.motion) {
       case _Motion.pinch:
       case _Motion.pinchPan:
-        await _drive(
-            Duration(milliseconds: (_pinchPeriodSeconds * 1000).round()));
+        await _warmPinchFootprint(scenario);
       case _Motion.none:
       case _Motion.fling:
       case _Motion.returnPan:
       case _Motion.returnFrom:
-        break;
+        if (scenario.animatedZoom != 0) {
+          _controller.setZoom(
+              scenario.startZoom + scenario.animatedZoom,
+              animate: false);
+          var settled = await _settle(Duration(seconds: _settleSeconds));
+          if (settled) {
+            _controller.setZoom(scenario.startZoom, animate: false);
+            settled = await _settle(Duration(seconds: _settleSeconds));
+          }
+          if (!settled) {
+            throw StateError(
+                'warm footprint failed to settle at zoom '
+                '${scenario.startZoom + scenario.animatedZoom} — rejecting '
+                'the capture: the warm control would be contaminated');
+          }
+        }
     }
   }
 
