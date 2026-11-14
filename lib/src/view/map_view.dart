@@ -398,23 +398,36 @@ class _GridLayerCapture {
   }
 
   /// Whether the live strict viewport, expressed in [zoom]-unit tile
-  /// coordinates, fits inside the captured painted window
-  /// `[leftLngIndex, leftLngIndex + horizontalCount) ×
-  /// [topLatIndex, topLatIndex + verticalCount)`. Zooming out exposes
-  /// geography the capture never painted; zooming in shrinks the live
-  /// extent and only ever widens the margin. Panning shifts the live
-  /// extent; once it reaches the window edge the pad is exhausted and
-  /// the capture must be rebuilt around the live camera. The tiny
-  /// tolerance keeps a margin that is zero to float precision from
-  /// oscillating between holds and recaptures.
+  /// coordinates, fits inside the retained **surface** — the captured
+  /// viewport extent plus one rendered tile of pad per side, which is
+  /// exactly what the repaint boundary's box holds
+  /// (`Positioned(-renderedTile)`, size `viewport + 2 · renderedTile`).
+  ///
+  /// This deliberately checks the surface bounds, not the padded
+  /// membership window: the painter may draw the whole padded window,
+  /// but the layer's raster is only the box, so anything painted past
+  /// the box edge is cut when the layer is cached. Checking the window
+  /// instead would accept pans/zoom-outs whose outer transform slides
+  /// bare raster edge past the viewport, exposing background strips.
+  /// Zooming out exposes geography the capture never painted; zooming
+  /// in shrinks the live extent and only ever widens the margin.
+  /// Panning shifts the live extent; once it passes the pad the capture
+  /// must be rebuilt around the live camera. The tiny tolerance keeps a
+  /// margin that is zero to float precision from oscillating between
+  /// holds and recaptures.
   bool coversViewport(TileManager live) {
     const epsilon = 1e-6;
     final halfW = viewportWidth / (2 * live.renderedTileWidth);
     final halfH = viewportHeight / (2 * live.renderedTileHeight);
-    return live.centerTileLng - halfW >= leftLngIndex - epsilon &&
-        live.centerTileLng + halfW <= leftLngIndex + horizontalCount + epsilon &&
-        live.centerTileLat - halfH >= topLatIndex - epsilon &&
-        live.centerTileLat + halfH <= topLatIndex + verticalCount + epsilon;
+    // Captured strict-viewport extent ± one rendered tile of raster pad.
+    final left = centerLng - viewportWidth / (2 * renderedTileWidth) - 1;
+    final right = centerLng + viewportWidth / (2 * renderedTileWidth) + 1;
+    final top = centerLat - viewportHeight / (2 * renderedTileHeight) - 1;
+    final bottom = centerLat + viewportHeight / (2 * renderedTileHeight) + 1;
+    return live.centerTileLng - halfW >= left - epsilon &&
+        live.centerTileLng + halfW <= right + epsilon &&
+        live.centerTileLat - halfH >= top - epsilon &&
+        live.centerTileLat + halfH <= bottom + epsilon;
   }
 
   /// The plan-13 Phase B outer camera transform for [live]: scale ratio
@@ -1439,6 +1452,12 @@ class _MapViewState extends State<MapView>
         throw StateError(
             'Wait for tile presentations to settle before reloading');
       }
+      // The retained-scale capture pins its tile snapshot
+      // (retainSnapshot) — release and invalidate before the workload
+      // reload demands zero pins; the reload's calculate + notification
+      // rebuilds the grid and the next build recaptures fresh.
+      _gridCapture?.release?.call();
+      _gridCapture = null;
       _clearZoomSnapshot();
       _clearZoomFallback();
       manager.reloadRenderedImagesForWorkload();
