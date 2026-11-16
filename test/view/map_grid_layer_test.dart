@@ -271,6 +271,15 @@ void main() {
   });
 
   group('retained grid layer geometry', () {
+    setUp(() {
+      // These groups pin the plan-12 translate-only layer semantics;
+      // the plan-13 retained-scale path has its own group below.
+      MapView.gridRetainedScaleEnabled = false;
+    });
+    tearDown(() {
+      MapView.gridRetainedScaleEnabled = MapView.gridRetainedScaleByDefine;
+    });
+
     testWidgets(
         'painter output with captured anchors plus translation equals '
         'live-anchor painting', (tester) async {
@@ -339,6 +348,16 @@ void main() {
   });
 
   group('retained grid layer invalidation', () {
+    setUp(() {
+      // Legacy-path assertions: the historical painter repaints on
+      // every fractional scale change. The retained-scale path is
+      // covered by the plan-13 group below.
+      MapView.gridRetainedScaleEnabled = false;
+    });
+    tearDown(() {
+      MapView.gridRetainedScaleEnabled = MapView.gridRetainedScaleByDefine;
+    });
+
     testWidgets('sub-tile pan moves the layer without repainting the grid',
         (tester) async {
       MapView.gridLayerEnabled = true;

@@ -646,11 +646,17 @@ class MapView extends StatefulWidget {
   /// switch, paint-flag or viewport change, or when the live viewport
   /// outgrows the captured window (zoom-out exposes area the capture
   /// never painted). Scaling a retained raster trades sharpness during
-  /// the gesture — accepted for this prototype, judged in the phone A/B.
-  /// Off by default: `--dart-define=fosm.gridRetainedScale=true`, the
-  /// static stays mutable for tests and the benchmark harness.
+  /// the gesture — a single transient frame when zooming out fast;
+  /// measured in the plan-13 phone A/B (recaptures 599 → 34 per 10 s,
+  /// grid-paint CPU −89%, zero over-budget frames, sharp end-states
+  /// identical) and accepted.
+  ///
+  /// On by default since the plan-13 Phase B A/B;
+  /// `--dart-define=fosm.gridRetainedScale=false` restores the
+  /// historical repaint-per-frame path. The static stays mutable for
+  /// tests and the benchmark harness.
   static const gridRetainedScaleByDefine =
-      bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: false);
+      bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: true);
   static bool gridRetainedScaleEnabled = gridRetainedScaleByDefine;
 
   /// Plan-13 attribution: why the retained grid layer recaptured since
