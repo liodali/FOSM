@@ -886,6 +886,113 @@ void main() {
           reason: 'the rebuilt capture covers the left viewport edge');
     });
 
+    testWidgets('a viewport resize recaptures and stays covered '
+        '(pixel output)', (tester) async {
+      final blue = await tester.runAsync(
+              () => _solidTilePng(const Color(0xFF3366AA))) ??
+          (throw StateError('tile png failed'));
+      final key = GlobalKey();
+      final controller = MapController();
+      await tester.pumpWidget(
+        RepaintBoundary(
+          key: key,
+          child: MaterialApp(
+            home: Scaffold(
+              body: MapView(
+                controller: controller,
+                latLng: const LatLng(latitude: 0, longitude: 0),
+                zoom: 10,
+                tileFetcher: (z, x, y) async => blue,
+                showZoomControls: false,
+                animateZoom: false,
+              ),
+            ),
+          ),
+        ),
+      );
+      await _waitForTilesPublished(tester);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // Resize the window: the capture's box dimensions and viewport
+      // extent are stale, so the capture must rebuild around the live
+      // camera for the new viewport instead of reusing a mis-sized
+      // raster.
+      final paints0 = RenderCanvasOSM.debugPaintCount;
+      tester.view.physicalSize = const Size(3000, 1800); // 800→1000 logical
+      addTearDown(tester.view.resetPhysicalSize);
+      await tester.pump();
+      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
+          reason: 'a viewport resize must recapture the grid');
+
+      // The rebuilt capture admits tiles the old box didn't hold; wait
+      // for their imagery before judging pixels.
+      await _waitForTilesPublished(tester);
+      final (rgba, width, height) = await _rasterize(tester, key);
+      expect(width, 1000,
+          reason: 'the raster must reflect the resized viewport '
+              '(logical px at toImage pixelRatio 1)');
+      const blueRgb = [0x33, 0x66, 0xAA];
+      expect(_edgeCoverage(rgba, width, height, true, blueRgb),
+          greaterThan(0.9),
+          reason: 'the resized viewport must be covered to its right edge');
+      expect(_edgeCoverage(rgba, width, height, false, blueRgb),
+          greaterThan(0.9),
+          reason: 'the resized viewport must be covered to its left edge');
+    });
+
+    testWidgets('crossing the antimeridian recaptures and stays covered '
+        '(pixel output)', (tester) async {
+      final blue = await tester.runAsync(
+              () => _solidTilePng(const Color(0xFF3366AA))) ??
+          (throw StateError('tile png failed'));
+      final key = GlobalKey();
+      final controller = MapController();
+      await tester.pumpWidget(
+        RepaintBoundary(
+          key: key,
+          child: MaterialApp(
+            home: Scaffold(
+              body: MapView(
+                controller: controller,
+                latLng: const LatLng(latitude: 0, longitude: 179.5),
+                zoom: 10,
+                tileFetcher: (z, x, y) async => blue,
+                showZoomControls: false,
+                animateZoom: false,
+              ),
+            ),
+          ),
+        ),
+      );
+      await _waitForTilesPublished(tester);
+      await tester.pumpAndSettle(const Duration(seconds: 1));
+
+      // The manager wraps centerTileLng to [0, n), so crossing the
+      // antimeridian jumps the center by ~n tiles. The one-tile surface
+      // pad can never bridge that, so the capture must rebuild around
+      // the live camera — reusing it would translate ~1024 tiles of
+      // content across the viewport.
+      final paints0 = RenderCanvasOSM.debugPaintCount;
+      controller.moveTo(
+          const LatLng(latitude: 0.0005, longitude: -179.5), animate: false);
+      await tester.pump();
+      expect(RenderCanvasOSM.debugPaintCount, greaterThan(paints0),
+          reason: 'a wrap crossing must recapture, not retain across the '
+              'world edge');
+
+      // The rebuilt capture fetches a fresh neighborhood around the
+      // wrapped camera; wait for its imagery before judging pixels.
+      await _waitForTilesPublished(tester);
+      final (rgba, width, height) = await _rasterize(tester, key);
+      const blueRgb = [0x33, 0x66, 0xAA];
+      expect(_edgeCoverage(rgba, width, height, true, blueRgb),
+          greaterThan(0.9),
+          reason: 'the wrapped viewport must be covered to its right edge');
+      expect(_edgeCoverage(rgba, width, height, false, blueRgb),
+          greaterThan(0.9),
+          reason: 'the wrapped viewport must be covered to its left edge');
+    });
+
     testWidgets('workload reload releases the capture pin and recaptures',
         (tester) async {
       final completers = <String, Completer<Uint8List>>{};
