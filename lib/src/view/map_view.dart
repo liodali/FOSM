@@ -2,7 +2,8 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
@@ -141,9 +142,10 @@ class _OldGridOverlay extends StatelessWidget {
   /// derived from the complete camera delta rather than one zoom step.
   final bool interactionSnapshot;
 
-  /// Whether the full-viewport blur is allowed. Skipped on web by default
-  /// and during direct manipulation, where opacity + transform are cheaper
-  /// and keep input responsive.
+  /// Whether the full-viewport blur is allowed. Skipped on web, during
+  /// direct manipulation, and for vector payloads (plan 13: vector
+  /// transitions stay unblurred; raster keeps its blur), where opacity +
+  /// transform are cheaper and keep input responsive.
   final bool blurEnabled;
 
   const _OldGridOverlay({
@@ -618,6 +620,23 @@ enum ZoomAnimationStyle {
 /// The fading old-grid overlay tracks camera pans, so a pinch that keeps
 /// panning mid-animation stays visually aligned.
 class MapView extends StatefulWidget {
+  /// Transition blur for the active payload. Per the updated product
+  /// direction (plan 13): vector imagery stays visible and receives no
+  /// artificial blur during zoom transitions — the scaled retained
+  /// imagery is the continuity; raster transitions keep their existing
+  /// blur. Web and direct manipulation keep their existing off gates.
+  ///
+  /// Returns the effective sigma; sub-0.1 is treated as off downstream.
+  @visibleForTesting
+  static double transitionBlurSigma({
+    required bool vectorPayload,
+    required double sigma,
+    required bool diagnosticOff,
+    required bool web,
+    required bool interacting,
+  }) =>
+      (diagnosticOff || web || interacting || vectorPayload) ? 0.0 : sigma;
+
   /// Counts [MapView] rebuilds. Test hook used to prove that several tile
   /// arrivals in one frame produce a single map update.
   @visibleForTesting
@@ -3041,6 +3060,18 @@ class _MapViewState extends State<MapView>
             !_interacting && _animWaitingTiles && _animOldSnapshot != null;
         final fallbackActive = coverage.hasRegions && !fallbackSuppressed;
 
+        // Effective transition blur: vector payloads keep their imagery
+        // unblurred (plan 13 product direction); raster keeps the
+        // snapshot's gaussian sigma; web, direct manipulation and the
+        // diagnostic arm stay off. Sub-0.1 is off downstream.
+        final transitionBlurSigma = MapView.transitionBlurSigma(
+          vectorPayload: _vectorRuntime != null,
+          sigma: _blurSigma,
+          diagnosticOff: _blurDiagnosticOff,
+          web: kIsWeb,
+          interacting: _interacting,
+        );
+
         final runtime = _vectorRuntime;
 
         // During scale animation, render two layers.
@@ -3096,9 +3127,10 @@ class _MapViewState extends State<MapView>
                         // tiles blend against the plain-grid background.
                         // The snapshot's gaussian sigma rides per-region
                         // saveLayers inside the painter (bounded, clipped
-                        // per cell), off on the web and while a hand
-                        // directly works the map — same gates as the
-                        // snapshot's own blur.
+                        // per cell), off on the web, while a hand
+                        // directly works the map, and for vector
+                        // payloads (plan 13: vector transitions get no
+                        // artificial blur; raster keeps its blur).
                         if (fallbackActive)
                           Positioned.fill(
                             child: CustomPaint(
@@ -3106,11 +3138,7 @@ class _MapViewState extends State<MapView>
                               painter: ZoomFallbackPainter(
                                 coverage: coverage,
                                 manager: manager,
-                                blurSigma: (_blurDiagnosticOff ||
-                                        kIsWeb ||
-                                        _interacting)
-                                    ? 0.0
-                                    : _blurSigma,
+                                blurSigma: transitionBlurSigma,
                               ),
                             ),
                           ),
@@ -3133,8 +3161,10 @@ class _MapViewState extends State<MapView>
                             visualScale: _visualScale,
                             blurSigma: _blurSigma,
                             interactionSnapshot: _pinchTransitionActive,
-                            blurEnabled:
-                                !kIsWeb && !_interacting && !_blurDiagnosticOff,
+                            // Same gate as the fallback: raster keeps its
+                            // blur; vector, web, direct manipulation and
+                            // the diagnostic arm do not blur.
+                            blurEnabled: transitionBlurSigma > 0.1,
                           ),
                         ],
                       ],

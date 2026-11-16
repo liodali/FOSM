@@ -543,7 +543,9 @@ class _TileCoord {
 class ZoomFallbackPainter extends CustomPainter {
   /// The zoom snapshot's gaussian sigma — the softened appearance that
   /// persists over the handoff (plan 09). Zero per-engine/gesture gates;
-  /// sub-0.1 is treated as off.
+  /// sub-0.1 is treated as off. The view passes 0 for vector payloads:
+  /// plan 13's product direction keeps vector transitions unblurred and
+  /// reserves this blur for raster.
   final double blurSigma;
 
   ZoomFallbackPainter({
