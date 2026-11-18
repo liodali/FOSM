@@ -573,14 +573,40 @@ class TileManager with CacheTiles {
   /// capture-time zoom's tile units: the gesture focal point, the camera
   /// center and the captured fractional scale. The focal-preserving
   /// projection maps the camera center to a target zoom z' as
-  /// `C' = F·2^dz − (F − C)·zoomScale` — the geographic point under the
-  /// fingers stays at its screen offset. Null until the first camera
-  /// change; prediction then falls back to the bare center.
+  /// `C' = [C + (F − C)·(1 − zoomScale)]·2^(z' − captureZoom)` — the
+  /// geographic point under the fingers stays at its screen offset.
+  /// Null until the first camera change; a pan invalidates the capture
+  /// (it moves the camera without re-capturing the focal relation), and
+  /// prediction then falls back to the live center.
   double? _preparedFocalLng;
   double? _preparedFocalLat;
   double? _preparedCenterLng;
   double? _preparedCenterLat;
   double? _preparedZoomScale;
+
+  /// The integer zoom the prediction inputs were captured at. Growth
+  /// factors are computed against this base, never against the current
+  /// zoom — after a zoom change the capture lives in a different
+  /// coordinate system than `zoom + dz`.
+  int? _preparedCaptureZoom;
+
+  /// Guard while a zoom-change method performs its own center mutation:
+  /// the setters below invalidate a stale capture, but the zoom methods
+  /// immediately install a fresh one.
+  bool _suppressPredictionInvalidation = false;
+
+  /// A pan moves the camera without re-capturing the focal relation.
+  /// Drop the capture so prediction follows the live center instead of
+  /// continuing around a previous location.
+  void _invalidatePreparedCapture() {
+    if (_suppressPredictionInvalidation) return;
+    _preparedFocalLng = null;
+    _preparedFocalLat = null;
+    _preparedCenterLng = null;
+    _preparedCenterLat = null;
+    _preparedZoomScale = null;
+    _preparedCaptureZoom = null;
+  }
 
   /// Sign of the most recent camera zoom change (+1 in, −1 out, 0 none):
   /// orders which level sign prepares first within a shell.
@@ -1061,6 +1087,7 @@ class TileManager with CacheTiles {
         longitude: tileX2Lng(centerTileLng, zoom),
       );
     }
+    _invalidatePreparedCapture();
   }
 
   void setCenterFromTileCoords(double tileLng, double tileLat) {
@@ -1072,6 +1099,7 @@ class TileManager with CacheTiles {
       latitude: tileY2Lat(centerTileLat, zoom),
       longitude: tileX2Lng(centerTileLng, zoom),
     );
+    _invalidatePreparedCapture();
   }
 
   void _clampTileCoords() {
@@ -1159,15 +1187,24 @@ class TileManager with CacheTiles {
   void setZoom(int newZoom) {
     if (newZoom == zoom && _cameraZoom == null) return;
     _zoomDirection = newZoom > zoom ? 1 : -1;
-    _preparedFocalLng = centerTileLng;
-    _preparedFocalLat = centerTileLat;
-    _preparedCenterLng = centerTileLng;
-    _preparedCenterLat = centerTileLat;
-    _preparedZoomScale = _zoomScale;
+    // Capture at the pre-change zoom.
+    final captureZoom = zoom;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedScale = _zoomScale;
+    _suppressPredictionInvalidation = true;
     _cameraZoom = null;
     _zoomScale = 1;
     zoom = newZoom;
     setCenterTile();
+    _suppressPredictionInvalidation = false;
+    // Center-preserving integer jump: focal == center.
+    _preparedFocalLng = capturedCenterLng;
+    _preparedFocalLat = capturedCenterLat;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
   }
 
@@ -1176,21 +1213,19 @@ class TileManager with CacheTiles {
     _zoomDirection = newZoom > oldZoom ? 1 : -1;
     // Capture at the pre-change zoom (the focal vars below are already
     // in old-zoom tile units) before anything mutates.
-    _preparedZoomScale = _zoomScale;
-    _preparedCenterLng = centerTileLng;
-    _preparedCenterLat = centerTileLat;
-
-    final focalTileLng =
+    final captureZoom = zoom;
+    final capturedScale = _zoomScale;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedFocalLng =
         centerTileLng + (focalLocal.dx - centerCanvasX) / renderedTileWidth;
-    final focalTileLat =
+    final capturedFocalLat =
         centerTileLat + (focalLocal.dy - centerCanvasY) / renderedTileHeight;
-    final focalLng = tileX2Lng(focalTileLng, oldZoom);
-    final focalLat = tileY2Lat(focalTileLat, oldZoom);
+    final focalLng = tileX2Lng(capturedFocalLng, oldZoom);
+    final focalLat = tileY2Lat(capturedFocalLat, oldZoom);
 
     final newFocalTileLng = lon2TileX(focalLng, newZoom);
     final newFocalTileLat = lat2TileY(focalLat, newZoom);
-    _preparedFocalLng = focalTileLng;
-    _preparedFocalLat = focalTileLat;
 
     _cameraZoom = null;
     _zoomScale = 1;
@@ -1200,7 +1235,15 @@ class TileManager with CacheTiles {
         newFocalTileLat - (focalLocal.dy - centerCanvasY) / renderedTileHeight;
 
     zoom = newZoom;
+    _suppressPredictionInvalidation = true;
     setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+    _suppressPredictionInvalidation = false;
+    _preparedFocalLng = capturedFocalLng;
+    _preparedFocalLat = capturedFocalLat;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
   }
 
@@ -1218,29 +1261,37 @@ class TileManager with CacheTiles {
     _validateCameraZoom(value);
     if (value == cameraZoom) return;
     // Prepared-window prediction inputs: zoom direction, the gesture
-    // focal point, the camera center and the fractional scale — all in
-    // capture-time tile units, so the focal-preserving projection can
-    // map the center to each target zoom.
+    // focal point, the camera center, the fractional scale and the
+    // capture zoom — all in capture-time tile units, so the
+    // focal-preserving projection can map the center to each target
+    // zoom from the capture's own coordinate system.
     _zoomDirection = value > cameraZoom ? 1 : -1;
     final focal = focalPoint ?? Offset(centerCanvasX, centerCanvasY);
     final focalX =
         centerTileLng + (focal.dx - centerCanvasX) / renderedTileWidth;
     final focalY =
         centerTileLat + (focal.dy - centerCanvasY) / renderedTileHeight;
-    _preparedFocalLng = focalX;
-    _preparedFocalLat = focalY;
-    _preparedCenterLng = centerTileLng;
-    _preparedCenterLat = centerTileLat;
-    _preparedZoomScale = _zoomScale;
+    final captureZoom = zoom;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedScale = _zoomScale;
     final oldZoom = zoom;
     zoom = value.round();
     _cameraZoom = value;
     _zoomScale = math.pow(2, value - zoom).toDouble();
     final ratio = math.pow(2, zoom - oldZoom).toDouble();
+    _suppressPredictionInvalidation = true;
     setCenterFromTileCoords(
       focalX * ratio - (focal.dx - centerCanvasX) / renderedTileWidth,
       focalY * ratio - (focal.dy - centerCanvasY) / renderedTileHeight,
     );
+    _suppressPredictionInvalidation = false;
+    _preparedFocalLng = focalX;
+    _preparedFocalLat = focalY;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
   }
 
@@ -1772,11 +1823,38 @@ class TileManager with CacheTiles {
     final halfW = width / 512 + 1;
     final halfH = height / 512 + 1;
 
+    // Projection inputs, all in the capture zoom's tile units. The
+    // focal-preserving projection grows the captured center by
+    // 2^(target − captureZoom) — never by dz, which is relative to the
+    // CURRENT zoom and would mix coordinate systems after a zoom change.
+    // Without a capture (first pass, or invalidated by a pan) predict
+    // around the live center.
+    final captureZoom = _preparedCaptureZoom;
     final captureScale = _preparedZoomScale ?? 1.0;
     final focalLng = _preparedFocalLng ?? centerTileLng;
     final focalLat = _preparedFocalLat ?? centerTileLat;
-    final centerLng = _preparedCenterLng ?? centerTileLng;
-    final centerLat = _preparedCenterLat ?? centerTileLat;
+    final capCenterLng = _preparedCenterLng ?? centerTileLng;
+    final capCenterLat = _preparedCenterLat ?? centerTileLat;
+
+    double predictedLngFor(int zTarget) {
+      if (captureZoom == null) {
+        return centerTileLng * math.pow(2, (zTarget - zoom).toDouble());
+      }
+      final growth =
+          math.pow(2, (zTarget - captureZoom).toDouble());
+      return (capCenterLng + (focalLng - capCenterLng) * (1 - captureScale)) *
+          growth;
+    }
+
+    double predictedLatFor(int zTarget) {
+      if (captureZoom == null) {
+        return centerTileLat * math.pow(2, (zTarget - zoom).toDouble());
+      }
+      final growth =
+          math.pow(2, (zTarget - captureZoom).toDouble());
+      return (capCenterLat + (focalLat - capCenterLat) * (1 - captureScale)) *
+          growth;
+    }
 
     final preferredSign = _zoomDirection < 0 ? -1 : 1;
     final candidates = <({_LoadJob job, int level, int signRank})>[];
@@ -1786,12 +1864,8 @@ class TileManager with CacheTiles {
       for (final dz in [preferredSign * level, -preferredSign * level]) {
         final z = zoom + dz;
         if (z < 0 || z > 19) continue;
-        final scale = math.pow(2, dz).toDouble();
-        // Focal-preserving projection of the camera center.
-        final predictedLng =
-            focalLng * scale - (focalLng - centerLng) * captureScale;
-        final predictedLat =
-            focalLat * scale - (focalLat - centerLat) * captureScale;
+        final predictedLng = predictedLngFor(z);
+        final predictedLat = predictedLatFor(z);
         final world = 1 << z;
         final minX = (predictedLng - halfW).floor();
         final maxX = (predictedLng + halfW).floor();
@@ -1810,7 +1884,10 @@ class TileManager with CacheTiles {
                 _preparedKeys.contains(key)) {
               continue;
             }
-            final dx = wx + 0.5 - predictedLng;
+            // Distance from the unwrapped x: the raw position is the
+            // rect-relative one, so wrapped tiles rank by their true
+            // proximity instead of appearing a world away.
+            final dx = x + 0.5 - predictedLng;
             final dy = y + 0.5 - predictedLat;
             candidates.add((
               job: _LoadJob(
