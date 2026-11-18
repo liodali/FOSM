@@ -371,6 +371,32 @@ class TileManager with CacheTiles {
       // asked for memory back and idle decodes would rebuild it.
       _speculativeSuspended = true;
     }
+    // Prepared zoom window: identical treatment — its queue entries and
+    // relevance keys drop so in-flight decodes abort at their next gate,
+    // and admission suspends until the camera generation changes (a
+    // cleared cache must not refill with offscreen speculation).
+    if (preparedZoomWindow && _preparedKeys.isNotEmpty) {
+      var cancelled = 0;
+      for (final key in _preparedKeys) {
+        if (!_hasRenderedImage(key)) cancelled++;
+      }
+      _loadQueue.removeWhere((job) {
+        if (job.jobClass != _JobClass.preparedZoom) return false;
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+        return true;
+      });
+      _presentQueue.removeWhere((entry) {
+        if (entry.job.jobClass != _JobClass.preparedZoom) return false;
+        _inFlight.remove(entry.job.key);
+        return true;
+      });
+      _preparedStats['cancelled'] = _preparedStats['cancelled']! + cancelled;
+      _preparedKeys.clear();
+      _preparedAdmitted = 0;
+      _preparedSuspended = true;
+      _trace('prepared: pressure-cancelled=$cancelled');
+    }
     _byteCache.clear();
     _byteCacheSize = 0;
     _memoryCache.flushUnused();
@@ -543,14 +569,27 @@ class TileManager with CacheTiles {
   /// The camera generation the prepared budget belongs to.
   int _preparedGeneration = -1;
 
-  /// Gesture focal point in tile coords at the current zoom, when the
-  /// view reported one; `null` predicts around the center.
+  /// Prediction inputs captured at the last camera change, in the
+  /// capture-time zoom's tile units: the gesture focal point, the camera
+  /// center and the captured fractional scale. The focal-preserving
+  /// projection maps the camera center to a target zoom z' as
+  /// `C' = F·2^dz − (F − C)·zoomScale` — the geographic point under the
+  /// fingers stays at its screen offset. Null until the first camera
+  /// change; prediction then falls back to the bare center.
   double? _preparedFocalLng;
   double? _preparedFocalLat;
+  double? _preparedCenterLng;
+  double? _preparedCenterLat;
+  double? _preparedZoomScale;
 
   /// Sign of the most recent camera zoom change (+1 in, −1 out, 0 none):
   /// orders which level sign prepares first within a shell.
   int _zoomDirection = 0;
+
+  /// True after memory pressure cleared prepared work; admission stays
+  /// suspended until the camera generation changes (the system just asked
+  /// for memory back — idle preparation would rebuild it).
+  bool _preparedSuspended = false;
 
   /// A/B counters: admitted (jobs enqueued), promoted (image became
   /// visible through the cache-hit path), cancelled (dropped by a camera
@@ -1120,8 +1159,11 @@ class TileManager with CacheTiles {
   void setZoom(int newZoom) {
     if (newZoom == zoom && _cameraZoom == null) return;
     _zoomDirection = newZoom > zoom ? 1 : -1;
-    _preparedFocalLng = null;
-    _preparedFocalLat = null;
+    _preparedFocalLng = centerTileLng;
+    _preparedFocalLat = centerTileLat;
+    _preparedCenterLng = centerTileLng;
+    _preparedCenterLat = centerTileLat;
+    _preparedZoomScale = _zoomScale;
     _cameraZoom = null;
     _zoomScale = 1;
     zoom = newZoom;
@@ -1132,6 +1174,11 @@ class TileManager with CacheTiles {
   void setZoomWithFocalPoint(int newZoom, Offset focalLocal, int oldZoom) {
     if (newZoom == zoom && cameraZoom == newZoom) return;
     _zoomDirection = newZoom > oldZoom ? 1 : -1;
+    // Capture at the pre-change zoom (the focal vars below are already
+    // in old-zoom tile units) before anything mutates.
+    _preparedZoomScale = _zoomScale;
+    _preparedCenterLng = centerTileLng;
+    _preparedCenterLat = centerTileLat;
 
     final focalTileLng =
         centerTileLng + (focalLocal.dx - centerCanvasX) / renderedTileWidth;
@@ -1142,8 +1189,8 @@ class TileManager with CacheTiles {
 
     final newFocalTileLng = lon2TileX(focalLng, newZoom);
     final newFocalTileLat = lat2TileY(focalLat, newZoom);
-    _preparedFocalLng = newFocalTileLng;
-    _preparedFocalLat = newFocalTileLat;
+    _preparedFocalLng = focalTileLng;
+    _preparedFocalLat = focalTileLat;
 
     _cameraZoom = null;
     _zoomScale = 1;
@@ -1170,22 +1217,26 @@ class TileManager with CacheTiles {
   void setCameraZoom(double value, {Offset? focalPoint}) {
     _validateCameraZoom(value);
     if (value == cameraZoom) return;
-    // Prepared-window prediction inputs: zoom direction and the live
-    // gesture focal point (tile coords at the new integer zoom — the
-    // focal remap below keeps the geographic point under the fingers).
+    // Prepared-window prediction inputs: zoom direction, the gesture
+    // focal point, the camera center and the fractional scale — all in
+    // capture-time tile units, so the focal-preserving projection can
+    // map the center to each target zoom.
     _zoomDirection = value > cameraZoom ? 1 : -1;
     final focal = focalPoint ?? Offset(centerCanvasX, centerCanvasY);
     final focalX =
         centerTileLng + (focal.dx - centerCanvasX) / renderedTileWidth;
     final focalY =
         centerTileLat + (focal.dy - centerCanvasY) / renderedTileHeight;
+    _preparedFocalLng = focalX;
+    _preparedFocalLat = focalY;
+    _preparedCenterLng = centerTileLng;
+    _preparedCenterLat = centerTileLat;
+    _preparedZoomScale = _zoomScale;
     final oldZoom = zoom;
     zoom = value.round();
     _cameraZoom = value;
     _zoomScale = math.pow(2, value - zoom).toDouble();
     final ratio = math.pow(2, zoom - oldZoom).toDouble();
-    _preparedFocalLng = focalX * ratio;
-    _preparedFocalLat = focalY * ratio;
     setCenterFromTileCoords(
       focalX * ratio - (focal.dx - centerCanvasX) / renderedTileWidth,
       focalY * ratio - (focal.dy - centerCanvasY) / renderedTileHeight,
@@ -1323,6 +1374,10 @@ class TileManager with CacheTiles {
     _speculativeAdmitted = 0;
     _speculativeSuspended = false;
     _revokeSpeculativeWork();
+    // A camera change lifts the pressure suspension too: the pressure
+    // landscape moved with the camera, and supersede re-admits the new
+    // prediction from a clean budget.
+    _preparedSuspended = false;
     _supersedePreparedWindow();
 
     _memoryCache.setActiveKeys(_protectedImageKeys({
@@ -1667,6 +1722,9 @@ class TileManager with CacheTiles {
   bool get _preparedWindowMayAdmit {
     if (!preparedZoomWindow || _disposed) return false;
     if (preparedWindowDepth < 1) return false;
+    if (_preparedSuspended) {
+      return false; // memory pressure: stay suspended until the camera moves
+    }
     if (_preparedGeneration != _generation) {
       // A generation the supersede hook missed (membership unchanged —
       // e.g. a sub-tile pan): keep counting against the old budget only
@@ -1686,10 +1744,18 @@ class TileManager with CacheTiles {
   }
 
   /// Admits prepared zoom window jobs (plan 13 Phase E): the predicted
-  /// viewport at zoom ±1 (then ±2, shells in order) around the gesture
-  /// focal point — or the center when no focal is known — prepared as
-  /// full drawable images on the background lane. A later zoom reveals
-  /// them through the synchronous rendered-cache-hit path.
+  /// viewport at zoom ±1 (then ±2, shells in order) prepared as full
+  /// drawable images on the background lane. A later zoom reveals them
+  /// through the synchronous rendered-cache-hit path.
+  ///
+  /// Target bounds come from the screen dimensions and the
+  /// focal-preserving camera projection — the screen shows `width / 256`
+  /// tiles of the target level, and the projected camera center is
+  /// `C' = F·2^dz − (F − C)·zoomScale` (the geographic point under the
+  /// fingers keeps its screen offset). Longitude wraps across the
+  /// antimeridian and deduplicates by canonical key; latitude clips at
+  /// the poles. Candidates rank by shell, direction sign, then distance
+  /// from the predicted center — the budget buys central tiles first.
   ///
   /// Runs on every queue pump, mirroring speculative admission: job
   /// completions and grid rebuilds are exactly the moments the foreground
@@ -1700,41 +1766,43 @@ class TileManager with CacheTiles {
     if (!_preparedWindowMayAdmit) return;
     final depth = preparedWindowDepth.clamp(1, 2);
 
-    // Strict viewport extent in tile units at the current zoom; the
-    // predicted viewport at zoom + dz scales it by 2^dz.
-    final visibleH = _visibleHorizontalCount;
-    final visibleV = _visibleVerticalCount;
-    if (visibleH <= 0 || visibleV <= 0) return;
+    // Screen extent in target-level tiles: a tile of an integer zoom is
+    // 256 logical px, so the screen always shows width/256 by height/256
+    // tiles; +1 is the bounded surface pad (mirrors the retained scale).
+    final halfW = width / 512 + 1;
+    final halfH = height / 512 + 1;
 
-    // Prediction center: the gesture focal point when known, else the
-    // camera center, mapped to the current integer zoom's tile space.
-    final centerLng = _preparedFocalLng ?? centerTileLng;
-    final centerLat = _preparedFocalLat ?? centerTileLat;
+    final captureScale = _preparedZoomScale ?? 1.0;
+    final focalLng = _preparedFocalLng ?? centerTileLng;
+    final focalLat = _preparedFocalLat ?? centerTileLat;
+    final centerLng = _preparedCenterLng ?? centerTileLng;
+    final centerLat = _preparedCenterLat ?? centerTileLat;
 
-    final candidates = <_LoadJob>[];
+    final preferredSign = _zoomDirection < 0 ? -1 : 1;
+    final candidates = <({_LoadJob job, int level, int signRank})>[];
     final seen = <String>{};
-    var shallowerPending = false;
+    var shallowerCandidates = false;
     for (var level = 1; level <= depth; level++) {
-      // Direction first: the sign the camera last moved prepares before
-      // its opposite within the same shell.
-      final signs = _zoomDirection >= 0 ? [level, -level] : [-level, level];
-      for (final dz in signs) {
+      for (final dz in [preferredSign * level, -preferredSign * level]) {
         final z = zoom + dz;
         if (z < 0 || z > 19) continue;
         final scale = math.pow(2, dz).toDouble();
-        final predictedLng = centerLng * scale;
-        final predictedLat = centerLat * scale;
-        final halfW = visibleH * scale / 2 + 1; // +1: bounded surface pad
-        final halfH = visibleV * scale / 2 + 1;
+        // Focal-preserving projection of the camera center.
+        final predictedLng =
+            focalLng * scale - (focalLng - centerLng) * captureScale;
+        final predictedLat =
+            focalLat * scale - (focalLat - centerLat) * captureScale;
         final world = 1 << z;
-        final minX = (predictedLng - halfW).floor().clamp(0, world - 1);
-        final maxX = (predictedLng + halfW).floor().clamp(0, world - 1);
-        final minY = (predictedLat - halfH).floor();
-        final maxY = (predictedLat + halfH).floor();
+        final minX = (predictedLng - halfW).floor();
+        final maxX = (predictedLng + halfW).floor();
+        final minY = (predictedLat - halfH).floor().clamp(0, world - 1);
+        final maxY = (predictedLat + halfH).floor().clamp(0, world - 1);
         for (var y = minY; y <= maxY; y++) {
-          if (y < 0 || y >= world) continue; // off-world rows never load
           for (var x = minX; x <= maxX; x++) {
-            final key = _key(z, x, y);
+            // Longitude wraps (antimeridian-crossing viewports keep their
+            // far-side coverage); latitude clipped above.
+            final wx = ((x % world) + world) % world;
+            final key = _key(z, wx, y);
             if (!seen.add(key)) continue;
             if (_memoryCache.containsKey(key) ||
                 _inFlight.contains(key) ||
@@ -1742,32 +1810,44 @@ class TileManager with CacheTiles {
                 _preparedKeys.contains(key)) {
               continue;
             }
-            final dx = x + 0.5 - predictedLng;
+            final dx = wx + 0.5 - predictedLng;
             final dy = y + 0.5 - predictedLat;
-            candidates.add(_LoadJob(
-              key: key,
-              resourceKey: _resourceKey(z, x, y),
-              z: z,
-              x: x,
-              y: y,
-              generation: _generation,
-              jobClass: _JobClass.preparedZoom,
-              distance: dx * dx + dy * dy,
-              byteOnly: false,
+            candidates.add((
+              job: _LoadJob(
+                key: key,
+                resourceKey: _resourceKey(z, wx, y),
+                z: z,
+                x: wx,
+                y: y,
+                generation: _generation,
+                jobClass: _JobClass.preparedZoom,
+                distance: dx * dx + dy * dy,
+                byteOnly: false,
+              ),
+              level: level,
+              signRank: (dz > 0) == (preferredSign > 0) ? 0 : 1,
             ));
           }
         }
       }
-      // Shell discipline: |dz| = level+1 waits until this level has no
-      // unfinished admission (candidates it could not admit this pass).
+      // Shell discipline: the next level out only admits once this level
+      // has no unresolved candidates (they clear as their images land or
+      // their keys are dropped, so later pumps expand the shell).
       if (candidates.isNotEmpty && level < depth) {
-        shallowerPending = true;
+        shallowerCandidates = true;
       }
-      if (shallowerPending) break;
+      if (shallowerCandidates) break;
     }
+    if (candidates.isEmpty) return;
 
-    // Caps: outstanding prepared work, per-generation admissions, and the
-    // shared byte-cache share the byte-only preload obeys.
+    // Rank before spending the budget: shell, direction sign, then
+    // distance — row-scan order would exhaust the budget on a far edge.
+    candidates.sort((a, b) {
+      if (a.level != b.level) return a.level.compareTo(b.level);
+      if (a.signRank != b.signRank) return a.signRank.compareTo(b.signRank);
+      return a.job.distance.compareTo(b.job.distance);
+    });
+
     var outstanding = 0;
     for (final job in _loadQueue) {
       if (job.jobClass == _JobClass.preparedZoom) outstanding++;
@@ -1776,7 +1856,8 @@ class TileManager with CacheTiles {
         .where((key) => _inFlight.contains(key) || _queued.contains(key))
         .length;
     final byteBudget = (maxByteCacheBytes * _preloadByteShare).round();
-    for (final job in candidates) {
+    for (final c in candidates) {
+      final job = c.job;
       if (outstanding >= maxConcurrentPrepared) break;
       if (_preparedAdmitted >= maxPreparedPerGeneration) break;
       if (_byteCacheSize >= byteBudget) break;

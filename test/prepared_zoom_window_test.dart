@@ -8,6 +8,30 @@ import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 
+/// Predicted admission count for a no-gesture camera at [center]
+/// (focal == center, integer capture scale).
+int expectedCount({
+  required LatLng center,
+  required double widthPx,
+  required double heightPx,
+  required int depth,
+}) {
+  const z = 3;
+  final focalLng = lon2TileX(center.longitude, z);
+  final focalLat = lat2TileY(center.latitude, z);
+  return expectedAdmitted(
+    zoom: z,
+    widthPx: widthPx,
+    heightPx: heightPx,
+    focalLngTile: focalLng,
+    focalLatTile: focalLat,
+    centerLngTile: focalLng,
+    centerLatTile: focalLat,
+    zoomScaleAtCapture: 1.0,
+    depth: depth,
+  );
+}
+
 /// Minimal valid 1×1 RGBA PNG — decodable by Flutter's image codec.
 final Uint8List fakeTilePng = Uint8List.fromList([
   0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
@@ -94,14 +118,19 @@ Future<void> _settlePrepared(
 }
 
 /// Predicted candidate count replicated from the design formula: the
-/// current strict viewport extent scaled by 2^dz around the predicted
-/// center (focal or camera center), padded one tile, world-clipped.
+/// focal-preserving projection maps the camera center to the target
+/// zoom (`C' = F·2^dz − (F − C)·zoomScale`), the screen shows
+/// `width/256 × height/256` tiles of the target level, +1 tile of
+/// bounded pad; longitude wraps and deduplicates, latitude clips.
 int expectedAdmitted({
   required int zoom,
-  required int visibleH,
-  required int visibleV,
+  required double widthPx,
+  required double heightPx,
+  required double focalLngTile,
+  required double focalLatTile,
   required double centerLngTile,
   required double centerLatTile,
+  required double zoomScaleAtCapture,
   required int depth,
 }) {
   final keys = <String>{};
@@ -110,19 +139,21 @@ int expectedAdmitted({
       final z = zoom + dz;
       if (z < 0 || z > 19) continue;
       final scale = _pow2(dz);
-      final predictedLng = centerLngTile * scale;
-      final predictedLat = centerLatTile * scale;
-      final halfW = visibleH * scale / 2 + 1;
-      final halfH = visibleV * scale / 2 + 1;
+      final predictedLng = focalLngTile * scale -
+          (focalLngTile - centerLngTile) * zoomScaleAtCapture;
+      final predictedLat = focalLatTile * scale -
+          (focalLatTile - centerLatTile) * zoomScaleAtCapture;
+      final halfW = widthPx / 512 + 1;
+      final halfH = heightPx / 512 + 1;
       final world = 1 << z;
-      final minX = (predictedLng - halfW).floor().clamp(0, world - 1);
-      final maxX = (predictedLng + halfW).floor().clamp(0, world - 1);
-      final minY = (predictedLat - halfH).floor();
-      final maxY = (predictedLat + halfH).floor();
+      final minX = (predictedLng - halfW).floor();
+      final maxX = (predictedLng + halfW).floor();
+      final minY = (predictedLat - halfH).floor().clamp(0, world - 1);
+      final maxY = (predictedLat + halfH).floor().clamp(0, world - 1);
       for (var y = minY; y <= maxY; y++) {
-        if (y < 0 || y >= world) continue;
         for (var x = minX; x <= maxX; x++) {
-          keys.add('$z/$x/$y');
+          final wx = ((x % world) + world) % world;
+          keys.add('$z/$wx/$y');
         }
       }
     }
@@ -187,14 +218,11 @@ void main() {
       addTearDown(manager.dispose);
 
       manager.calculate();
-      final expected = expectedAdmitted(
-        zoom: 3,
-        visibleH: visibleH(manager),
-        visibleV: visibleV(manager),
-        centerLngTile: lon2TileX(center.longitude, 3),
-        centerLatTile: lat2TileY(center.latitude, 3),
-        depth: 1,
-      );
+      final expected = expectedCount(
+          center: center,
+          widthPx: 256,
+          heightPx: 256,
+          depth: 1);
       expect(expected, greaterThan(0), reason: 'sanity: nonempty window');
       // Budget high enough that the prediction is admitted exactly.
       expect(expected, lessThanOrEqualTo(256));
@@ -253,14 +281,11 @@ void main() {
       addTearDown(manager.dispose);
 
       manager.calculate();
-      final expected = expectedAdmitted(
-        zoom: 3,
-        visibleH: visibleH(manager),
-        visibleV: visibleV(manager),
-        centerLngTile: lon2TileX(center.longitude, 3),
-        centerLatTile: lat2TileY(center.latitude, 3),
-        depth: 1,
-      );
+      final expected = expectedCount(
+          center: center,
+          widthPx: 256,
+          heightPx: 256,
+          depth: 1);
       await _settlePrepared(tester, counts, expected);
 
       // Zoom in one level: the predicted z4 viewport was prepared, so the
@@ -330,14 +355,11 @@ void main() {
       });
 
       manager.calculate();
-      final expected = expectedAdmitted(
-        zoom: 3,
-        visibleH: visibleH(manager),
-        visibleV: visibleV(manager),
-        centerLngTile: lon2TileX(center.longitude, 3),
-        centerLatTile: lat2TileY(center.latitude, 3),
-        depth: 1,
-      );
+      final expected = expectedCount(
+          center: center,
+          widthPx: 256,
+          heightPx: 256,
+          depth: 1);
       await _settleUntil(
           tester, () => manager.debugPreparedWindowStats['admitted']! >= expected);
 
@@ -408,16 +430,9 @@ void main() {
       addTearDown(manager.dispose);
 
       manager.calculate();
-      final expected = expectedAdmitted(
-        zoom: 3,
-        visibleH: visibleH(manager),
-        visibleV: visibleV(manager),
-        centerLngTile: lon2TileX(center.longitude, 3),
-        centerLatTile: lat2TileY(center.latitude, 3),
-        depth: 2,
-      );
+      final expected = expectedCount(
+          center: center, widthPx: 256, heightPx: 256, depth: 2);
       await _settlePrepared(tester, counts, expected);
-
       final zooms =
           counts.preparedKeys.map((k) => k.split('/').first).toSet();
       expect(zooms, {'1', '2', '4', '5'},
@@ -425,9 +440,127 @@ void main() {
       expect(manager.debugPreparedWindowStats['admitted'], expected);
     });
 
-    testWidgets('prepared work never delays foreground demand',
+    testWidgets('an antimeridian-crossing viewport keeps its far side',
         (tester) async {
-      // Hold a visible fetch; nothing prepared may decode until the
+      // Center 179.5°E at z3: the ±1 predicted rects cross the world edge;
+      // wrapped X must appear (not be clipped away) and dedup by key.
+      const edgeCenter = LatLng(latitude: 0.01, longitude: 179.5);
+      final counts = _Counts();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: edgeCenter,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        preparedZoomWindow: true,
+        preparedWindowDepth: 1,
+        maxPreparedPerGeneration: 256,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      final expected = expectedCount(
+        center: edgeCenter,
+        widthPx: 256,
+        heightPx: 256,
+        depth: 1,
+      );
+      await _settlePrepared(tester, counts, expected);
+
+      final zooms =
+          counts.preparedKeys.map((k) => k.split('/').first).toSet();
+      expect(zooms, {'2', '4'});
+      // The z4 shell crosses the antimeridian: canonical wrapped columns
+      // 0 and 1 must be present beside 14 and 15.
+      final z4Columns =
+          counts.preparedKeys.where((k) => k.startsWith('4/')).map((k) {
+        final parts = k.split('/');
+        return parts[1];
+      }).toSet();
+      expect(z4Columns, containsAll(['0', '1', '14', '15']),
+          reason: 'wrapped far-side coverage must be prepared, not '
+              'clipped at the world edge');
+      expect(counts.preparedKeys.length, expected,
+          reason: 'wrapped duplicates must dedup by canonical key');
+    });
+
+    testWidgets('memory pressure cancels prepared work and suspends '
+        'admission until the camera moves', (tester) async {
+      // Gate the first prepared fetch so unfinished prepared work exists
+      // when pressure lands.
+      final gate = Completer<void>();
+      var gated = false;
+      Future<Uint8List> fetcher(int z, int x, int y) async {
+        if (z != 3 && !gated) {
+          gated = true;
+          await gate.future;
+        }
+        return fakeTilePng;
+      }
+
+      final counts = _Counts();
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: fetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        preparedZoomWindow: true,
+        preparedWindowDepth: 1,
+        maxPreparedPerGeneration: 256,
+      );
+      addTearDown(manager.dispose);
+      addTearDown(() {
+        if (!gate.isCompleted) gate.complete();
+      });
+
+      manager.calculate();
+      final expected = expectedCount(
+        center: center,
+        widthPx: 256,
+        heightPx: 256,
+        depth: 1,
+      );
+      await _settleUntil(
+          tester, () => manager.debugPreparedWindowStats['admitted']! >= expected);
+
+      // Pressure clears prepared relevance and suspends admission; the
+      // unfinished gated work counts as cancelled.
+      manager.handleMemoryPressure();
+      await tester.pump();
+      expect(manager.debugPreparedWindowStats['cancelled'], greaterThan(0),
+          reason: 'pressure must cancel prepared work, not leave it '
+              'relevant over the flushed cache');
+
+      final admittedAtPressure = manager.debugPreparedWindowStats['admitted']!;
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(manager.debugPreparedWindowStats['admitted'], admittedAtPressure,
+          reason: 'suspended admission must not refill the cleared cache '
+              'while the camera rests');
+
+      // A camera generation change lifts the suspension and re-admits
+      // from the new camera.
+      gate.complete();
+      manager.setCameraZoom(4.0);
+      await _settleUntil(
+        tester,
+        () =>
+            manager.debugPreparedWindowStats['admitted']! > admittedAtPressure,
+      );
+    });
+
+    testWidgets('prepared work never delays foreground demand',
+        (tester) async {      // Hold a visible fetch; nothing prepared may decode until the
       // foreground settles.
       final visibleGate = Completer<void>();
       var firstVisibleGated = false;
