@@ -668,6 +668,87 @@ void main() {
               'grew from the capture zoom');
     });
 
+    testWidgets('off-center focal prediction matches the projected camera',
+        (tester) async {
+      // Ground truth comes from driving a real camera through the same
+      // two-step focal-preserving gesture and reading where it lands at
+      // z5 — the test does not re-implement the prediction formula.
+      const focal = Offset(192, 128); // 64 px right of the viewport center
+      final counts = _Counts();
+      final probe = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+      );
+      addTearDown(probe.dispose);
+      probe.setCameraZoom(4.0, focalPoint: focal);
+      probe.setCameraZoom(5.0, focalPoint: focal);
+      final truthLng = probe.centerTileLng;
+      final truthLat = probe.centerTileLat;
+
+      // Candidate: same start, same first gesture step. Its z5 shell
+      // must target the camera's actual z5 position.
+      final manager = TileManager.init(
+        width: 256,
+        height: 256,
+        centerLatLng: center,
+        zoom: 3,
+        fetcher: _fakeFetcher,
+        decoder: counts.regular,
+        speculativeDecoder: counts.speculative,
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        preparedZoomWindow: true,
+        preparedWindowDepth: 1,
+        maxPreparedPerGeneration: 256,
+      );
+      addTearDown(manager.dispose);
+
+      manager.calculate();
+      await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
+
+      manager.setCameraZoom(4.0, focalPoint: focal);
+      await tester.pump();
+
+      final half = 256 / 512 + 1;
+      final world = 1 << 5;
+      Set<String> truthKeys() {
+        final keys = <String>{};
+        for (var x = (truthLng - half).floor();
+            x <= (truthLng + half).floor();
+            x++) {
+          final wx = ((x % world) + world) % world;
+          for (var y = (truthLat - half).floor().clamp(0, world - 1);
+              y <= (truthLat + half).floor().clamp(0, world - 1);
+              y++) {
+            keys.add('5/$wx/$y');
+          }
+        }
+        return keys;
+      }
+
+      Iterable<String> preparedZ5Live() =>
+          counts.preparedKeys.where((k) => k.startsWith('5/'));
+      await _settleUntil(tester, () {
+        final live = preparedZ5Live().toSet();
+        return truthKeys().containsAll(live) && live.containsAll(truthKeys());
+      });
+      // Full z5 set equality: the prepared viewport must be exactly the
+      // projected camera's viewport. The centered-growth bug prepared
+      // columns 14–17 (the old center's) instead of 15–18 (the landed
+      // camera's, ~0.75 tiles further east from the off-center focal).
+      final preparedZ5 = preparedZ5Live().toSet();
+      expect(preparedZ5, truthKeys(),
+          reason: 'the prepared z5 viewport must equal the real '
+              'focal-preserving projection\'s landing viewport');
+    });
+
     testWidgets('a pan invalidates stale prediction inputs; preparation '
         'follows the live camera', (tester) async {
       final counts = _Counts();

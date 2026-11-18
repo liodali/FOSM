@@ -1824,11 +1824,13 @@ class TileManager with CacheTiles {
     final halfH = height / 512 + 1;
 
     // Projection inputs, all in the capture zoom's tile units. The
-    // focal-preserving projection grows the captured center by
-    // 2^(target − captureZoom) — never by dz, which is relative to the
-    // CURRENT zoom and would mix coordinate systems after a zoom change.
-    // Without a capture (first pass, or invalidated by a pan) predict
-    // around the live center.
+    // focal-preserving projection keeps the screen offset pixel-fixed:
+    // the offset in target-level tile units stays (F − C)·capturedScale
+    // (a tile of any integer zoom is 256 px), while the focal point's
+    // coordinates grow by 2^(target − captureZoom):
+    // C' = F·growth − (F − C)·capturedScale. Without a capture (first
+    // pass, or invalidated by a pan) focal == center and captureScale is
+    // 1, reducing to the live center scaled by 2^(target − zoom).
     final captureZoom = _preparedCaptureZoom;
     final captureScale = _preparedZoomScale ?? 1.0;
     final focalLng = _preparedFocalLng ?? centerTileLng;
@@ -1837,23 +1839,15 @@ class TileManager with CacheTiles {
     final capCenterLat = _preparedCenterLat ?? centerTileLat;
 
     double predictedLngFor(int zTarget) {
-      if (captureZoom == null) {
-        return centerTileLng * math.pow(2, (zTarget - zoom).toDouble());
-      }
       final growth =
-          math.pow(2, (zTarget - captureZoom).toDouble());
-      return (capCenterLng + (focalLng - capCenterLng) * (1 - captureScale)) *
-          growth;
+          math.pow(2, (zTarget - (captureZoom ?? zoom)).toDouble());
+      return focalLng * growth - (focalLng - capCenterLng) * captureScale;
     }
 
     double predictedLatFor(int zTarget) {
-      if (captureZoom == null) {
-        return centerTileLat * math.pow(2, (zTarget - zoom).toDouble());
-      }
       final growth =
-          math.pow(2, (zTarget - captureZoom).toDouble());
-      return (capCenterLat + (focalLat - capCenterLat) * (1 - captureScale)) *
-          growth;
+          math.pow(2, (zTarget - (captureZoom ?? zoom)).toDouble());
+      return focalLat * growth - (focalLat - capCenterLat) * captureScale;
     }
 
     final preferredSign = _zoomDirection < 0 ? -1 : 1;
