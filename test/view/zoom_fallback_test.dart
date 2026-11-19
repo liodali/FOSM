@@ -805,7 +805,11 @@ void main() {
     expect(grid.paintPlaceholders, isFalse);
     expect(grid.paintBackground, isFalse);
 
-    for (var i = 0; i < 10 && fetcher.hasPending; i++) {
+    // With the prepared zoom window enabled (MapView layer), retirement
+    // competes with ongoing background preparation: the drain loop runs
+    // until the fetch queue actually empties (the per-generation budget
+    // bounds it), which can take many more rounds than demand alone.
+    for (var i = 0; i < 64 && fetcher.hasPending; i++) {
       fetcher.deliverAllPending();
       await _drain(tester);
     }

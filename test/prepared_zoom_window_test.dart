@@ -205,7 +205,7 @@ void main() {
         manager.horizontalTileCount - 2; // tilePadding 1
     int visibleV(TileManager manager) => manager.verticalTileCount - 2;
 
-    testWidgets('off by default: the gate admits nothing', (tester) async {
+    testWidgets('the escape hatch admits nothing', (tester) async {
       final counts = _Counts();
       final manager = TileManager.init(
         width: 256,
@@ -218,6 +218,7 @@ void main() {
         tilePadding: 1,
         preloadAdjacentZoom: false,
         byteOnlyPadding: true,
+        preparedZoomWindow: false,
       );
       addTearDown(manager.dispose);
 
@@ -225,9 +226,10 @@ void main() {
       await _settleUntil(tester, () => manager.pendingPresentationCount == 0);
 
       expect(manager.debugPreparedWindowStats['admitted'], 0,
-          reason: 'the candidate is separately gated and defaults off');
-      expect(counts.specCount, 0, reason: 'no prepared decodes without the '
-          'gate');
+          reason: 'fosm.preparedZoomWindow=false disables preparation '
+              'entirely');
+      expect(counts.specCount, 0,
+          reason: 'no prepared decodes with the gate off');
     });
 
     testWidgets('prepares the predicted viewport at zoom ±1', (tester) async {

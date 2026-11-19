@@ -637,6 +637,18 @@ class MapView extends StatefulWidget {
   }) =>
       (diagnosticOff || web || interacting || vectorPayload) ? 0.0 : sigma;
 
+  /// Plan-13 Phase E: the prepared zoom window ships enabled —
+  /// `--dart-define=fosm.preparedZoomWindow=false` disables preparation
+  /// app-wide. The manager-level default stays off so direct
+  /// TileManager consumers opt in explicitly.
+  static const bool preparedWindowByDefine =
+      bool.fromEnvironment('fosm.preparedZoomWindow', defaultValue: true);
+
+  /// Prepared window depth in zoom levels either side (1 = nearest
+  /// levels only; 2 = the full rolling window).
+  static const int preparedWindowDepthByDefine =
+      int.fromEnvironment('fosm.preparedWindowDepth', defaultValue: 1);
+
   /// Counts [MapView] rebuilds. Test hook used to prove that several tile
   /// arrivals in one frame produce a single map update.
   @visibleForTesting
@@ -1565,6 +1577,12 @@ class _MapViewState extends State<MapView>
       // on demand when it scrolls into view. Raster decodes are cheap and
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
+      // Plan-13 Phase E: the prepared zoom window ships enabled for the
+      // product surface (`fosm.preparedZoomWindow=false` disables) — the
+      // manager-level default stays off so direct manager consumers opt
+      // in explicitly.
+      preparedZoomWindow: MapView.preparedWindowByDefine,
+      preparedWindowDepth: MapView.preparedWindowDepthByDefine,
       // The vector runtime already routes its `Picture.toImage` through
       // the shared scheduler; the manager must not wrap the same decoder
       // in another image-lane reservation. This is scheduling ownership,

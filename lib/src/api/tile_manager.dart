@@ -116,10 +116,17 @@ class TileManager with CacheTiles {
   /// Prepared zoom window (plan 13 Phase E, separately gated): predict
   /// the next viewport from zoom direction and the gesture focal point,
   /// then prepare full drawable tile images for the nearest zoom levels
-  /// first, expanding toward ±2 within budgets. Off by default — the
-  /// bytes-only idle preload remains the control.
+  /// first, expanding toward ±2 within budgets.
   ///
-  /// `--dart-define=fosm.preparedZoomWindow=true` enables it.
+  /// Accepted on the phone A/B (plan13-phasee-ab/): zoom-step reveal
+  /// 102–332 ms → 0 ms every leg both pairs, minSharp 0.0 → 1.0, labels
+  /// 5–8× faster, 0 over-budget frames; bounded costs (peak rendered
+  /// 4–5 → 18 MB, +12–20 fetches/window).
+  ///
+  /// The manager-level default is off; [MapView] enables it for the
+  /// product surface via `fosm.preparedZoomWindow` (its own define,
+  /// default true — `=false` disables). The bytes-only idle preload
+  /// remains enabled alongside it.
   static const bool preparedWindowByDefine =
       bool.fromEnvironment('fosm.preparedZoomWindow', defaultValue: false);
 
