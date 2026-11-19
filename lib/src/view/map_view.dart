@@ -887,7 +887,8 @@ class _MapViewState extends State<MapView>
         MapMemoryDelegate,
         MapCoverageDelegate,
         MapWorkloadDelegate,
-        MapCacheAttributionDelegate {
+        MapCacheAttributionDelegate,
+        MapPreparedWindowDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -1515,6 +1516,12 @@ class _MapViewState extends State<MapView>
         parsedEvictions: _vectorRuntime?.parsedEvictions,
         parsedTiles: _vectorRuntime?.parsedTileCount,
       );
+
+  /// Lifetime prepared-window A/B counters of the attached map (plan-13
+  /// Phase E). Exposed through [MapController.preparedWindowStats].
+  @override
+  Map<String, int> get preparedWindowStats =>
+      _tileManager?.debugPreparedWindowStats ?? const {};
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;

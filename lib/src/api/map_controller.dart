@@ -102,6 +102,12 @@ abstract class MapCacheAttributionDelegate {
   FosmCacheMissAttribution get cacheAttribution;
 }
 
+/// Point-in-time snapshot of the attached map's prepared-window A/B
+/// counters (plan 13 Phase E): admitted, promoted, cancelled.
+abstract class MapPreparedWindowDelegate {
+  Map<String, int> get preparedWindowStats;
+}
+
 /// Programmatic control surface for a [MapView].
 ///
 /// Create a controller outside the widget tree, pass it to [MapView],
@@ -251,6 +257,15 @@ class MapController extends ChangeNotifier {
     final delegate = _delegate;
     return delegate is MapCacheAttributionDelegate
         ? (delegate as MapCacheAttributionDelegate).cacheAttribution
+        : null;
+  }
+
+  /// Prepared-window A/B counters of the attached map, or `null` when the
+  /// delegate does not expose them.
+  Map<String, int>? get preparedWindowStats {
+    final delegate = _delegate;
+    return delegate is MapPreparedWindowDelegate
+        ? (delegate as MapPreparedWindowDelegate).preparedWindowStats
         : null;
   }
 

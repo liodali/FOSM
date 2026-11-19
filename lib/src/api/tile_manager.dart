@@ -545,6 +545,13 @@ class TileManager with CacheTiles {
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
+  /// Debounce timer for prepared-window re-admission after ANY camera
+  /// change (pans included): prediction inputs are invalidated by a pan,
+  /// and the idle tick re-predicts around the live center so a zoom
+  /// shortly after a pan finds its level already prepared. Zoom changes
+  /// admit instantly through the queue pump instead.
+  Timer? _preparedIdleTimer;
+
   /// The zoom level that was last pre-loaded for.
   int _lastPreloadedZoom = -1;
 
@@ -1027,6 +1034,8 @@ class TileManager with CacheTiles {
     _tileNotificationScheduled = false;
     _preloadTimer?.cancel();
     _preloadTimer = null;
+    _preparedIdleTimer?.cancel();
+    _preparedIdleTimer = null;
     for (final timer in _retryTimers.values) {
       timer.cancel();
     }
@@ -1327,6 +1336,13 @@ class TileManager with CacheTiles {
   /// split grid reconciliation cost by path.
   void calculate() {
     if (_disposed) return;
+    // Prepared-window re-admission re-arms on every camera change (pan
+    // frames included): pans invalidate the prediction capture, and the
+    // debounced tick re-predicts around the live center so a zoom
+    // shortly after a pan finds its level prepared (plan-13 Phase E:
+    // reevaluate on pan). Zoom changes admit instantly through the
+    // queue pump instead.
+    _schedulePreparedIdleAdmission();
     if (!VectorSpanLog.enabled) {
       _calculateGrid();
       return;
@@ -2961,6 +2977,22 @@ class TileManager with CacheTiles {
   }
 
   // ── Adjacent zoom pre-loading (debounced, bytes-only) ───────────────
+
+  /// Re-arms the prepared-window admission timer after any camera change.
+  /// The debounce matches the preload's so both idle paths fire together;
+  /// the admission itself re-checks the quiet-foreground gates.
+  void _schedulePreparedIdleAdmission() {
+    if (!preparedZoomWindow || _disposed) return;
+    _preparedIdleTimer?.cancel();
+    if (preloadDebounce == Duration.zero) {
+      _admitPreparedZoomWork();
+      _pumpLoadQueue();
+      return;
+    }
+    _preparedIdleTimer = Timer(preloadDebounce, () {
+      if (!_disposed) _pumpLoadQueue(); // admits at its head
+    });
+  }
 
   /// Schedules adjacent zoom pre-loading with a debounce timer.
   /// Only fires after the user stops panning for [preloadDebounce].

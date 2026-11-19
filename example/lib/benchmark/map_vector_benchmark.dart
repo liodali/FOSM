@@ -148,6 +148,12 @@ class _Scenario {
   /// whatever cache state the scenario establishes.
   final int animatedZoom;
 
+  /// With [zoomStep] != 0: pan this fraction of a tile after arming, idle
+  /// briefly (the prepared window re-predicts around the panned center;
+  /// the baseline's byte preload re-debounces), then jump [zoomStep]
+  /// levels. Measures pan-then-zoom reveal — plan-13 Phase E A/B.
+  final double panTilesBeforeZoom;
+
   /// Mount the map WITHOUT continuous zoom, so controller zooms route
   /// through the integer snapshot-overlay animation
   /// (`_startZoomAnimation`) instead of the fractional tween. The
@@ -174,6 +180,7 @@ class _Scenario {
     this.legHoldMs = 0,
     this.animatedZoom = 0,
     this.integerZoom = false,
+    this.panTilesBeforeZoom = 0,
     this.sampleSeconds = 0,
   });
 
@@ -221,6 +228,16 @@ const _scenarios = [
       zoomStep: 1, idleBeforeMs: 4000, legHoldMs: 22000, sampleSeconds: 40),
   _Scenario('vector_zoomcycle_out1_expired',
       zoomStep: -1, idleBeforeMs: 4000, legHoldMs: 22000, sampleSeconds: 40),
+  // Pan-then-zoom (plan 13 Phase E A/B): arm, pan a fraction of a tile,
+  // idle briefly (the candidate's prepared window re-predicts around the
+  // panned center; the baseline's byte preload re-debounces), then zoom
+  // in and measure the reveal. Holds, then jumps back (reversal).
+  _Scenario('vector_pan_then_zoom',
+      zoomStep: 1,
+      panTilesBeforeZoom: 0.25,
+      idleBeforeMs: 4000,
+      legHoldMs: 8000,
+      sampleSeconds: 25),
   // Warm rendered: motion tails without any loading cost.
   _Scenario('vector_warm_static', cacheState: _CacheState.warmRendered),
   _Scenario('vector_warm_fling',
@@ -621,6 +638,10 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
   /// [startZoom]. Leg boundaries are recorded on the coverage clock and
   /// emitted as payload lines for log-level attribution.
   Future<void> _driveZoomLegs(_Scenario scenario) async {
+    if (scenario.panTilesBeforeZoom != 0) {
+      await _drivePanThenZoomLegs(scenario);
+      return;
+    }
     Future<void> jump(int levels, String label) async {
       final atMs = _coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
       _legJumpAtMs.add(atMs);
@@ -637,6 +658,44 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
       await Future<void>.delayed(Duration(milliseconds: scenario.legHoldMs));
       if (!mounted) return;
       await jump(0, 'back');
+    }
+  }
+
+  /// Pan-then-zoom legs (plan 13 Phase E A/B): pan a fraction of a tile,
+  /// idle briefly — the candidate's idle re-admission re-predicts around
+  /// the panned center while the baseline's byte preload re-debounces —
+  /// then jump [zoomStep] levels and measure the reveal. Holds, then
+  /// jumps back.
+  Future<void> _drivePanThenZoomLegs(_Scenario scenario) async {
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    if (!mounted) return;
+    _controller.moveTo(
+        LatLng(
+          latitude: _center.latitude,
+          longitude: _center.longitude +
+              scenario.panTilesBeforeZoom * 360 / (1 << scenario.startZoom),
+        ),
+        animate: false);
+    // Pan-idle window: both arms' idle paths run here, unrecorded as
+    // "preparation" — the measured leg is the zoom reveal after it.
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    if (!mounted) return;
+    final atMs = _coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
+    _legJumpAtMs.add(atMs);
+    unawaited(_emitPayload('FOSM_BENCHMARK_LEG_JUMP',
+        '${scenario.name} leg=1 levels=${scenario.zoomStep} '
+        'atMs=${atMs.round()}'));
+    _timelineMark('legJump1.${scenario.name}');
+    _controller.setZoom(scenario.startZoom + scenario.zoomStep,
+        animate: false);
+    if (scenario.legHoldMs > 0) {
+      await Future<void>.delayed(Duration(milliseconds: scenario.legHoldMs));
+      if (!mounted) return;
+      final backMs = _coverageClock?.elapsedMilliseconds.toDouble() ?? 0;
+      _legJumpAtMs.add(backMs);
+      unawaited(_emitPayload('FOSM_BENCHMARK_LEG_JUMP',
+          '${scenario.name} leg=2 levels=0 atMs=${backMs.round()}'));
+      _controller.setZoom(scenario.startZoom, animate: false);
     }
   }
 
@@ -752,6 +811,21 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
     return {
       for (final key in now.keys)
         key: (now[key] as int? ?? 0) - (before[key] as int? ?? 0),
+    };
+  }
+
+  /// Prepared-window A/B counters (plan 13 Phase E): window deltas of
+  /// admitted / promoted / cancelled — the wasted-preparation metric is
+  /// (admitted − promoted) / admitted.
+  Map<String, Object?>? _preparedStatsAtArm;
+  Map<String, Object?>? _preparedStatsDelta() {
+    final before = _preparedStatsAtArm;
+    if (before == null) return null;
+    final now = _controller.preparedWindowStats;
+    if (now == null) return null;
+    return {
+      for (final key in now.keys)
+        key: (now[key] ?? 0) - (before[key] as int? ?? 0),
     };
   }
 
@@ -970,6 +1044,8 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
         _legBaseAtMs.clear();
         _cacheAttributionAtArm = _controller.cacheAttribution?.toJson();
         _gridRecapturesAtArm = MapView.debugGridRecaptures.toJson();
+        _preparedStatsAtArm =
+            _controller.preparedWindowStats?.cast<String, Object?>();
         diskBefore = _diskStats();
         _peakRenderedBytes = 0;
         _peakEstimatedTotalBytes = 0;
@@ -1140,6 +1216,7 @@ class _VectorBenchmarkState extends State<_VectorBenchmark>
                 _coverageReport(vector: scenario.source == _Source.vector),
             'cacheAttribution': _cacheAttributionDelta(),
             'gridRecaptures': _gridRecaptureDelta(),
+            'preparedWindow': _preparedStatsDelta(),
             'diskCache': diskDelta,
             'peakRenderedBytes': _peakRenderedBytes,
             'peakEstimatedTotalBytes': _peakEstimatedTotalBytes,
