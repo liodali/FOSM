@@ -3,7 +3,6 @@ import 'dart:ui' as ui;
 import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/tile_manager.dart';
-import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/vector/render/vector_trace.dart';
 
@@ -613,15 +612,15 @@ class ZoomFallbackPainter extends CustomPainter {
         final cellX = originX + (pad + h) * tileW;
         final cellY = originY + (pad + v) * tileH;
 
-        // Checkerboard placeholder, same parity rule as the grid painter.
-        final picture = RenderCanvasOSM.checkerPicture(
-            (tile.lngIndex + tile.latIndex) % 2 == 0);
-        canvas
-          ..save()
-          ..translate(cellX, cellY)
-          ..scale(tileW / tileWidth, tileH / tileHeight)
-          ..drawPicture(picture)
-          ..restore();
+        // Checkerboard placeholder, same parity rule and draw path as the
+        // grid painter.
+        RenderCanvasOSM.drawPlaceholder(
+            canvas,
+            (tile.lngIndex + tile.latIndex) % 2 == 0,
+            cellX,
+            cellY,
+            tileW,
+            tileH);
 
         final region = coverage._region(tile.index);
         if (region == null) continue;

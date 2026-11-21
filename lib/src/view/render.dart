@@ -168,32 +168,13 @@ class RenderCanvasOSM extends CustomPainter {
             canvas.restore();
           }
         } else if (paintPlaceholders) {
-          final darkTopLeft = (tileLngIndex + tileLatIndex) % 2 == 0;
-          // One pre-rasterized image draw per missing tile
-          // (`fosm.gridPlaceholderImage`, on by default). On a device the
-          // picture replay below cost about 150 us per tile against about
-          // 6 us for an image draw, and dominated the grid repaint.
-          final checker = placeholderImage ? _checkerImage(darkTopLeft) : null;
-          if (checker != null) {
-            canvas.drawImageRect(
-                checker,
-                ui.Rect.fromLTWH(
-                    0, 0, tileWidth.toDouble(), tileHeight.toDouble()),
-                ui.Rect.fromLTWH(tileCanvasX, tileCanvasY,
-                    tileWidth * tileScale, tileHeight * tileScale),
-                _checkerImagePaint);
-          } else {
-            // Reusable checkerboard placeholder — a single picture replay
-            // per missing tile instead of hundreds of rect draws. The
-            // picture is recorded at (0,0), so translate to the tile origin.
-            final picture = checkerPicture(darkTopLeft);
-            canvas
-              ..save()
-              ..translate(tileCanvasX, tileCanvasY)
-              ..scale(tileScale)
-              ..drawPicture(picture)
-              ..restore();
-          }
+          drawPlaceholder(
+              canvas,
+              (tileLngIndex + tileLatIndex) % 2 == 0,
+              tileCanvasX,
+              tileCanvasY,
+              tileWidth * tileScale,
+              tileHeight * tileScale);
         }
       }
     }
@@ -201,6 +182,36 @@ class RenderCanvasOSM extends CustomPainter {
       VectorSpanLog.record('paint.grid', null, spanStart,
           VectorSpanLog.nowUs() - spanStart);
     }
+  }
+
+  /// Draws the missing-tile checkerboard into the [width] x [height] cell at
+  /// ([x], [y]). Shared by the grid painter and the zoom-fallback painter so
+  /// both pay the same cost per missing cell.
+  ///
+  /// One pre-rasterized image draw per cell (`fosm.gridPlaceholderImage`, on
+  /// by default). On a device the picture replay below cost about 150 us per
+  /// tile against about 6 us for an image draw, and dominated the grid
+  /// repaint.
+  static void drawPlaceholder(ui.Canvas canvas, bool darkTopLeft, double x,
+      double y, double width, double height) {
+    final checker = placeholderImage ? _checkerImage(darkTopLeft) : null;
+    if (checker != null) {
+      canvas.drawImageRect(
+          checker,
+          ui.Rect.fromLTWH(0, 0, tileWidth.toDouble(), tileHeight.toDouble()),
+          ui.Rect.fromLTWH(x, y, width, height),
+          _checkerImagePaint);
+      return;
+    }
+    // Reusable checkerboard placeholder: a single picture replay per missing
+    // tile instead of hundreds of rect draws. The picture is recorded at
+    // (0,0), so translate to the cell origin.
+    canvas
+      ..save()
+      ..translate(x, y)
+      ..scale(width / tileWidth, height / tileHeight)
+      ..drawPicture(checkerPicture(darkTopLeft))
+      ..restore();
   }
 
   /// Draws missing-tile placeholders as one pre-rasterized image instead of

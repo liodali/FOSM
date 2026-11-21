@@ -983,6 +983,51 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets(
+      'missing-cell placeholders match between the image and replay paths',
+      (tester) async {
+    tester.view.physicalSize = const ui.Size(360, 240);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    // Nothing is delivered, so every visible cell is a bare placeholder
+    // with no fallback region on top of it.
+    final manager = _smallManager(_GatedFetcher(), zoom: 5);
+    manager.calculate();
+    final coverage = ZoomFallbackCoverage(manager);
+    addTearDown(() {
+      coverage.dispose();
+      manager.dispose();
+    });
+
+    final previous = RenderCanvasOSM.placeholderImage;
+    addTearDown(() => RenderCanvasOSM.placeholderImage = previous);
+
+    Future<List<int>?> raster(bool image) async {
+      RenderCanvasOSM.placeholderImage = image;
+      final recorder = ui.PictureRecorder();
+      ZoomFallbackPainter(coverage: coverage, manager: manager, blurSigma: 0)
+          .paint(ui.Canvas(recorder), const Size(256, 256));
+      final picture = recorder.endRecording();
+      final rendered = picture.toImageSync(256, 256);
+      picture.dispose();
+      final data = await tester.runAsync(() =>
+          rendered.toByteData(format: ui.ImageByteFormat.rawStraightRgba));
+      rendered.dispose();
+      return data?.buffer.asUint8List().toList();
+    }
+
+    final replay = await raster(false);
+    final available = RenderCanvasOSM.debugCheckerImageAvailable;
+    final candidate = await raster(true);
+    expect(replay, isNotNull);
+    // Guard against comparing two blank canvases: the checkerboard must
+    // contribute colours beyond the opaque base.
+    expect(replay!.toSet().length, greaterThan(2));
+    expect(candidate, replay);
+    if (!available) markTestSkipped('toImageSync is unavailable here');
+  });
+
   testWidgets('a blur-sigma-only change repaints the stationary fallback',
       (tester) async {
     final fetcher = _GatedFetcher();
