@@ -699,6 +699,22 @@ class MapView extends StatefulWidget {
       bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: true);
   static bool gridRetainedScaleEnabled = gridRetainedScaleByDefine;
 
+  /// Vector zoom-softness diagnostic: keeps the plan-13 Phase B retained
+  /// scale path for vector payloads (shipped default). With
+  /// `--dart-define=fosm.vectorRetainedScale=false`, vector payloads bypass
+  /// retained scaling: their grid falls back to the plan-12 translate-only
+  /// capture below, so every fractional scale change repaints at the live
+  /// pose (single-stage per-tile resampling) instead of letting the
+  /// compositor stretch the captured raster (two-stage resampling, whose
+  /// enlargement can exceed the live tile scale between recaptures).
+  /// Raster payloads keep the retained-scale path unchanged in both arms.
+  /// Sharpness and frame cost are compared in
+  /// `test/view/vector_zoom_softness_diagnostic_test.dart`; the static
+  /// stays mutable for tests and the benchmark harness.
+  static const vectorRetainedScaleByDefine =
+      bool.fromEnvironment('fosm.vectorRetainedScale', defaultValue: true);
+  static bool vectorRetainedScaleEnabled = vectorRetainedScaleByDefine;
+
   /// Vector payload rendered-image budget, used when the app leaves
   /// [maxRenderedCacheBytes] unset. Validated in the macOS resolution A/B
   /// (docs/performance/vector-render-improvement/zoom-softness-diagnostic.md):
@@ -2904,7 +2920,11 @@ class _MapViewState extends State<MapView>
         ),
       );
     }
-    if (MapView.gridRetainedScaleEnabled) {
+    // Retained scale applies to the whole grid; the vector diagnostic
+    // bypass opts vector payloads out (paint live at the fractional pose)
+    // while raster payloads keep the compositor path unchanged.
+    if (MapView.gridRetainedScaleEnabled &&
+        (MapView.vectorRetainedScaleEnabled || _vectorRuntime == null)) {
       return _buildRetainedScaleGrid(manager, size, fallbackActive);
     }
 
