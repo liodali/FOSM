@@ -2,12 +2,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
-import '../api/geo_point.dart';
-import '../api/marker_cluster.dart';
-import '../api/marker_index.dart';
-import '../api/marker_manager.dart';
-import '../common/marker_trace.dart';
-import '../common/osm_transformation_utilities.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/marker_index.dart';
+import 'package:fosm/src/api/marker_manager.dart';
+import 'package:fosm/src/common/marker_trace.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
 
 /// Render item produced by the clustering engine.
 sealed class ClusterRenderItem {

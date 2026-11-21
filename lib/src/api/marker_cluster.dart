@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-import 'geo_point.dart';
-import 'marker.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/marker.dart';
 
 /// A marker that may be grouped with nearby cluster markers.
 ///

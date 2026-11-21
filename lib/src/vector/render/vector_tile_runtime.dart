@@ -25,7 +25,7 @@ import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/vector/render/label_overlay.dart';
 import 'package:fosm/src/vector/render/sprite_atlas.dart';
 import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
-import 'vector_trace.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// A parsed source tile, shared by every logical tile that over-zooms from
 /// it (e.g. four z15 tiles reading one z14 source tile parse it once).

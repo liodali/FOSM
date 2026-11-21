@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 
-import '../vector/mvt/vector_tile.dart';
-import '../vector/render/vector_trace.dart';
+import 'package:fosm/src/vector/mvt/vector_tile.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// Decodes raw MVT bytes into a [DecodedVectorTile].
 ///

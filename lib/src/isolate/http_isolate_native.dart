@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
-import '../api/map_load_state.dart';
+import 'package:fosm/src/api/map_load_state.dart';
 
 /// Persistent native HTTP worker with bounded requests and owned reply ports.
 class HttpIsolate {

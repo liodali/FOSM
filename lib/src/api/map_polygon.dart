@@ -1,6 +1,6 @@
 import 'dart:ui';
 
-import 'geo_point.dart';
+import 'package:fosm/src/api/geo_point.dart';
 
 /// A filled geographic ring with optional cut-out rings. Rings close
 /// automatically; fewer than three points paint nothing. Coordinates follow

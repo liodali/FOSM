@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-import 'geo_point.dart';
-import 'map_controller.dart';
-import 'marker.dart';
-import 'marker_cluster.dart';
-import 'map_polyline.dart';
-import 'map_polygon.dart';
-import 'map_location_controller.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/map_controller.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/map_polygon.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Base class for notifications dispatched by [MapView].
 ///

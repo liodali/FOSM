@@ -38,10 +38,10 @@ import 'package:fosm/src/view/shape_geometry_cache.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_fallback.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
-import 'scale_bar.dart';
-import 'location_control.dart';
-import 'user_location_layer.dart';
-import '../api/map_location_controller.dart';
+import 'package:fosm/src/view/scale_bar.dart';
+import 'package:fosm/src/view/location_control.dart';
+import 'package:fosm/src/view/user_location_layer.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 typedef MapLoadingBuilder = Widget Function(
     BuildContext context, MapLoadState state);

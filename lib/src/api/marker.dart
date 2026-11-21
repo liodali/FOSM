@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'geo_point.dart';
+import 'package:fosm/src/api/geo_point.dart';
 
 /// Which side of the marker widget an overlay is anchored to.
 enum MarkerOverlayAnchor {

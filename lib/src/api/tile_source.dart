@@ -3,7 +3,7 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
-import 'map_load_state.dart';
+import 'package:fosm/src/api/map_load_state.dart';
 
 /// Fetches raw image bytes for a single map tile.
 ///

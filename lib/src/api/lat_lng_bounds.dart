@@ -1,7 +1,7 @@
 import 'package:fosm/src/common/osm_transformation_utilities.dart'
     show maxWebMercatorLatitude;
 
-import 'geo_point.dart';
+import 'package:fosm/src/api/geo_point.dart';
 
 /// An axis-aligned geographic bounding box in Web Mercator tile space.
 ///

@@ -1,14 +1,14 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show EdgeInsets;
 
-import '../common/memory_attribution.dart';
-import '../common/tile_coverage.dart';
-import 'geo_point.dart';
-import 'lat_lng_bounds.dart';
-import 'map_load_state.dart';
-import 'marker.dart';
-import 'marker_manager.dart';
-import 'map_location_controller.dart';
+import 'package:fosm/src/common/memory_attribution.dart';
+import 'package:fosm/src/common/tile_coverage.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/lat_lng_bounds.dart';
+import 'package:fosm/src/api/map_load_state.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_manager.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Delegate implemented by [MapView] state.
 ///

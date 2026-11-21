@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../api/map_location_controller.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Recenter/follow button, also available as MapView's built-in overlay.
 class MapLocationControl extends StatelessWidget {

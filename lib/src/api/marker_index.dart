@@ -1,5 +1,5 @@
-import '../common/osm_transformation_utilities.dart';
-import 'marker.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/api/marker.dart';
 
 /// One indexed [Marker] with its cached normalized Web-Mercator coordinates.
 ///

@@ -4,13 +4,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/scheduler.dart';
 
-import '../api/marker.dart';
-import '../api/marker_cluster.dart';
-import '../api/marker_index.dart';
-import '../api/marker_manager.dart';
-import '../api/tile_manager.dart';
-import '../common/marker_trace.dart';
-import 'marker_cluster_engine.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/marker_index.dart';
+import 'package:fosm/src/api/marker_manager.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/common/marker_trace.dart';
+import 'package:fosm/src/view/marker_cluster_engine.dart';
 
 /// Renders the markers of a [MarkerManager] at their projected positions,
 /// above the tile grid and below the vector label overlay.

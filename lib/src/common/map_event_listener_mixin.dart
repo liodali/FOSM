@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 
-import '../api/geo_point.dart';
-import '../api/map_controller.dart';
-import '../api/map_notification.dart';
-import '../api/marker.dart';
-import '../api/marker_cluster.dart';
-import '../api/map_polyline.dart';
-import '../api/map_polygon.dart';
-import '../api/map_location_controller.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/map_controller.dart';
+import 'package:fosm/src/api/map_notification.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/map_polygon.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Mixin for parent [State]s that want to react to map events.
 ///

@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart' show kIsWasm, kIsWeb;
 import 'package:flutter/scheduler.dart';
 
-import '../api/tile_source.dart' show TileDecodeAborted;
+import 'package:fosm/src/api/tile_source.dart' show TileDecodeAborted;
 
 /// Shared cooperative UI-work allowance for one map. Checkpoints in separate
 /// render/label jobs consume the same interval, rather than each getting a

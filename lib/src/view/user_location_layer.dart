@@ -2,11 +2,11 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import '../api/map_location.dart';
-import '../api/geo_point.dart';
-import '../common/osm_transformation_utilities.dart';
-import '../api/tile_manager.dart';
-import '../common/scale_bar_metrics.dart';
+import 'package:fosm/src/api/map_location.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/common/scale_bar_metrics.dart';
 
 /// Geographic accuracy radius plus a fixed-size, pointer-transparent dot.
 class UserLocationLayer extends StatelessWidget {
