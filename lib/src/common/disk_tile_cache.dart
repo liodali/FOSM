@@ -59,9 +59,8 @@ class TileDiskCache {
   TileDiskCache(
     this.box, {
     MapDiskCacheOptions options = const MapDiskCacheOptions(),
-    DateTime Function() now = DateTime.now,
-  })  : _options = options,
-        _now = now {
+    this._now = DateTime.now,
+  })  : _options = options {
     options.validate();
   }
 
@@ -79,7 +78,7 @@ class TileDiskCache {
 
   Future<T> _serialize<T>(Future<T> Function() action) {
     final result = _pending.then((_) => action());
-    _pending = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    _pending = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
     return result;
   }
 

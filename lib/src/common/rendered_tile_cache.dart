@@ -87,10 +87,9 @@ class RenderedTileCache {
   RenderedTileCache({
     int maxBytes = defaultMaxBytes,
     Duration retention = defaultRetention,
-    DateTime Function() now = DateTime.now,
+    this._now = DateTime.now,
   })  : _maxBytes = maxBytes,
-        _retention = retention,
-        _now = now {
+        _retention = retention {
     _validate(maxBytes, retention);
   }
 

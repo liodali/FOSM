@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 
@@ -26,7 +26,7 @@ Future<void> _mount(WidgetTester tester, MapController controller,
     enableScrollZoom: enableScrollZoom,
     animateZoom: animateZoom,
     showZoomControls: false,
-    tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+    tileFetcher: (_, _, _) => Completer<Uint8List>().future,
   );
   if (wrap != null) map = wrap(map);
   await tester.pumpWidget(MaterialApp(home: Scaffold(body: map)));
@@ -262,7 +262,7 @@ void main() {
         showZoomControls: false,
         zoom: zoom,
         controller: controller,
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
         onCameraChanged: (point, level) => update(() {
           center = point;
           zoom = level;
@@ -491,7 +491,7 @@ void main() {
       zoom: 5,
       controller: controller,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     final gestures = tester.widget<GestureDetector>(find.descendant(
         of: find.byType(MapView),

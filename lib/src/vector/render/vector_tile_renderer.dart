@@ -1,13 +1,13 @@
 import 'dart:async';
 import 'dart:ui' as ui;
 
-import '../mvt/vector_tile.dart';
-import '../style/css_color.dart';
-import '../style/expression.dart';
-import '../style/map_style.dart';
-import '../style/style_loader.dart';
-import 'vector_dash_diagnostics.dart';
-import 'vector_trace.dart';
+import 'package:fosm/src/vector/mvt/vector_tile.dart';
+import 'package:fosm/src/vector/style/css_color.dart';
+import 'package:fosm/src/vector/style/expression.dart';
+import 'package:fosm/src/vector/style/map_style.dart';
+import 'package:fosm/src/vector/style/style_loader.dart';
+import 'package:fosm/src/vector/render/vector_dash_diagnostics.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// Maps source-layer coordinates (0..extent of the *source* tile) to pixel
 /// coordinates inside the 256px tile being rendered, including the

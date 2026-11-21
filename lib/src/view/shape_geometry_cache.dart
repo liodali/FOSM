@@ -3,9 +3,9 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show Offset, Rect;
 
-import '../api/geo_point.dart';
-import '../api/tile_manager.dart';
-import '../common/osm_transformation_utilities.dart'
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart'
     show lat2TileY, lon2TileX, maxWebMercatorLatitude;
 
 /// Camera snapshot for cached-world affine projection.

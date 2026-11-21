@@ -59,7 +59,7 @@ LoadedVectorStyle buildLoadedStyle({
           'text-field': ['get', 'class'],
           ...symbolLayout,
         },
-        if (symbolFilter != null) 'filter': symbolFilter,
+        'filter': ?symbolFilter,
       },
     ],
   }));
@@ -320,8 +320,8 @@ void main() {
       final images = results!;
       expect(images.length, 2);
       for (final image in images) {
-        expect(image.width, 256);
-        expect(image.height, 256);
+        expect(image.width, VectorTileRuntime.resolution);
+        expect(image.height, VectorTileRuntime.resolution);
         image.dispose();
       }
 

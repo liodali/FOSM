@@ -4,7 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart'
     show FosmMemoryAttribution, MapPolyline, RenderedTileCacheStats;
@@ -54,7 +54,7 @@ void main() {
       zoom: 4,
       tilePadding: 0,
       preloadAdjacentZoom: true,
-      fetcher: (_, __, ___) async => png!,
+      fetcher: (_, _, _) async => png!,
     );
     addTearDown(manager.dispose);
     await tester.runAsync(() async {
@@ -110,7 +110,7 @@ void main() {
       zoom: 3,
       tilePadding: 0,
       preloadAdjacentZoom: false,
-      fetcher: (_, __, ___) async => png!,
+      fetcher: (_, _, _) async => png!,
     );
     await tester.runAsync(() async {
       manager.calculate();
@@ -241,7 +241,7 @@ void main() {
     // Hold decode B inside the presentation lane, then apply pressure: the
     // raster images must not be disposed while B can still reference them.
     final gate = Completer<void>();
-    runtime.debugOnDecodeStarted = (_, __, ___) => gate.future;
+    runtime.debugOnDecodeStarted = (_, _, _) => gate.future;
     final b = runtime.decoder(buildDenseLabelTile(), 12, 4, 2);
     await _runUntil(() => runtime.debugDecodeOrder.length >= 2);
 
@@ -298,7 +298,7 @@ void main() {
             latLng: const LatLng(latitude: 0, longitude: 0),
             zoom: 3,
             controller: controller,
-            tileFetcher: (_, __, ___) async => png!,
+            tileFetcher: (_, _, _) async => png!,
           ),
         ),
       ),
@@ -363,7 +363,7 @@ void main() {
             latLng: const LatLng(latitude: 0, longitude: 0),
             zoom: 3,
             controller: controller,
-            tileFetcher: (_, __, ___) async => png!,
+            tileFetcher: (_, _, _) async => png!,
             polylines: const [
               MapPolyline(
                 points: [

@@ -1,4 +1,4 @@
-import 'geo_point.dart';
+import 'package:fosm/src/api/geo_point.dart';
 
 /// A position supplied by the host's GPS, replay, or other location provider.
 /// [accuracyMeters] is a horizontal radius; [bearing] is clockwise from north.

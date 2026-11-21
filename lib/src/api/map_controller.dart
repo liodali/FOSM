@@ -1,14 +1,14 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart' show EdgeInsets;
 
-import '../common/memory_attribution.dart';
-import '../common/tile_coverage.dart';
-import 'geo_point.dart';
-import 'lat_lng_bounds.dart';
-import 'map_load_state.dart';
-import 'marker.dart';
-import 'marker_manager.dart';
-import 'map_location_controller.dart';
+import 'package:fosm/src/common/memory_attribution.dart';
+import 'package:fosm/src/common/tile_coverage.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/lat_lng_bounds.dart';
+import 'package:fosm/src/api/map_load_state.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_manager.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Delegate implemented by [MapView] state.
 ///
@@ -100,6 +100,12 @@ abstract class MapCacheAttributionDelegate {
   /// counters (rendered-image expiry/budget/pressure, compressed-byte
   /// and parsed-tile capacity evictions).
   FosmCacheMissAttribution get cacheAttribution;
+}
+
+/// Point-in-time snapshot of the attached map's prepared-window A/B
+/// counters (plan 13 Phase E): admitted, promoted, cancelled.
+abstract class MapPreparedWindowDelegate {
+  Map<String, int> get preparedWindowStats;
 }
 
 /// Programmatic control surface for a [MapView].
@@ -251,6 +257,15 @@ class MapController extends ChangeNotifier {
     final delegate = _delegate;
     return delegate is MapCacheAttributionDelegate
         ? (delegate as MapCacheAttributionDelegate).cacheAttribution
+        : null;
+  }
+
+  /// Prepared-window A/B counters of the attached map, or `null` when the
+  /// delegate does not expose them.
+  Map<String, int>? get preparedWindowStats {
+    final delegate = _delegate;
+    return delegate is MapPreparedWindowDelegate
+        ? (delegate as MapPreparedWindowDelegate).preparedWindowStats
         : null;
   }
 

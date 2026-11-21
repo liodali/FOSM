@@ -1,12 +1,12 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
-import 'geo_point.dart';
-import 'map_controller.dart';
-import 'marker.dart';
-import 'marker_cluster.dart';
-import 'map_polyline.dart';
-import 'map_polygon.dart';
-import 'map_location_controller.dart';
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/map_controller.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_cluster.dart';
+import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/map_polygon.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 /// Base class for notifications dispatched by [MapView].
 ///
@@ -77,8 +77,7 @@ class MapCameraChangeNotification extends MapNotification {
   double get fractionalZoom => _fractionalZoom ?? zoom.toDouble();
 
   const MapCameraChangeNotification(this.center, this.zoom,
-      {double? fractionalZoom})
-      : _fractionalZoom = fractionalZoom;
+      {this._fractionalZoom});
 }
 
 /// Dispatched when the zoom level changes.

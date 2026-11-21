@@ -2,8 +2,9 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show kIsWeb, visibleForTesting;
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/physics.dart';
@@ -37,10 +38,10 @@ import 'package:fosm/src/view/shape_geometry_cache.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/view/zoom_fallback.dart';
 import 'package:fosm/src/view/zoom_controls.dart';
-import 'scale_bar.dart';
-import 'location_control.dart';
-import 'user_location_layer.dart';
-import '../api/map_location_controller.dart';
+import 'package:fosm/src/view/scale_bar.dart';
+import 'package:fosm/src/view/location_control.dart';
+import 'package:fosm/src/view/user_location_layer.dart';
+import 'package:fosm/src/api/map_location_controller.dart';
 
 typedef MapLoadingBuilder = Widget Function(
     BuildContext context, MapLoadState state);
@@ -141,10 +142,16 @@ class _OldGridOverlay extends StatelessWidget {
   /// derived from the complete camera delta rather than one zoom step.
   final bool interactionSnapshot;
 
-  /// Whether the full-viewport blur is allowed. Skipped on web by default
-  /// and during direct manipulation, where opacity + transform are cheaper
-  /// and keep input responsive.
+  /// Whether the full-viewport blur is allowed. Skipped on web, during
+  /// direct manipulation, and for vector payloads (plan 13: vector
+  /// transitions stay unblurred; raster keeps its blur), where opacity +
+  /// transform are cheaper and keep input responsive.
   final bool blurEnabled;
+
+  /// Vector payload: snapshot tile images may exceed the tile-space
+  /// resolution (`fosm.vectorTileResolution`) and must be drawn mapped
+  /// onto the cell rect (see [RenderCanvasOSM.fitImagesToTile]).
+  final bool fitImagesToTile;
 
   const _OldGridOverlay({
     required this.manager,
@@ -157,6 +164,7 @@ class _OldGridOverlay extends StatelessWidget {
     required this.blurSigma,
     required this.interactionSnapshot,
     required this.blurEnabled,
+    required this.fitImagesToTile,
   });
 
   @override
@@ -175,6 +183,7 @@ class _OldGridOverlay extends StatelessWidget {
         tiles: snapshot.tiles,
         revision: snapshot.revision,
         tileScale: snapshot.tileScale,
+        fitImagesToTile: fitImagesToTile,
       ),
     );
 
@@ -278,6 +287,36 @@ class _GridLayerCapture {
   final double anchorX;
   final double anchorY;
 
+  /// Fractional camera zoom at capture (`TileManager.cameraZoom`). The
+  /// retained-scale transform's ratio is 2^(live − this); [tileScale] is
+  /// its value relative to the integer [zoom] at capture.
+  final double cameraZoom;
+
+  /// Camera center at capture, in [zoom]-unit tile coordinates. The outer
+  /// translation re-anchors the captured content to the live center.
+  final double centerLng;
+  final double centerLat;
+
+  /// Viewport size at capture. The captured box keeps this geometry
+  /// between recaptures; a resize invalidates it.
+  final double viewportWidth;
+  final double viewportHeight;
+
+  /// Rendered tile size at capture (`tileWidth * tileScale`). Stable box
+  /// dimensions for the captured raster.
+  final double renderedTileWidth;
+  final double renderedTileHeight;
+
+  /// Snapshot of the manager's render tiles at capture. Between
+  /// recaptures the live membership may move on while the captured
+  /// painter keeps drawing exactly these cells. Images are pinned via
+  /// [release], mirroring `_GridSnapshot`.
+  final List<Tile> tiles;
+
+  /// Releases the rendered-image pins on [tiles]. Null on the legacy
+  /// path, whose painter reads the live `manager.renderTiles` list.
+  final VoidCallback? release;
+
   const _GridLayerCapture({
     required this.manager,
     required this.revision,
@@ -292,6 +331,15 @@ class _GridLayerCapture {
     required this.placeholders,
     required this.anchorX,
     required this.anchorY,
+    required this.cameraZoom,
+    required this.centerLng,
+    required this.centerLat,
+    required this.viewportWidth,
+    required this.viewportHeight,
+    required this.renderedTileWidth,
+    required this.renderedTileHeight,
+    this.tiles = const [],
+    this.release,
   });
 
   /// Whether [next] describes the same grid content, so the retained layer
@@ -329,6 +377,92 @@ class _GridLayerCapture {
     if (background != next.background || placeholders != next.placeholders) {
       stats.flags++;
     }
+  }
+
+  /// Whether the captured grid can still stand in for [live] through the
+  /// retained-scale transform (plan-13 Phase B): same runtime, integer
+  /// source zoom, imagery revision and paint flags, an unchanged viewport
+  /// size, and a live strict viewport that stays inside the captured
+  /// painted window. This replaces the legacy `matches` role of
+  /// `tileScale` — fractional scale changes are absorbed by the outer
+  /// transform, while the geographic checks that `tileScale` equality
+  /// implicitly guaranteed (window coverage at the painted scale) are
+  /// now explicit in [coversViewport].
+  bool retainedHolds(
+    TileManager live,
+    Size viewport,
+    bool nextBackground,
+    bool nextPlaceholders,
+  ) {
+    if (!identical(manager, live)) return false;
+    if (zoom != live.zoom) return false;
+    if (contentRevision != live.contentRevision) return false;
+    if (background != nextBackground || placeholders != nextPlaceholders) {
+      return false;
+    }
+    if (viewportWidth != viewport.width || viewportHeight != viewport.height) {
+      return false;
+    }
+    return coversViewport(live);
+  }
+
+  /// Whether the live strict viewport, expressed in [zoom]-unit tile
+  /// coordinates, fits inside the retained **surface** — the captured
+  /// viewport extent plus one rendered tile of pad per side, which is
+  /// exactly what the repaint boundary's box holds
+  /// (`Positioned(-renderedTile)`, size `viewport + 2 · renderedTile`).
+  ///
+  /// This deliberately checks the surface bounds, not the padded
+  /// membership window: the painter may draw the whole padded window,
+  /// but the layer's raster is only the box, so anything painted past
+  /// the box edge is cut when the layer is cached. Checking the window
+  /// instead would accept pans/zoom-outs whose outer transform slides
+  /// bare raster edge past the viewport, exposing background strips.
+  /// Zooming out exposes geography the capture never painted; zooming
+  /// in shrinks the live extent and only ever widens the margin.
+  /// Panning shifts the live extent; once it passes the pad the capture
+  /// must be rebuilt around the live camera. The tiny tolerance keeps a
+  /// margin that is zero to float precision from oscillating between
+  /// holds and recaptures.
+  bool coversViewport(TileManager live) {
+    const epsilon = 1e-6;
+    final halfW = viewportWidth / (2 * live.renderedTileWidth);
+    final halfH = viewportHeight / (2 * live.renderedTileHeight);
+    // Captured strict-viewport extent ± one rendered tile of raster pad.
+    final left = centerLng - viewportWidth / (2 * renderedTileWidth) - 1;
+    final right = centerLng + viewportWidth / (2 * renderedTileWidth) + 1;
+    final top = centerLat - viewportHeight / (2 * renderedTileHeight) - 1;
+    final bottom = centerLat + viewportHeight / (2 * renderedTileHeight) + 1;
+    return live.centerTileLng - halfW >= left - epsilon &&
+        live.centerTileLng + halfW <= right + epsilon &&
+        live.centerTileLat - halfH >= top - epsilon &&
+        live.centerTileLat + halfH <= bottom + epsilon;
+  }
+
+  /// The plan-13 Phase B outer camera transform for [live]: scale ratio
+  /// `2^(liveCameraZoom − capturedCameraZoom)` and the translation that
+  /// re-anchors the captured content to the live camera center, applied
+  /// outside the repaint boundary.
+  ///
+  /// Derivation: the manager maps a tile coordinate t to canvas
+  /// `centerCanvas + (t − centerTile) · renderedTile`, so the same
+  /// geographic point sits at `r · captured + K` with
+  /// `r = 2^(live − captured)` and `K = (1 − r) · (viewport/2 +
+  /// renderedTile)` + the center-difference term — see the widget build
+  /// in [_MapState._buildRetainedScaleGrid]. Because both sides map tile
+  /// coordinates consistently, the geographic point under the gesture's
+  /// focal point stays fixed: the focal logic lives in the manager's
+  /// live center, and the transform follows it.
+  Matrix4 retainedScaleTransform(TileManager live) {
+    final ratio =
+        math.pow(2, live.cameraZoom - cameraZoom).toDouble();
+    final kx = (1 - ratio) * (viewportWidth / 2 + renderedTileWidth) +
+        (centerLng - live.centerTileLng) * live.renderedTileWidth;
+    final ky = (1 - ratio) * (viewportHeight / 2 + renderedTileHeight) +
+        (centerLat - live.centerTileLat) * live.renderedTileHeight;
+    return Matrix4.identity()
+      ..translateByDouble(kx, ky, 0, 1)
+      ..scaleByDouble(ratio, ratio, ratio, 1);
   }
 }
 
@@ -495,6 +629,35 @@ enum ZoomAnimationStyle {
 /// The fading old-grid overlay tracks camera pans, so a pinch that keeps
 /// panning mid-animation stays visually aligned.
 class MapView extends StatefulWidget {
+  /// Transition blur for the active payload. Per the updated product
+  /// direction (plan 13): vector imagery stays visible and receives no
+  /// artificial blur during zoom transitions — the scaled retained
+  /// imagery is the continuity; raster transitions keep their existing
+  /// blur. Web and direct manipulation keep their existing off gates.
+  ///
+  /// Returns the effective sigma; sub-0.1 is treated as off downstream.
+  @visibleForTesting
+  static double transitionBlurSigma({
+    required bool vectorPayload,
+    required double sigma,
+    required bool diagnosticOff,
+    required bool web,
+    required bool interacting,
+  }) =>
+      (diagnosticOff || web || interacting || vectorPayload) ? 0.0 : sigma;
+
+  /// Plan-13 Phase E: the prepared zoom window ships enabled —
+  /// `--dart-define=fosm.preparedZoomWindow=false` disables preparation
+  /// app-wide. The manager-level default stays off so direct
+  /// TileManager consumers opt in explicitly.
+  static const bool preparedWindowByDefine =
+      bool.fromEnvironment('fosm.preparedZoomWindow', defaultValue: true);
+
+  /// Prepared window depth in zoom levels either side (1 = nearest
+  /// levels only; 2 = the full rolling window).
+  static const int preparedWindowDepthByDefine =
+      int.fromEnvironment('fosm.preparedWindowDepth', defaultValue: 1);
+
   /// Counts [MapView] rebuilds. Test hook used to prove that several tile
   /// arrivals in one frame produce a single map update.
   @visibleForTesting
@@ -513,6 +676,68 @@ class MapView extends StatefulWidget {
   static const gridLayerByDefine =
       bool.fromEnvironment('fosm.gridLayer', defaultValue: true);
   static bool gridLayerEnabled = gridLayerByDefine;
+
+  /// Plan-13 Phase B candidate: keep the captured grid raster in stable
+  /// captured coordinates and move it with an outer camera scale +
+  /// translation, so fractional zoom no longer repaints the grid every
+  /// frame (the plan-12 translate-only layer still recaptures on every
+  /// `tileScale` change). The captured pose, coverage window and tile
+  /// images are pinned; recapture happens on imagery arrival, source-zoom
+  /// switch, paint-flag or viewport change, or when the live viewport
+  /// outgrows the captured window (zoom-out exposes area the capture
+  /// never painted). Scaling a retained raster trades sharpness during
+  /// the gesture — a single transient frame when zooming out fast;
+  /// measured in the plan-13 phone A/B (recaptures 599 → 34 per 10 s,
+  /// grid-paint CPU −89%, zero over-budget frames, sharp end-states
+  /// identical) and accepted.
+  ///
+  /// On by default since the plan-13 Phase B A/B;
+  /// `--dart-define=fosm.gridRetainedScale=false` restores the
+  /// historical repaint-per-frame path. The static stays mutable for
+  /// tests and the benchmark harness.
+  static const gridRetainedScaleByDefine =
+      bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: true);
+  static bool gridRetainedScaleEnabled = gridRetainedScaleByDefine;
+
+  /// Vector zoom-softness diagnostic: keeps the plan-13 Phase B retained
+  /// scale path for vector payloads (shipped default). With
+  /// `--dart-define=fosm.vectorRetainedScale=false`, vector payloads bypass
+  /// retained scaling: their grid falls back to the plan-12 translate-only
+  /// capture below, so every fractional scale change repaints at the live
+  /// pose (single-stage per-tile resampling) instead of letting the
+  /// compositor stretch the captured raster (two-stage resampling, whose
+  /// enlargement can exceed the live tile scale between recaptures).
+  /// Raster payloads keep the retained-scale path unchanged in both arms.
+  /// Sharpness and frame cost are compared in
+  /// `test/view/vector_zoom_softness_diagnostic_test.dart`; the static
+  /// stays mutable for tests and the benchmark harness.
+  static const vectorRetainedScaleByDefine =
+      bool.fromEnvironment('fosm.vectorRetainedScale', defaultValue: true);
+  static bool vectorRetainedScaleEnabled = vectorRetainedScaleByDefine;
+
+  /// Vector payload rendered-image budget, used when the app leaves
+  /// [maxRenderedCacheBytes] unset. Validated in the macOS resolution A/B
+  /// (docs/performance/vector-render-improvement/zoom-softness-diagnostic.md):
+  /// at 512 px vector tiles the 50 MB raster default pinned at its cap
+  /// mid-gesture — sharp coverage 1.0 → 0.73, raster p95 → 17 ms — while
+  /// 150 MB held a full warm motion footprint with zero over-budget
+  /// frames (peak 123 MB observed at a 720×540 viewport).
+  static const int vectorRenderedCacheDefaultBytes = 150 * 1024 * 1024;
+
+  /// Resolves the rendered-cache budget for a payload: an explicit
+  /// [maxRenderedCacheBytes] always wins; otherwise vector payloads get
+  /// [vectorRenderedCacheDefaultBytes] (their tiles render at 512 px and
+  /// quadruple the per-tile bytes) and raster payloads keep the shipped
+  /// [RenderedTileCache.defaultMaxBytes].
+  @visibleForTesting
+  static int resolvedRenderedCacheBytes({
+    required bool vectorPayload,
+    int? maxRenderedCacheBytes,
+  }) =>
+      maxRenderedCacheBytes ??
+      (vectorPayload
+          ? vectorRenderedCacheDefaultBytes
+          : RenderedTileCache.defaultMaxBytes);
 
   /// Plan-13 attribution: why the retained grid layer recaptured since
   /// process start. One capture-identity change can match several
@@ -636,7 +861,14 @@ class MapView extends StatefulWidget {
   /// Budget for estimated RGBA rendered-tile memory. The current grid and
   /// active zoom snapshot are protected and may temporarily exceed it.
   /// Unused images are evicted first. Zero retains only protected images.
-  final int maxRenderedCacheBytes;
+  ///
+  /// Null (default) resolves per payload via
+  /// [MapView.resolvedRenderedCacheBytes]: [MapView.vectorRenderedCacheDefaultBytes]
+  /// (150 MB) for vector payloads — 512 px tiles quadruple the per-tile
+  /// bytes, and the 50 MB raster default pins at its cap mid-gesture at
+  /// that resolution — and the shipped raster default (50 MB) for raster
+  /// payloads. An explicit value wins in both modes.
+  final int? maxRenderedCacheBytes;
 
   /// How long unused rendered tiles remain available for return pans/zooms,
   /// subject to [maxRenderedCacheBytes]. Defaults to 20 seconds.
@@ -697,13 +929,13 @@ class MapView extends StatefulWidget {
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
     this.zoomAnimationStyle = ZoomAnimationStyle.scale,
-    this.maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
+    this.maxRenderedCacheBytes,
     this.renderedCacheRetention = RenderedTileCache.defaultRetention,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
     this.loadingBuilder,
     this.errorBuilder,
     this.onTileError,
-  })  : assert(maxRenderedCacheBytes >= 0),
+  })  : assert(maxRenderedCacheBytes == null || maxRenderedCacheBytes >= 0),
         assert(scaleBarMaxWidth > 0 && scaleBarMaxWidth < double.infinity),
         assert(fractionalZoom == null ||
             (fractionalZoom >= 0 && fractionalZoom <= 30)),
@@ -723,7 +955,8 @@ class _MapViewState extends State<MapView>
         MapMemoryDelegate,
         MapCoverageDelegate,
         MapWorkloadDelegate,
-        MapCacheAttributionDelegate {
+        MapCacheAttributionDelegate,
+        MapPreparedWindowDelegate {
   @override
   MapLocationController? get locationController => widget.locationController;
 
@@ -1135,7 +1368,10 @@ class _MapViewState extends State<MapView>
     if (widget.maxRenderedCacheBytes != oldWidget.maxRenderedCacheBytes ||
         widget.renderedCacheRetention != oldWidget.renderedCacheRetention) {
       _tileManager?.updateRenderedCachePolicy(
-        maxBytes: widget.maxRenderedCacheBytes,
+        maxBytes: MapView.resolvedRenderedCacheBytes(
+          vectorPayload: _vectorRuntime != null,
+          maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+        ),
         retention: widget.renderedCacheRetention,
       );
     }
@@ -1229,6 +1465,7 @@ class _MapViewState extends State<MapView>
     _stopFractionalAnimation();
     _zoomFallback?.dispose();
     _zoomFallback = null;
+    _gridCapture?.release?.call();
     _gridCapture = null;
     _styleCancel?.cancel('Map disposed');
     widget.controller?.detach(this);
@@ -1312,6 +1549,12 @@ class _MapViewState extends State<MapView>
         throw StateError(
             'Wait for tile presentations to settle before reloading');
       }
+      // The retained-scale capture pins its tile snapshot
+      // (retainSnapshot) — release and invalidate before the workload
+      // reload demands zero pins; the reload's calculate + notification
+      // rebuilds the grid and the next build recaptures fresh.
+      _gridCapture?.release?.call();
+      _gridCapture = null;
       _clearZoomSnapshot();
       _clearZoomFallback();
       manager.reloadRenderedImagesForWorkload();
@@ -1344,6 +1587,12 @@ class _MapViewState extends State<MapView>
         parsedEvictions: _vectorRuntime?.parsedEvictions,
         parsedTiles: _vectorRuntime?.parsedTileCount,
       );
+
+  /// Lifetime prepared-window A/B counters of the attached map (plan-13
+  /// Phase E). Exposed through [MapController.preparedWindowStats].
+  @override
+  Map<String, int> get preparedWindowStats =>
+      _tileManager?.debugPreparedWindowStats ?? const {};
 
   void _notify() {
     // Per-region fallback retirement happens at the reconcile in build;
@@ -1387,6 +1636,12 @@ class _MapViewState extends State<MapView>
       // on demand when it scrolls into view. Raster decodes are cheap and
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
+      // Plan-13 Phase E: the prepared zoom window ships enabled for the
+      // product surface (`fosm.preparedZoomWindow=false` disables) — the
+      // manager-level default stays off so direct manager consumers opt
+      // in explicitly.
+      preparedZoomWindow: MapView.preparedWindowByDefine,
+      preparedWindowDepth: MapView.preparedWindowDepthByDefine,
       // The vector runtime already routes its `Picture.toImage` through
       // the shared scheduler; the manager must not wrap the same decoder
       // in another image-lane reservation. This is scheduling ownership,
@@ -1411,7 +1666,10 @@ class _MapViewState extends State<MapView>
           : 12,
       speculativeDecoder: runtime?.speculativeDecoder,
       cameraBounds: widget.cameraBounds,
-      maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+      maxRenderedCacheBytes: MapView.resolvedRenderedCacheBytes(
+        vectorPayload: runtime != null,
+        maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+      ),
       renderedCacheRetention: widget.renderedCacheRetention,
       requestTimeout: widget.requestTimeout,
     );
@@ -2627,6 +2885,9 @@ class _MapViewState extends State<MapView>
   /// the painter receives the anchors captured at the last identity
   /// change, so unchanged content keeps `shouldRepaint` false and the
   /// retained layer is moved by a paint transform for sub-tile motion.
+  /// With [MapView.gridRetainedScaleEnabled] on, [_buildRetainedScaleGrid]
+  /// takes over: the capture also fixes the fractional camera pose and the
+  /// window coverage, and the outer transform scales as well as moves.
   ///
   /// Geometry: the boundary box extends one rendered tile beyond the
   /// viewport on every side and its origin sits at screen (−tw, −th), so
@@ -2654,9 +2915,17 @@ class _MapViewState extends State<MapView>
             tileScale: manager.zoomScale,
             paintBackground: !fallbackActive,
             paintPlaceholders: !fallbackActive,
+            fitImagesToTile: _vectorRuntime != null,
           ),
         ),
       );
+    }
+    // Retained scale applies to the whole grid; the vector diagnostic
+    // bypass opts vector payloads out (paint live at the fractional pose)
+    // while raster payloads keep the compositor path unchanged.
+    if (MapView.gridRetainedScaleEnabled &&
+        (MapView.vectorRetainedScaleEnabled || _vectorRuntime == null)) {
+      return _buildRetainedScaleGrid(manager, size, fallbackActive);
     }
 
     final capture = _GridLayerCapture(
@@ -2673,6 +2942,15 @@ class _MapViewState extends State<MapView>
       placeholders: !fallbackActive,
       anchorX: manager.leftColumnTilesCanvasX,
       anchorY: manager.topRowTilesCanvasY,
+      // Legacy translate-only capture: pose fields are unused (the
+      // identity keeps tileScale, so every scale change recaptures).
+      cameraZoom: manager.cameraZoom,
+      centerLng: manager.centerTileLng,
+      centerLat: manager.centerTileLat,
+      viewportWidth: size.width,
+      viewportHeight: size.height,
+      renderedTileWidth: manager.renderedTileWidth,
+      renderedTileHeight: manager.renderedTileHeight,
     );
     if (_gridCapture == null || !_gridCapture!.matches(capture)) {
       if (_gridCapture != null) {
@@ -2680,7 +2958,7 @@ class _MapViewState extends State<MapView>
         // invalid (arrival, zoom switch, scale, membership, flags).
         _gridCapture!.accumulateChangedFields(capture);
       }
-      _gridCapture = capture;
+      _replaceGridCapture(capture);
     }
     final cap = _gridCapture!;
     final dx = manager.leftColumnTilesCanvasX - cap.anchorX;
@@ -2703,6 +2981,7 @@ class _MapViewState extends State<MapView>
       tileScale: cap.tileScale,
       paintBackground: cap.background,
       paintPlaceholders: cap.placeholders,
+      fitImagesToTile: _vectorRuntime != null,
     );
     return Positioned(
       left: -tileW,
@@ -2721,6 +3000,118 @@ class _MapViewState extends State<MapView>
         ),
       ),
     );
+  }
+
+  /// Plan-13 Phase B (`fosm.gridRetainedScale`): the captured grid keeps
+  /// its stable captured geometry — box dimensions, anchors, tile scale,
+  /// tile snapshot — and the live camera is applied as an outer scale +
+  /// translation [outside] the repaint boundary, so a fractional pinch
+  /// recomposites the retained raster instead of repainting the grid
+  /// every frame (the plan-12 translate-only layer above recaptures on
+  /// every `tileScale` change).
+  ///
+  /// Recapture policy: imagery arrival ([TileManager.contentRevision]),
+  /// integer source-zoom switch, fallback flag change, viewport resize,
+  /// or the live viewport outgrowing the captured painted window —
+  /// zooming out exposes geography the capture never painted, so the
+  /// legacy one-tile pad assumption is replaced by an explicit coverage
+  /// check ([_GridLayerCapture.retainedHolds]). The transform follows the
+  /// manager's own camera mapping, so the geographic point under the
+  /// gesture focal point stays fixed. Captured cells are pinned until the
+  /// next recapture, so cache eviction cannot dispose content the
+  /// painter still draws; the pin adds at most one window of images
+  /// between recaptures, on top of the cache budget.
+  ///
+  /// Sampling is the accepted trade: between recaptures the captured
+  /// raster is resampled by the compositor (up to 2^±0.5 within a source
+  /// zoom) instead of re-rendered at the live scale.
+  Widget _buildRetainedScaleGrid(
+    TileManager manager,
+    Size size,
+    bool fallbackActive,
+  ) {
+    final background = !fallbackActive;
+    final placeholders = !fallbackActive;
+    if (_gridCapture == null ||
+        !_gridCapture!.retainedHolds(manager, size, background, placeholders)) {
+      final capture = _GridLayerCapture(
+        manager: manager,
+        revision: manager.revision,
+        contentRevision: manager.contentRevision,
+        zoom: manager.zoom,
+        leftLngIndex: manager.leftColumnTilesLngIndex,
+        topLatIndex: manager.topRowTilesLatIndex,
+        horizontalCount: manager.horizontalTileCount,
+        verticalCount: manager.verticalTileCount,
+        tileScale: manager.zoomScale,
+        background: background,
+        placeholders: placeholders,
+        anchorX: manager.leftColumnTilesCanvasX,
+        anchorY: manager.topRowTilesCanvasY,
+        cameraZoom: manager.cameraZoom,
+        centerLng: manager.centerTileLng,
+        centerLat: manager.centerTileLat,
+        viewportWidth: size.width,
+        viewportHeight: size.height,
+        renderedTileWidth: manager.renderedTileWidth,
+        renderedTileHeight: manager.renderedTileHeight,
+        tiles: List<Tile>.from(manager.renderTiles),
+        release: manager.retainSnapshot(manager.renderTiles),
+      );
+      if (_gridCapture != null) {
+        // Plan-13 attribution with the same field comparison; in this
+        // mode `scale` counts only recaptures whose captured tile scale
+        // happened to change (the transform absorbs scale between them).
+        _gridCapture!.accumulateChangedFields(capture);
+      }
+      _replaceGridCapture(capture);
+    }
+    final cap = _gridCapture!;
+    final boxWidth = cap.viewportWidth + 2 * cap.renderedTileWidth;
+    final boxHeight = cap.viewportHeight + 2 * cap.renderedTileHeight;
+    final painter = RenderCanvasOSM(
+      horizontalTileCount: cap.horizontalCount,
+      verticalTileCount: cap.verticalCount,
+      leftColumnTilesLngIndex: cap.leftLngIndex,
+      topRowTilesLatIndex: cap.topLatIndex,
+      // Box coordinates: the box origin sits one captured tile up-left of
+      // the viewport, so the captured anchors shift by (+tw, +th).
+      leftColumnTilesCanvasX: cap.anchorX + cap.renderedTileWidth,
+      topRowTilesCanvasY: cap.anchorY + cap.renderedTileHeight,
+      tiles: cap.tiles,
+      revision: cap.revision,
+      tileScale: cap.tileScale,
+      paintBackground: cap.background,
+      paintPlaceholders: cap.placeholders,
+      fitImagesToTile: _vectorRuntime != null,
+    );
+    return Positioned(
+      left: -cap.renderedTileWidth,
+      top: -cap.renderedTileHeight,
+      width: boxWidth,
+      height: boxHeight,
+      child: Transform(
+        // The repaint boundary retains the captured raster; the outer
+        // scale + translation recomposites it for the live camera without
+        // repainting. Coverage between recaptures is guaranteed by
+        // [retainedHolds].
+        transform: cap.retainedScaleTransform(manager),
+        child: RepaintBoundary(
+          child: CustomPaint(
+            size: Size(boxWidth, boxHeight),
+            painter: painter,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Swaps the retained-grid capture, releasing any rendered-image pins
+  /// the previous capture holds (retained-scale mode pins its tile
+  /// snapshot; the legacy translate-only path holds none).
+  void _replaceGridCapture(_GridLayerCapture capture) {
+    _gridCapture?.release?.call();
+    _gridCapture = capture;
   }
 
   @override
@@ -2762,6 +3153,18 @@ class _MapViewState extends State<MapView>
         final fallbackSuppressed =
             !_interacting && _animWaitingTiles && _animOldSnapshot != null;
         final fallbackActive = coverage.hasRegions && !fallbackSuppressed;
+
+        // Effective transition blur: vector payloads keep their imagery
+        // unblurred (plan 13 product direction); raster keeps the
+        // snapshot's gaussian sigma; web, direct manipulation and the
+        // diagnostic arm stay off. Sub-0.1 is off downstream.
+        final transitionBlurSigma = MapView.transitionBlurSigma(
+          vectorPayload: _vectorRuntime != null,
+          sigma: _blurSigma,
+          diagnosticOff: _blurDiagnosticOff,
+          web: kIsWeb,
+          interacting: _interacting,
+        );
 
         final runtime = _vectorRuntime;
 
@@ -2818,9 +3221,10 @@ class _MapViewState extends State<MapView>
                         // tiles blend against the plain-grid background.
                         // The snapshot's gaussian sigma rides per-region
                         // saveLayers inside the painter (bounded, clipped
-                        // per cell), off on the web and while a hand
-                        // directly works the map — same gates as the
-                        // snapshot's own blur.
+                        // per cell), off on the web, while a hand
+                        // directly works the map, and for vector
+                        // payloads (plan 13: vector transitions get no
+                        // artificial blur; raster keeps its blur).
                         if (fallbackActive)
                           Positioned.fill(
                             child: CustomPaint(
@@ -2828,11 +3232,7 @@ class _MapViewState extends State<MapView>
                               painter: ZoomFallbackPainter(
                                 coverage: coverage,
                                 manager: manager,
-                                blurSigma: (_blurDiagnosticOff ||
-                                        kIsWeb ||
-                                        _interacting)
-                                    ? 0.0
-                                    : _blurSigma,
+                                blurSigma: transitionBlurSigma,
                               ),
                             ),
                           ),
@@ -2855,8 +3255,11 @@ class _MapViewState extends State<MapView>
                             visualScale: _visualScale,
                             blurSigma: _blurSigma,
                             interactionSnapshot: _pinchTransitionActive,
-                            blurEnabled:
-                                !kIsWeb && !_interacting && !_blurDiagnosticOff,
+                            // Same gate as the fallback: raster keeps its
+                            // blur; vector, web, direct manipulation and
+                            // the diagnostic arm do not blur.
+                            blurEnabled: transitionBlurSigma > 0.1,
+                            fitImagesToTile: _vectorRuntime != null,
                           ),
                         ],
                       ],

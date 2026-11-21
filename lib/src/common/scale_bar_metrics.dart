@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 
-import 'osm_transformation_utilities.dart';
-import 'utils.dart' show tileWidth;
+import 'package:fosm/src/common/osm_transformation_utilities.dart';
+import 'package:fosm/src/common/utils.dart' show tileWidth;
 
 /// Units displayed by the map's distance scale.
 enum ScaleBarUnit { metric, imperial }

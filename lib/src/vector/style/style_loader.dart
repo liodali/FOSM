@@ -1,9 +1,9 @@
 import 'dart:convert';
 
-import '../../api/tile_source.dart' show downloadTileBytes, MapRequestSession;
-import '../../api/map_load_state.dart';
-import 'map_style.dart';
-import 'style_parser.dart';
+import 'package:fosm/src/api/tile_source.dart' show downloadTileBytes, MapRequestSession;
+import 'package:fosm/src/api/map_load_state.dart';
+import 'package:fosm/src/vector/style/map_style.dart';
+import 'package:fosm/src/vector/style/style_parser.dart';
 
 /// Identifies a hosted vector style the map can render.
 ///

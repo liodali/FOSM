@@ -1,10 +1,10 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
-import '../api/map_polygon.dart';
-import '../api/tile_manager.dart';
-import '../common/geometry_trace.dart';
-import 'shape_geometry.dart';
-import 'shape_geometry_cache.dart';
+import 'package:fosm/src/api/map_polygon.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/common/geometry_trace.dart';
+import 'package:fosm/src/view/shape_geometry.dart';
+import 'package:fosm/src/view/shape_geometry_cache.dart';
 
 /// Painted below routes and markers. Selection uses the map's gesture surface,
 /// so this layer never competes with marker or camera recognizers.

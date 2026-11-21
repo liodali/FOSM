@@ -1205,7 +1205,7 @@ void main() {
         height: 600,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 4,
-        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        fetcher: (_, _, _) => Completer<Uint8List>().future,
         tilePadding: 0,
         preloadAdjacentZoom: false,
       );
@@ -1258,7 +1258,7 @@ void main() {
         height: 512,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 3,
-        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        fetcher: (_, _, _) => Completer<Uint8List>().future,
         tilePadding: 0,
         preloadAdjacentZoom: false,
       );
@@ -1805,7 +1805,7 @@ void main() {
         height: 512,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 4,
-        fetcher: (_, __, ___) async => fakeTilePng,
+        fetcher: (_, _, _) async => fakeTilePng,
         decoder: nestedDecoder,
         workScheduler: scheduler,
         // Padding decodes too: with scheduling ownership tied to this flag

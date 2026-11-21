@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'map_style.dart';
+import 'package:fosm/src/vector/style/map_style.dart';
 
 /// Parses a MapLibre style JSON document. Tolerant by design: unknown
 /// properties are ignored, missing ones fall back to spec defaults, and a

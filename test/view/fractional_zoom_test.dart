@@ -3,7 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -19,7 +19,7 @@ TileManager _manager({LatLngBounds? bounds}) => TileManager.init(
     zoom: 10,
     cameraBounds: bounds,
     preloadAdjacentZoom: false,
-    fetcher: (_, __, ___) => Completer<Uint8List>().future);
+    fetcher: (_, _, _) => Completer<Uint8List>().future);
 
 Future<void> _map(
   WidgetTester tester,
@@ -45,7 +45,7 @@ Future<void> _map(
       polylines: lines,
       onTap: onTap,
       onFractionalZoomChanged: onZoom,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
 
 GestureDetector _gestures(WidgetTester tester) =>
@@ -146,7 +146,29 @@ void main() {
         .map((w) => w.painter)
         .whereType<RenderCanvasOSM>()
         .single;
-    expect(painter.tileScale, closeTo(math.pow(2, 0.25), 1e-8));
+    // The fractional factor reaches the screen through whichever grid
+    // path is enabled: the legacy painter carries it as `tileScale`;
+    // the retained-scale path (plan-13) keeps the painter at the
+    // captured integer-band scale and rides the factor on the outer
+    // camera transform.
+    final transforms = tester.widgetList<Transform>(find.ancestor(
+        of: find.byWidgetPredicate(
+            (w) => w is CustomPaint && w.painter == painter),
+        matching: find.byType(Transform)));
+    final outerScale = transforms.fold<double>(
+        1.0,
+        (scale, t) =>
+            scale * ((t.transform.storage[0] + t.transform.storage[5]) / 2));
+    if ((outerScale - 1).abs() > 1e-9) {
+      expect(outerScale, closeTo(math.pow(2, 0.25), 1e-8),
+          reason: 'the retained path carries the fractional factor on the '
+              'outer camera transform');
+      expect(painter.tileScale, 1.0,
+          reason: 'the retained painter keeps the captured integer-band '
+              'scale');
+    } else {
+      expect(painter.tileScale, closeTo(math.pow(2, 0.25), 1e-8));
+    }
     controller.setFractionalZoom(100, animate: false);
     expect(controller.fractionalZoom, 19);
     controller.setFractionalZoom(-10, animate: false);
@@ -320,7 +342,7 @@ void main() {
                     controller: controller,
                     enableFractionalZoom: true,
                     showZoomControls: false,
-                    tileFetcher: (_, __, ___) =>
+                    tileFetcher: (_, _, _) =>
                         Completer<Uint8List>().future)))));
     controller.setFractionalZoom(10.3, animate: false);
     expect(camera!.zoom, 10);
@@ -347,7 +369,7 @@ void main() {
         controller: controller,
         onZoomChanged: (value) => update(() => integer = value),
         onFractionalZoomChanged: (value) => update(() => exact = value),
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
       ),
     ))));
     await tester.tap(find.byIcon(Icons.add));

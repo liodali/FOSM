@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -805,7 +805,11 @@ void main() {
     expect(grid.paintPlaceholders, isFalse);
     expect(grid.paintBackground, isFalse);
 
-    for (var i = 0; i < 10 && fetcher.hasPending; i++) {
+    // With the prepared zoom window enabled (MapView layer), retirement
+    // competes with ongoing background preparation: the drain loop runs
+    // until the fetch queue actually empties (the per-generation budget
+    // bounds it), which can take many more rounds than demand alone.
+    for (var i = 0; i < 64 && fetcher.hasPending; i++) {
       fetcher.deliverAllPending();
       await _drain(tester);
     }
@@ -1276,6 +1280,80 @@ void main() {
     expect(fallbackVisible(), isFalse,
         reason: 'regions retire when their cells leave the window');
     expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  test('transition blur truth table (plan 13: vector unblurred, raster '
+      'keeps blur)', () {
+    const sigma = 2.0;
+    // The product decision: vector payloads never blur; raster keeps the
+    // snapshot's gaussian sigma unless an existing off-gate applies.
+    expect(
+        MapView.transitionBlurSigma(
+            vectorPayload: true,
+            sigma: sigma,
+            diagnosticOff: false,
+            web: false,
+            interacting: false),
+        0.0,
+        reason: 'vector imagery stays visible without artificial blur');
+    expect(
+        MapView.transitionBlurSigma(
+            vectorPayload: false,
+            sigma: sigma,
+            diagnosticOff: false,
+            web: false,
+            interacting: false),
+        sigma,
+        reason: 'raster transitions keep their blur');
+    void expectOff({required bool diagnosticOff, required bool web,
+        required bool interacting}) {
+      expect(
+          MapView.transitionBlurSigma(
+              vectorPayload: false,
+              sigma: sigma,
+              diagnosticOff: diagnosticOff,
+              web: web,
+              interacting: interacting),
+          0.0,
+          reason: 'diagnostic/web/direct-manipulation gates stay off');
+    }
+
+    expectOff(diagnosticOff: true, web: false, interacting: false);
+    expectOff(diagnosticOff: false, web: true, interacting: false);
+    expectOff(diagnosticOff: false, web: false, interacting: true);
+  });
+
+  testWidgets('raster fallback keeps its blur sigma at the painter',
+      (tester) async {
+    tester.view.physicalSize = const ui.Size(360, 240);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final fetcher = _GatedFetcher();
+    final controller = MapController();
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: MapView(
+      latLng: const LatLng(latitude: 0, longitude: 0),
+      zoom: 5,
+      enableFractionalZoom: true,
+      controller: controller,
+      tileFetcher: fetcher.call,
+    ))));
+    fetcher.deliverZoom(5);
+    await _drain(tester, until: () => _gridLoaded(tester));
+
+    controller.setFractionalZoom(6.25, animate: false);
+    await tester.pump();
+    final painter = tester
+        .widgetList<CustomPaint>(find.byType(CustomPaint))
+        .map((widget) => widget.painter)
+        .whereType<ZoomFallbackPainter>()
+        .single;
+    expect(painter.blurSigma, greaterThan(0.1),
+        reason: 'a raster payload keeps the snapshot blur at the fallback '
+            'painter — only vector transitions are unblurred');
     await tester.pumpWidget(const SizedBox.shrink());
   });
 }

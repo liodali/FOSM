@@ -2,7 +2,7 @@
 // dart.library.js_interop is available.
 
 import 'dart:typed_data';
-import '../api/map_load_state.dart';
+import 'package:fosm/src/api/map_load_state.dart';
 
 /// Persistent HTTP isolate for tile downloads.
 ///

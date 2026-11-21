@@ -1,13 +1,13 @@
 import 'dart:ui';
 
-import '../api/geo_point.dart';
-import '../api/map_polygon.dart';
-import '../api/map_polyline.dart';
-import '../api/tile_manager.dart';
-import '../common/geometry_trace.dart';
-import '../common/osm_transformation_utilities.dart'
+import 'package:fosm/src/api/geo_point.dart';
+import 'package:fosm/src/api/map_polygon.dart';
+import 'package:fosm/src/api/map_polyline.dart';
+import 'package:fosm/src/api/tile_manager.dart';
+import 'package:fosm/src/common/geometry_trace.dart';
+import 'package:fosm/src/common/osm_transformation_utilities.dart'
     show maxWebMercatorLatitude;
-import 'shape_geometry_cache.dart';
+import 'package:fosm/src/view/shape_geometry_cache.dart';
 
 /// Validates before projection so invalid geometry cannot reach Canvas/Path.
 List<Offset>? projectRing(List<LatLng> points, TileManager manager) {
