@@ -739,6 +739,24 @@ class MapView extends StatefulWidget {
           ? vectorRenderedCacheDefaultBytes
           : RenderedTileCache.defaultMaxBytes);
 
+  /// Gesture-driven prefetch of the next zoom level's bytes while a zoom
+  /// gesture moves, on by default for vector payloads
+  /// (`--dart-define=fosm.gesturePrefetch=false` disables). iPhone 12 mini,
+  /// cold start then a two second zoom-in, three launches per arm, median
+  /// stale area off / on: 1001 / 590 ms at 250 ms tile latency and
+  /// 1925 / 1056 ms at 600 ms; mean time for a newly exposed cell to turn
+  /// sharp 607 / 123 ms and 1025 / 249 ms. Fast oscillating pinches are
+  /// neutral (their first grid switch comes before one round trip), the
+  /// pan and warm cases unchanged, UI p99 flat and no frame over 16.7 ms.
+  static const bool gesturePrefetchByDefine =
+      bool.fromEnvironment('fosm.gesturePrefetch', defaultValue: true);
+
+  /// Whether a payload prefetches along zoom gestures: vector only, raster
+  /// keeps its behavior.
+  @visibleForTesting
+  static bool resolvedGesturePrefetch({required bool vectorPayload}) =>
+      vectorPayload && gesturePrefetchByDefine;
+
   /// Background lane width for a payload: vector payloads get
   /// [TileManager.vectorBackgroundLoads]; raster returns null so the manager
   /// keeps its default ([TileManager.maxConcurrentBackgroundLoads]).
@@ -1658,6 +1676,8 @@ class _MapViewState extends State<MapView>
           MapView.resolvedBackgroundLoads(vectorPayload: runtime != null),
       visibleLoads:
           MapView.resolvedVisibleLoads(vectorPayload: runtime != null),
+      gesturePrefetch:
+          MapView.resolvedGesturePrefetch(vectorPayload: runtime != null),
       // Plan-13 Phase E: the prepared zoom window ships enabled for the
       // product surface (`fosm.preparedZoomWindow=false` disables) — the
       // manager-level default stays off so direct manager consumers opt

@@ -594,6 +594,29 @@ class TileManager with CacheTiles {
   /// [vectorVisibleLoads].
   final int visibleLoadLimit;
 
+  /// Gesture-driven prefetch: while a zoom gesture moves, fetch the bytes of
+  /// the next level in its direction (z+1 zooming in, z-1 zooming out) around
+  /// the predicted viewport, so the grid switch finds them cached. Bytes only:
+  /// nothing is parsed, recorded or rasterized during the gesture, so it adds
+  /// no UI work. Off by default at the manager level; [MapView] enables it
+  /// for vector payloads.
+  final bool gesturePrefetch;
+
+  /// Upper bound on prefetch tiles admitted per gesture direction.
+  static const int maxGesturePrefetch = 32;
+
+  /// Zoom distance (levels) a gesture must travel before its direction is
+  /// trusted, and the hysteresis against jitter reversals is twice this.
+  static const double gesturePrefetchMinZoomDelta = 0.05;
+
+  /// A pause this long between zoom updates starts a new gesture.
+  static const Duration _gestureIdleReset = Duration(milliseconds: 400);
+
+  int _gestureDirection = 0;
+  double _gestureExtremeZoom = 0;
+  int _gestureAdmitted = 0;
+  DateTime? _gestureLastAt;
+
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
@@ -1044,6 +1067,7 @@ class TileManager with CacheTiles {
     this.byteOnlyPadding = false,
     int? backgroundLoads,
     int? visibleLoads,
+    this.gesturePrefetch = false,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
@@ -1324,6 +1348,7 @@ class TileManager with CacheTiles {
   void setCameraZoom(double value, {Offset? focalPoint}) {
     _validateCameraZoom(value);
     if (value == cameraZoom) return;
+    final previousCameraZoom = cameraZoom;
     // Prepared-window prediction inputs: zoom direction, the gesture
     // focal point, the camera center, the fractional scale and the
     // capture zoom — all in capture-time tile units, so the
@@ -1357,6 +1382,112 @@ class TileManager with CacheTiles {
     _preparedZoomScale = capturedScale;
     _preparedCaptureZoom = captureZoom;
     calculate();
+    if (gesturePrefetch) _prefetchAlongGesture(previousCameraZoom, value);
+  }
+
+  /// Tracks the zoom gesture's direction and admits the prefetch for it.
+  void _prefetchAlongGesture(double from, double to) {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final last = _gestureLastAt;
+    _gestureLastAt = now;
+    if (last == null || now.difference(last) > _gestureIdleReset) {
+      // A new gesture: forget the old direction and budget.
+      _gestureDirection = 0;
+      _gestureExtremeZoom = from;
+      _gestureAdmitted = 0;
+    }
+    if (_gestureDirection == 0) {
+      if ((to - _gestureExtremeZoom).abs() < gesturePrefetchMinZoomDelta) {
+        return;
+      }
+      _gestureDirection = to > _gestureExtremeZoom ? 1 : -1;
+      _gestureExtremeZoom = to;
+      _gestureAdmitted = 0;
+    } else if ((to - _gestureExtremeZoom) * _gestureDirection > 0) {
+      _gestureExtremeZoom = to;
+    } else if ((_gestureExtremeZoom - to) * _gestureDirection >=
+        2 * gesturePrefetchMinZoomDelta) {
+      // The user reversed: the old level is no longer the one needed.
+      _gestureDirection = -_gestureDirection;
+      _gestureExtremeZoom = to;
+      _gestureAdmitted = 0;
+      _loadQueue.removeWhere((job) {
+        if (!job.gesture) return false;
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+        return true;
+      });
+    }
+    _admitGesturePrefetch();
+  }
+
+  /// Enqueues byte-only jobs for the tiles the next level in the gesture's
+  /// direction will need. The viewport is predicted with the same
+  /// focal-preserving projection as the prepared zoom window; the +1 pad
+  /// absorbs the prediction error.
+  void _admitGesturePrefetch() {
+    if (_gestureAdmitted >= maxGesturePrefetch) return;
+    final target = zoom + _gestureDirection;
+    if (target < 0 || target > 19) return;
+    final growth =
+        math.pow(2, (target - (_preparedCaptureZoom ?? zoom)).toDouble());
+    final captureScale = _preparedZoomScale ?? 1.0;
+    final focalLng = _preparedFocalLng ?? centerTileLng;
+    final focalLat = _preparedFocalLat ?? centerTileLat;
+    final capCenterLng = _preparedCenterLng ?? centerTileLng;
+    final capCenterLat = _preparedCenterLat ?? centerTileLat;
+    final predictedLng =
+        focalLng * growth - (focalLng - capCenterLng) * captureScale;
+    final predictedLat =
+        focalLat * growth - (focalLat - capCenterLat) * captureScale;
+    final halfW = width / 512 + 1;
+    final halfH = height / 512 + 1;
+    final world = 1 << target;
+    final minY = (predictedLat - halfH).floor().clamp(0, world - 1);
+    final maxY = (predictedLat + halfH).floor().clamp(0, world - 1);
+    final byteBudget = (maxByteCacheBytes * _preloadByteShare).round();
+    final candidates = <_LoadJob>[];
+    for (var y = minY; y <= maxY; y++) {
+      for (var x = (predictedLng - halfW).floor();
+          x <= (predictedLng + halfW).floor();
+          x++) {
+        final wx = ((x % world) + world) % world;
+        final key = _key(target, wx, y);
+        final resource = _resourceKey(target, wx, y);
+        if (_memoryCache.containsKey(key) ||
+            _byteCache.containsKey(resource) ||
+            _inFlight.contains(key) ||
+            _queued.contains(key)) {
+          continue;
+        }
+        final dx = x + 0.5 - predictedLng;
+        final dy = y + 0.5 - predictedLat;
+        candidates.add(_LoadJob(
+          key: key,
+          resourceKey: resource,
+          z: target,
+          x: wx,
+          y: y,
+          generation: _generation,
+          jobClass: _JobClass.adjacentZoom,
+          distance: dx * dx + dy * dy,
+          byteOnly: true,
+          gesture: true,
+        ));
+      }
+    }
+    if (candidates.isEmpty) return;
+    candidates.sort((a, b) => a.distance.compareTo(b.distance));
+    for (final job in candidates) {
+      if (_gestureAdmitted >= maxGesturePrefetch ||
+          _byteCacheSize >= byteBudget) {
+        break;
+      }
+      _gestureAdmitted++;
+      _enqueueJob(job);
+    }
+    _pumpLoadQueue();
   }
 
   // ── Grid computation ────────────────────────────────────────────────
@@ -1618,6 +1749,7 @@ class TileManager with CacheTiles {
     }
     final cls = a.jobClass.index.compareTo(b.jobClass.index);
     if (cls != 0) return cls;
+    if (a.gesture != b.gesture) return a.gesture ? -1 : 1;
     return a.distance.compareTo(b.distance);
   }
 
@@ -2196,7 +2328,7 @@ class TileManager with CacheTiles {
         } else {
           keep.add(job);
         }
-      } else if (backgroundBlocked ||
+      } else if ((backgroundBlocked && !job.gesture) ||
           _activeBackgroundLoads >= backgroundLoadLimit) {
         keep.add(job);
       } else {
@@ -3453,6 +3585,11 @@ class _LoadJob {
   /// When `true`, only source bytes are fetched — no decode.
   final bool byteOnly;
 
+  /// Gesture prefetch (bytes of the next zoom level, admitted while a zoom
+  /// gesture is moving): runs on the background lane even while foreground
+  /// work is queued or active, and outranks idle preloads.
+  final bool gesture;
+
   const _LoadJob({
     required this.key,
     required this.resourceKey,
@@ -3463,6 +3600,7 @@ class _LoadJob {
     required this.jobClass,
     required this.distance,
     required this.byteOnly,
+    this.gesture = false,
   });
 }
 

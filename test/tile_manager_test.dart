@@ -94,6 +94,7 @@ Future<void> _flushAsync(WidgetTester tester, {int turns = 20}) async {
 }
 
 void main() {
+  _gesturePrefetchTests();
   group('TileManager grid construction', () {
     test('creates one tile per visible cell (no duplicates)', () {
       final manager = TileManager.init(
@@ -3655,6 +3656,115 @@ class _SpecCounts {
     specInside++;
     return Tile.decodeImage(bytes);
   }
+}
+
+
+/// Gesture-driven prefetch: while a zoom gesture moves, the next level in its
+/// direction is fetched as bytes only, even while the foreground is busy.
+void _gesturePrefetchTests() {
+  group('gesture prefetch', () {
+    ({TileManager manager, List<String> started, List<String> decoded})
+        build({
+      required bool prefetch,
+      int backgroundLoads = 40,
+    }) {
+      final started = <String>[];
+      final decoded = <String>[];
+      final manager = TileManager.init(
+        width: 512,
+        height: 512,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 4,
+        // Held forever: the foreground stays busy for the whole test.
+        fetcher: (z, x, y) {
+          started.add('$z/$x/$y');
+          return Completer<Uint8List>().future;
+        },
+        decoder: (bytes, z, x, y) {
+          decoded.add('$z/$x/$y');
+          return Tile.decodeImage(bytes);
+        },
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        backgroundLoads: backgroundLoads,
+        gesturePrefetch: prefetch,
+      );
+      manager.calculate();
+      return (manager: manager, started: started, decoded: decoded);
+    }
+
+    testWidgets('zooming in fetches the next level while visible loads wait',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      expect(_containsZoom(t.started, 4), isTrue,
+          reason: 'visible work is in flight and never finishes');
+      expect(_containsZoom(t.started, 5), isFalse);
+
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      expect(_containsZoom(t.started, 3), isFalse,
+          reason: 'only the level in the gesture direction is fetched');
+    });
+
+    testWidgets('zooming out fetches the level below', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(3.9);
+      await _runUntil(tester, () => _containsZoom(t.started, 3));
+      expect(_containsZoom(t.started, 5), isFalse);
+    });
+
+    testWidgets('is off unless enabled', (tester) async {
+      final t = build(prefetch: false);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _flushAsync(tester);
+      expect(_containsZoom(t.started, 5), isFalse);
+    });
+
+    testWidgets('waits for a real direction before fetching', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.02);
+      await _flushAsync(tester);
+      expect(_containsZoom(t.started, 5), isFalse,
+          reason: 'a 0.02 level nudge is below the direction threshold');
+    });
+
+    testWidgets('a reversal switches to the other level', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      t.manager.setCameraZoom(3.95);
+      await _runUntil(tester, () => _containsZoom(t.started, 3));
+    });
+
+    testWidgets('admits a bounded number of tiles per direction',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      for (final zoom in [4.1, 4.2, 4.3, 4.4]) {
+        t.manager.setCameraZoom(zoom);
+      }
+      await _flushAsync(tester);
+      final next = t.started.where((key) => key.startsWith('5/')).length;
+      expect(next, greaterThan(0));
+      expect(next, lessThanOrEqualTo(TileManager.maxGesturePrefetch));
+    });
+
+    testWidgets('fetches bytes only: nothing is decoded for the next level',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      await _flushAsync(tester);
+      expect(t.decoded.where((key) => key.startsWith('5/')), isEmpty);
+    });
+  });
 }
 
 bool _containsZoom(List<String> keys, int zoom) =>
