@@ -7,6 +7,52 @@ import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/view/render.dart';
 
 void main() {
+  group('RenderCanvasOSM placeholder image', () {
+    test('is the default', () {
+      // Revert per build with --dart-define=fosm.gridPlaceholderImage=false.
+      expect(RenderCanvasOSM.placeholderImage, isTrue);
+    });
+
+    testWidgets('is pixel-identical to the picture replay', (tester) async {
+      Future<List<int>?> raster(bool image) async {
+        RenderCanvasOSM.placeholderImage = image;
+        final painter = RenderCanvasOSM(
+          horizontalTileCount: 3,
+          verticalTileCount: 2,
+          leftColumnTilesLngIndex: 1,
+          topRowTilesLatIndex: 0,
+          leftColumnTilesCanvasX: 0,
+          topRowTilesCanvasY: 0,
+          tiles: const [],
+          revision: 1,
+        );
+        final recorder = ui.PictureRecorder();
+        painter.paint(ui.Canvas(recorder), const Size(256 * 3, 256 * 2));
+        final picture = recorder.endRecording();
+        final rendered = await picture.toImage(256 * 3, 256 * 2);
+        final bytes = await rendered.toByteData();
+        rendered.dispose();
+        picture.dispose();
+        return bytes?.buffer.asUint8List().toList();
+      }
+
+      final previous = RenderCanvasOSM.placeholderImage;
+      addTearDown(() => RenderCanvasOSM.placeholderImage = previous);
+      final result = await tester.runAsync(() async {
+        final replay = await raster(false);
+        final available = RenderCanvasOSM.debugCheckerImageAvailable;
+        final candidate = await raster(true);
+        return (replay, candidate, available);
+      });
+      final (replay, candidate, available) = result!;
+      expect(replay, isNotNull);
+      expect(candidate, replay);
+      // Without synchronous snapshots the candidate arm falls back to the
+      // replay, so the comparison above proves nothing: say so.
+      if (!available) markTestSkipped('toImageSync is unavailable here');
+    });
+  });
+
   group('RenderCanvasOSM checkerboard placeholder', () {
     testWidgets('paints without throwing for an all-missing grid',
         (tester) async {
