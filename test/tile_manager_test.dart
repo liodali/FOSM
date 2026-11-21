@@ -1706,6 +1706,42 @@ void main() {
       manager.dispose();
     });
 
+    testWidgets('the foreground lane runs exactly visibleLoads jobs at once',
+        (tester) async {
+      Future<int> foregroundInFlight({int? visibleLoads}) async {
+        final started = <String>[];
+        Future<Uint8List> fetcher(int z, int x, int y) {
+          started.add('$z/$x/$y');
+          return Completer<Uint8List>().future;
+        }
+
+        final manager = TileManager.init(
+          width: 1024,
+          height: 768,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 4,
+          fetcher: fetcher,
+          tilePadding: 0,
+          preloadAdjacentZoom: false,
+          visibleLoads: visibleLoads,
+        );
+        addTearDown(manager.dispose);
+        manager.calculate();
+        expect(manager.missingVisibleTileCount, greaterThan(12),
+            reason: 'the viewport must need more tiles than the widest lane');
+        final expected = visibleLoads ?? TileManager.maxConcurrentVisibleLoads;
+        await _runUntil(tester, () => started.length >= expected);
+        // Held fetches never finish, so extra starts would show up here.
+        await _flushAsync(tester);
+        return started.length;
+      }
+
+      expect(await foregroundInFlight(), TileManager.maxConcurrentVisibleLoads,
+          reason: 'the default lane is unchanged for raster and direct use');
+      expect(await foregroundInFlight(visibleLoads: 12), 12,
+          reason: 'a widened lane fetches more of the viewport at once');
+    });
+
     testWidgets('the background lane runs exactly backgroundLoads jobs at once',
         (tester) async {
       Future<int> backgroundInFlight({int? backgroundLoads}) async {

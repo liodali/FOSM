@@ -58,6 +58,26 @@ class TileManager with CacheTiles {
   /// queued requests instead of them leaving the queue immediately.
   static const int maxConcurrentVisibleLoads = 6;
 
+  /// `--dart-define=fosm.visibleLoads=N` overrides the vector foreground
+  /// lane width for measurement A/B runs (0 = shipped default).
+  static const int _visibleLoadsDefine =
+      int.fromEnvironment('fosm.visibleLoads');
+
+  /// Foreground lane width for vector payloads. A pinch exposes about 30 new
+  /// cells at once; a 6 wide lane fetches them in waves of one network round
+  /// trip each. iPhone 12 mini, cold gestures, three launches per arm, median
+  /// stale area at 6 / 12 / 24 wide: cold pinch 1979 / 1445 / 1335 ms at
+  /// 250 ms latency and 3765 / 2124 / 1620 ms at 600 ms; cold pinch and pan
+  /// 1634 / 1387 / 1384 ms and 2682 / 1892 / 1510 ms; cold fling mean time for
+  /// a new cell to turn sharp at 250 ms 1617 / 982 / 348 ms. UI p99 stayed at
+  /// or below 5.8 ms, no frame went over 16.7 ms and peak memory did not
+  /// change. 12 is chosen over 24 because the measurement link had unlimited
+  /// bandwidth: on a slow link a very wide lane delivers the whole viewport
+  /// at once instead of the centre first (not measured). Raster keeps
+  /// [maxConcurrentVisibleLoads].
+  static const int vectorVisibleLoads =
+      _visibleLoadsDefine > 0 ? _visibleLoadsDefine : 12;
+
   /// Maximum number of background preload jobs executing at once. Background
   /// work is bytes-only vector padding, adjacent-zoom preloading and (when
   /// enabled) speculative preparation; it only starts when no foreground
@@ -569,6 +589,11 @@ class TileManager with CacheTiles {
   /// [vectorBackgroundLoads].
   final int backgroundLoadLimit;
 
+  /// How many foreground (strict-viewport) loads may execute at once.
+  /// Defaults to [maxConcurrentVisibleLoads]; vector payloads pass
+  /// [vectorVisibleLoads].
+  final int visibleLoadLimit;
+
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
@@ -1018,6 +1043,7 @@ class TileManager with CacheTiles {
     this.maxConcurrentPrepared = defaultMaxConcurrentPrepared,
     this.byteOnlyPadding = false,
     int? backgroundLoads,
+    int? visibleLoads,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
@@ -1036,6 +1062,7 @@ class TileManager with CacheTiles {
         _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
         backgroundLoadLimit = backgroundLoads ?? maxConcurrentBackgroundLoads,
+        visibleLoadLimit = visibleLoads ?? maxConcurrentVisibleLoads,
         _urlBuilder = urlBuilder {
     validateRequestTimeout(requestTimeout);
     if (cameraZoom != null) {
@@ -2156,7 +2183,7 @@ class TileManager with CacheTiles {
             _activePresentEntries.any((entry) => _isForeground(entry.job));
     final backgroundBlocked =
         foregroundPending || _activeForegroundLoads > 0 || presentationPending;
-    var foregroundSlots = maxConcurrentVisibleLoads - _activeForegroundLoads;
+    var foregroundSlots = visibleLoadLimit - _activeForegroundLoads;
 
     final keep = <_LoadJob>[];
     for (final job in _loadQueue) {
