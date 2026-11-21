@@ -54,6 +54,20 @@ class VectorTileRuntime {
   final bool adaptiveResolution;
   bool motionActive = false;
 
+  /// Vector tile render resolution, in square pixels per side
+  /// (`--dart-define=fosm.vectorTileResolution`, default 512). Rendered
+  /// tile images are enlarged whenever the fractional camera zoom exceeds
+  /// the integer grid zoom (zoomScale up to √2 ≈ 1.41 between source
+  /// zooms); 512 px quarters that bitmap upscale versus the tile-space
+  /// identity — measured 2.3× edge energy at the max-enlargement pose on
+  /// macOS/Impeller (see
+  /// docs/performance/vector-render-improvement/zoom-softness-diagnostic.md)
+  /// — at 4× pixel memory and `toImage` cost. The static stays mutable for
+  /// tests and the benchmark harness.
+  static const int resolutionByDefine =
+      int.fromEnvironment('fosm.vectorTileResolution', defaultValue: 512);
+  static int resolution = resolutionByDefine;
+
   /// Span-log identity of this runtime instance (`r3`): runtime #3.
   ///
   /// Attempts are namespaced by runtime because tile coordinates alone
@@ -692,7 +706,9 @@ class VectorTileRuntime {
       // Use the time-budgeted renderer. It cooperatively yields between
       // layers, features, and large geometry batches on every platform.
       final imageSize =
-          adaptiveResolution && motionActive && !speculative ? 128 : 256;
+          adaptiveResolution && motionActive && !speculative
+              ? 128
+              : resolution;
       final picture = await VectorTrace.async(
           'record',
           () => VectorTileRenderer(loaded).renderAsync(

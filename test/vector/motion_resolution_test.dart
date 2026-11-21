@@ -67,7 +67,7 @@ void main() {
     runtime.motionActive = false;
     final full = await runtime.decoder(bytes, 10, 120, 60);
     addTearDown(full.dispose);
-    expect(full.width, 256);
+    expect(full.width, VectorTileRuntime.resolution);
     expect(runtime.parsedTileCount, 1);
 
     final control = VectorTileRuntime(
@@ -76,7 +76,7 @@ void main() {
     addTearDown(control.dispose);
     final unchanged = await control.decoder(bytes, 10, 120, 60);
     addTearDown(unchanged.dispose);
-    expect(unchanged.width, 256);
+    expect(unchanged.width, VectorTileRuntime.resolution);
   });
 
   test('preview painting fills its logical tile at integer and fractional zoom',
@@ -127,9 +127,9 @@ void main() {
           fetches++;
           return Uint8List.fromList([1]);
         },
-        decoder: (_, __, ___, ____) async {
-          final size = moving ? 128 : 256;
-          if (size == 256) {
+        decoder: (_, _, _, _) async {
+          final size = moving ? 128 : VectorTileRuntime.resolution;
+          if (!moving) {
             fullStarted++;
             await gate.future;
           }
@@ -155,8 +155,9 @@ void main() {
     await until(() =>
         manager.coverage().allSharp && manager.pendingPresentationCount == 0);
     expect(
-        manager.renderTiles
-            .every((t) => !t.isPreview && t.sourceTile!.width == 256),
+        manager.renderTiles.every((t) =>
+            !t.isPreview &&
+            t.sourceTile!.width == VectorTileRuntime.resolution),
         isTrue);
     expect(fetches, beforeFetches, reason: 'upgrades must reuse source bytes');
     expect(old.debugDisposed, isFalse,

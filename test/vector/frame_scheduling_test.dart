@@ -56,9 +56,14 @@ void main() {
         reason: 'jobs must share and exhaust the allowance across frames');
     expect(labelUpdates, 2, reason: 'labels must not starve behind base tiles');
     final bytes = await tester.runAsync(() => images![1].toByteData());
-    final pixels = Pixels(bytes!, 256);
-    expect(pixels.blue(40, 100), 255);
-    expect(pixels.red(220, 100), 255);
+    // Sample points are given in 256 px tile space; the decoder renders at
+    // VectorTileRuntime.resolution.
+    final size = images![1].width;
+    expect(size, VectorTileRuntime.resolution);
+    int at(int v) => v * size ~/ 256;
+    final pixels = Pixels(bytes!, size);
+    expect(pixels.blue(at(40), at(100)), 255);
+    expect(pixels.red(at(220), at(100)), 255);
     for (final image in images!) {
       image.dispose();
     }

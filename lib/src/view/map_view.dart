@@ -148,6 +148,11 @@ class _OldGridOverlay extends StatelessWidget {
   /// transform are cheaper and keep input responsive.
   final bool blurEnabled;
 
+  /// Vector payload: snapshot tile images may exceed the tile-space
+  /// resolution (`fosm.vectorTileResolution`) and must be drawn mapped
+  /// onto the cell rect (see [RenderCanvasOSM.fitImagesToTile]).
+  final bool fitImagesToTile;
+
   const _OldGridOverlay({
     required this.manager,
     required this.size,
@@ -159,6 +164,7 @@ class _OldGridOverlay extends StatelessWidget {
     required this.blurSigma,
     required this.interactionSnapshot,
     required this.blurEnabled,
+    required this.fitImagesToTile,
   });
 
   @override
@@ -177,6 +183,7 @@ class _OldGridOverlay extends StatelessWidget {
         tiles: snapshot.tiles,
         revision: snapshot.revision,
         tileScale: snapshot.tileScale,
+        fitImagesToTile: fitImagesToTile,
       ),
     );
 
@@ -2855,6 +2862,7 @@ class _MapViewState extends State<MapView>
             tileScale: manager.zoomScale,
             paintBackground: !fallbackActive,
             paintPlaceholders: !fallbackActive,
+            fitImagesToTile: _vectorRuntime != null,
           ),
         ),
       );
@@ -2916,6 +2924,7 @@ class _MapViewState extends State<MapView>
       tileScale: cap.tileScale,
       paintBackground: cap.background,
       paintPlaceholders: cap.placeholders,
+      fitImagesToTile: _vectorRuntime != null,
     );
     return Positioned(
       left: -tileW,
@@ -3017,6 +3026,7 @@ class _MapViewState extends State<MapView>
       tileScale: cap.tileScale,
       paintBackground: cap.background,
       paintPlaceholders: cap.placeholders,
+      fitImagesToTile: _vectorRuntime != null,
     );
     return Positioned(
       left: -cap.renderedTileWidth,
@@ -3192,6 +3202,7 @@ class _MapViewState extends State<MapView>
                             // blur; vector, web, direct manipulation and
                             // the diagnostic arm do not blur.
                             blurEnabled: transitionBlurSigma > 0.1,
+                            fitImagesToTile: _vectorRuntime != null,
                           ),
                         ],
                       ],

@@ -37,6 +37,14 @@ class RenderCanvasOSM extends CustomPainter {
   final bool paintBackground;
   final bool paintPlaceholders;
 
+  /// Vector payloads set this: their captured tile images may exceed the
+  /// 256 px tile-space resolution (the `fosm.vectorTileResolution` knob),
+  /// so non-preview images are drawn mapped onto the cell rect. Raster
+  /// imagery keeps the historical natural-size path (drawn at its own
+  /// pixel size × `tileScale`) regardless of the source resolution —
+  /// raster output is pixel-identical to the pre-knob painter.
+  final bool fitImagesToTile;
+
   RenderCanvasOSM({
     required this.horizontalTileCount,
     required this.verticalTileCount,
@@ -49,6 +57,7 @@ class RenderCanvasOSM extends CustomPainter {
     this.tileScale = 1,
     this.paintBackground = true,
     this.paintPlaceholders = true,
+    this.fitImagesToTile = false,
   });
 
   static const Color _checkerLight = Color(0xFFF5F5F5);
@@ -137,6 +146,17 @@ class RenderCanvasOSM extends CustomPainter {
                 ui.Rect.fromLTWH(tileCanvasX, tileCanvasY,
                     tileWidth * tileScale, tileHeight * tileScale),
                 _imagePaint);
+          } else if (fitImagesToTile && image.width != tileWidth) {
+            // Vector capture above the tile-space resolution: map natural
+            // pixels onto the cell rect uniformly (scale then draw at
+            // natural size, so a resolution knob never leaks past the
+            // cell). Raster imagery never enters this branch.
+            final drawScale = tileWidth * tileScale / image.width;
+            canvas.save();
+            canvas.translate(tileCanvasX, tileCanvasY);
+            canvas.scale(drawScale);
+            canvas.drawImage(image, Offset.zero, _imagePaint);
+            canvas.restore();
           } else if (tileScale == 1) {
             canvas.drawImage(
                 image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
@@ -175,7 +195,8 @@ class RenderCanvasOSM extends CustomPainter {
       oldDelegate.leftColumnTilesCanvasX != leftColumnTilesCanvasX ||
       oldDelegate.topRowTilesCanvasY != topRowTilesCanvasY ||
       oldDelegate.paintBackground != paintBackground ||
-      oldDelegate.paintPlaceholders != paintPlaceholders;
+      oldDelegate.paintPlaceholders != paintPlaceholders ||
+      oldDelegate.fitImagesToTile != fitImagesToTile;
 }
 
 /// Paints the vector label overlay (place names, road shields, POI icons)
