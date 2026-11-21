@@ -987,7 +987,7 @@ class TileManager with CacheTiles {
     TileDecoder? decoder,
     this.workScheduler,
     String Function(int z, int x, int y)? urlBuilder,
-    TileResourceKeyBuilder? resourceKeyBuilder,
+    this._resourceKeyBuilder,
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
@@ -1014,8 +1014,7 @@ class TileManager with CacheTiles {
         ),
         _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
-        _urlBuilder = urlBuilder,
-        _resourceKeyBuilder = resourceKeyBuilder {
+        _urlBuilder = urlBuilder {
     validateRequestTimeout(requestTimeout);
     if (cameraZoom != null) {
       _validateCameraZoom(cameraZoom);
@@ -2866,7 +2865,7 @@ class TileManager with CacheTiles {
     try {
       if (_httpIsolate.isReady && _urlBuilder != null) {
         // Use persistent HTTP isolate (native) — reuses TCP connections.
-        fetch = _httpIsolate.fetchUrl(_urlBuilder!(z, x, y),
+        fetch = _httpIsolate.fetchUrl(_urlBuilder(z, x, y),
             requestTimeout: requestTimeout);
       } else if (identical(_fetcher, osmTileFetcher)) {
         fetch = downloadTileBytes(tileUrl(z, x, y),
@@ -3243,7 +3242,7 @@ class TileManager with CacheTiles {
       // Never persist the raw URL: a query string can carry an API token.
       // A digest of the credential-free URL keeps the resource identity
       // public while still invalidating when scheme/host/path changes.
-      raw = _digestUrl(_urlBuilder!(z, x, y));
+      raw = _digestUrl(_urlBuilder(z, x, y));
     } else {
       // Opaque coordinate identity: wraps X so antimeridian duplicates share,
       // without encoding any URL.

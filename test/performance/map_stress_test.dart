@@ -4,7 +4,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/view/marker_cluster_engine.dart';
@@ -41,7 +41,7 @@ void main() {
       markers: markers,
       controller: controller,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     expect(builds, 20);
     expect(find.byType(_Probe), findsNWidgets(20));
@@ -70,7 +70,7 @@ void main() {
       zoom: 10,
       polylines: [MapPolyline(points: points, onTap: (value) => hit = value)],
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     await tester.tapAt(const Offset(400, 300));
     await tester.pump(const Duration(milliseconds: 350));
@@ -105,7 +105,7 @@ void main() {
       markers: markers,
       controller: controller,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     await tester.pump();
     final visibleAtStart = find.byType(_Probe).evaluate().length;
@@ -151,7 +151,7 @@ void main() {
       zoom: 14,
       locationController: locationController,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     var tick = 0;
     DateTime stamp = DateTime(2026, 1, 1);
@@ -196,7 +196,7 @@ void main() {
       markerClusterOptions: const MarkerClusterOptions(),
       controller: controller,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     await tester.pumpAndSettle();
     MarkerClusterEngine.debugComputations = 0;
@@ -329,7 +329,7 @@ void main() {
       polylines: polylines,
       onTap: (_) => bareMapTaps++,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     await tester.pump();
     expect(tester.takeException(), isNull);
@@ -411,6 +411,6 @@ class _LiveRouteHarnessState extends State<_LiveRouteHarness> {
         zoom: 10,
         polylines: polylines,
         showZoomControls: false,
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
       );
 }

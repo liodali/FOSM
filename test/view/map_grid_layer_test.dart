@@ -3,14 +3,13 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart' show RenderRepaintBoundary;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart'
     show lat2TileY, lon2TileX;
-import 'package:fosm/src/common/utils.dart' show tileHeight, tileWidth;
 import 'package:fosm/src/view/render.dart';
 
 /// Minimal valid 1×1 RGBA PNG — decodable by Flutter's image codec.

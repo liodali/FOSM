@@ -59,7 +59,7 @@ LoadedVectorStyle buildLoadedStyle({
           'text-field': ['get', 'class'],
           ...symbolLayout,
         },
-        if (symbolFilter != null) 'filter': symbolFilter,
+        'filter': ?symbolFilter,
       },
     ],
   }));

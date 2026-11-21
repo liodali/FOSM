@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart' show RenderProxyBox;
 import 'package:flutter/scheduler.dart';
 
@@ -344,7 +344,7 @@ class _MarkerLayerState extends State<MarkerLayer>
               entry: visibleEntries[i],
             ),
         ],
-        if (overlay != null) overlay,
+        ?overlay,
       ],
     );
   }

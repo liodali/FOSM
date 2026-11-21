@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/map_controller.dart';
@@ -77,8 +77,7 @@ class MapCameraChangeNotification extends MapNotification {
   double get fractionalZoom => _fractionalZoom ?? zoom.toDouble();
 
   const MapCameraChangeNotification(this.center, this.zoom,
-      {double? fractionalZoom})
-      : _fractionalZoom = fractionalZoom;
+      {this._fractionalZoom});
 }
 
 /// Dispatched when the zoom level changes.

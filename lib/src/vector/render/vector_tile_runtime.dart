@@ -847,7 +847,7 @@ class VectorTileRuntime {
     // shared parse is cancelled.
     unawaited(future.then<void>(
       (_) => _clearParseBookkeeping(coord),
-      onError: (Object _, StackTrace __) => _clearParseBookkeeping(coord),
+      onError: (Object _, StackTrace _) => _clearParseBookkeeping(coord),
     ));
     return future;
   }

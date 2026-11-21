@@ -123,7 +123,7 @@ void main() {
         adaptiveResolution: true,
         cacheNamespace: 'style',
         maxRenderedCacheBytes: 0,
-        fetcher: (_, __, ___) async {
+        fetcher: (_, _, _) async {
           fetches++;
           return Uint8List.fromList([1]);
         },
@@ -194,8 +194,8 @@ void main() {
         preloadAdjacentZoom: false,
         byteOnlyPadding: true,
         adaptiveResolution: true,
-        fetcher: (_, __, ___) async => Uint8List.fromList([1]),
-        decoder: (_, __, ___, ____) async {
+        fetcher: (_, _, _) async => Uint8List.fromList([1]),
+        decoder: (_, _, _, _) async {
           final size = moving ? 128 : 256;
           if (size == 256) {
             started++;

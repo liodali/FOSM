@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
@@ -44,7 +44,7 @@ Future<void> _mount(WidgetTester tester, MapLocationController locations,
                   onTap: onTap,
                   onCameraChanged: onCamera,
                   onLocationFollowChanged: onFollow,
-                  tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+                  tileFetcher: (_, _, _) => Completer<Uint8List>().future,
                 )))));
 
 Future<void> _flush(WidgetTester tester) async {
@@ -159,7 +159,7 @@ void main() {
             controller: camera,
             locationController: locations,
             onCameraChanged: (point, _) => setState(() => center = point),
-            tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+            tileFetcher: (_, _, _) => Completer<Uint8List>().future,
           ),
         );
       },

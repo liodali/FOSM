@@ -4,7 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
     show kIsWeb, visibleForTesting;
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/physics.dart';
@@ -453,7 +453,9 @@ class _GridLayerCapture {
         (centerLng - live.centerTileLng) * live.renderedTileWidth;
     final ky = (1 - ratio) * (viewportHeight / 2 + renderedTileHeight) +
         (centerLat - live.centerTileLat) * live.renderedTileHeight;
-    return Matrix4.identity()..translate(kx, ky)..scale(ratio, ratio);
+    return Matrix4.identity()
+      ..translateByDouble(kx, ky, 0, 1)
+      ..scaleByDouble(ratio, ratio, ratio, 1);
   }
 }
 

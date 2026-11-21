@@ -1,6 +1,6 @@
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/common/utils.dart';

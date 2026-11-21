@@ -95,8 +95,8 @@ void main() {
       zoom: 4,
       tilePadding: 0,
       preloadAdjacentZoom: false,
-      fetcher: (_, __, ___) async => png!,
-      decoder: (bytes, _, __, ___) {
+      fetcher: (_, _, _) async => png!,
+      decoder: (bytes, _, _, _) {
         decoded++;
         return Tile.decodeImage(bytes);
       },

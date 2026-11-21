@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/map_polygon.dart';
 import 'package:fosm/src/api/tile_manager.dart';

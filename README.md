@@ -32,6 +32,12 @@ dependencies:
       url: https://github.com/yourusername/fosm.git
 ```
 
+> **Note:** FOSM builds its UI with [`material_ui`](https://pub.dev/packages/material_ui),
+> the official Material library for Flutter 3.47+. Import
+> `package:material_ui/material_ui.dart` in your app instead of the deprecated
+> `package:flutter/material.dart` so themes and scaffolds integrate with the
+> map's built-in controls.
+
 ## 🚀 Quick Start
 
 ### Initialize Map Cache

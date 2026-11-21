@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart' show Size;
+import 'package:material_ui/material_ui.dart' show Size;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/view/render.dart';

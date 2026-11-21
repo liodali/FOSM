@@ -3,7 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -19,7 +19,7 @@ TileManager _manager({LatLngBounds? bounds}) => TileManager.init(
     zoom: 10,
     cameraBounds: bounds,
     preloadAdjacentZoom: false,
-    fetcher: (_, __, ___) => Completer<Uint8List>().future);
+    fetcher: (_, _, _) => Completer<Uint8List>().future);
 
 Future<void> _map(
   WidgetTester tester,
@@ -45,7 +45,7 @@ Future<void> _map(
       polylines: lines,
       onTap: onTap,
       onFractionalZoomChanged: onZoom,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
 
 GestureDetector _gestures(WidgetTester tester) =>
@@ -342,7 +342,7 @@ void main() {
                     controller: controller,
                     enableFractionalZoom: true,
                     showZoomControls: false,
-                    tileFetcher: (_, __, ___) =>
+                    tileFetcher: (_, _, _) =>
                         Completer<Uint8List>().future)))));
     controller.setFractionalZoom(10.3, animate: false);
     expect(camera!.zoom, 10);
@@ -369,7 +369,7 @@ void main() {
         controller: controller,
         onZoomChanged: (value) => update(() => integer = value),
         onFractionalZoomChanged: (value) => update(() => exact = value),
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
       ),
     ))));
     await tester.tap(find.byIcon(Icons.add));

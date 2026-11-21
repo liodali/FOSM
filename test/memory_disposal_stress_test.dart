@@ -102,7 +102,7 @@ void main() {
       zoom: 3,
       tilePadding: 0,
       preloadAdjacentZoom: false,
-      fetcher: (_, __, ___) async => png!,
+      fetcher: (_, _, _) async => png!,
       decoder: decoder,
     );
     manager.calculate();
@@ -208,7 +208,7 @@ void main() {
         () => VectorTileRuntime.debugMaxConcurrentDecodesOverride = null);
 
     final gate = Completer<void>();
-    runtime.debugOnDecodeStarted = (_, __, ___) => gate.future;
+    runtime.debugOnDecodeStarted = (_, _, _) => gate.future;
 
     final held = runtime.decoder(buildDenseLabelTile(), 12, 3, 2);
     final waiters = [

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/api/tile_manager.dart';
@@ -147,7 +147,7 @@ void main() {
         controller: controller,
         markerClusterOptions: clustered ? const MarkerClusterOptions() : null,
         showZoomControls: false,
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
       ))));
       final before = tester.state(find
           .byWidgetPredicate((w) => w is _StatefulMarkerProbe && w.id == 'B'));
@@ -180,7 +180,7 @@ void main() {
       markers: markers,
       markerClusterOptions: const MarkerClusterOptions(maxZoom: 0),
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     expect(find.byType(_StatefulMarkerProbe), findsNWidgets(2));
     expect(tester.takeException(), isNull);
