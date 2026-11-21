@@ -699,6 +699,30 @@ class MapView extends StatefulWidget {
       bool.fromEnvironment('fosm.gridRetainedScale', defaultValue: true);
   static bool gridRetainedScaleEnabled = gridRetainedScaleByDefine;
 
+  /// Vector payload rendered-image budget, used when the app leaves
+  /// [maxRenderedCacheBytes] unset. Validated in the macOS resolution A/B
+  /// (docs/performance/vector-render-improvement/zoom-softness-diagnostic.md):
+  /// at 512 px vector tiles the 50 MB raster default pinned at its cap
+  /// mid-gesture — sharp coverage 1.0 → 0.73, raster p95 → 17 ms — while
+  /// 150 MB held a full warm motion footprint with zero over-budget
+  /// frames (peak 123 MB observed at a 720×540 viewport).
+  static const int vectorRenderedCacheDefaultBytes = 150 * 1024 * 1024;
+
+  /// Resolves the rendered-cache budget for a payload: an explicit
+  /// [maxRenderedCacheBytes] always wins; otherwise vector payloads get
+  /// [vectorRenderedCacheDefaultBytes] (their tiles render at 512 px and
+  /// quadruple the per-tile bytes) and raster payloads keep the shipped
+  /// [RenderedTileCache.defaultMaxBytes].
+  @visibleForTesting
+  static int resolvedRenderedCacheBytes({
+    required bool vectorPayload,
+    int? maxRenderedCacheBytes,
+  }) =>
+      maxRenderedCacheBytes ??
+      (vectorPayload
+          ? vectorRenderedCacheDefaultBytes
+          : RenderedTileCache.defaultMaxBytes);
+
   /// Plan-13 attribution: why the retained grid layer recaptured since
   /// process start. One capture-identity change can match several
   /// reasons (e.g. a zoom switch changes both [GridLayerRecaptureStats.zoom]
@@ -821,7 +845,14 @@ class MapView extends StatefulWidget {
   /// Budget for estimated RGBA rendered-tile memory. The current grid and
   /// active zoom snapshot are protected and may temporarily exceed it.
   /// Unused images are evicted first. Zero retains only protected images.
-  final int maxRenderedCacheBytes;
+  ///
+  /// Null (default) resolves per payload via
+  /// [MapView.resolvedRenderedCacheBytes]: [MapView.vectorRenderedCacheDefaultBytes]
+  /// (150 MB) for vector payloads — 512 px tiles quadruple the per-tile
+  /// bytes, and the 50 MB raster default pins at its cap mid-gesture at
+  /// that resolution — and the shipped raster default (50 MB) for raster
+  /// payloads. An explicit value wins in both modes.
+  final int? maxRenderedCacheBytes;
 
   /// How long unused rendered tiles remain available for return pans/zooms,
   /// subject to [maxRenderedCacheBytes]. Defaults to 20 seconds.
@@ -882,13 +913,13 @@ class MapView extends StatefulWidget {
     this.animateZoom = true,
     this.zoomAnimationDuration = const Duration(milliseconds: 350),
     this.zoomAnimationStyle = ZoomAnimationStyle.scale,
-    this.maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
+    this.maxRenderedCacheBytes,
     this.renderedCacheRetention = RenderedTileCache.defaultRetention,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
     this.loadingBuilder,
     this.errorBuilder,
     this.onTileError,
-  })  : assert(maxRenderedCacheBytes >= 0),
+  })  : assert(maxRenderedCacheBytes == null || maxRenderedCacheBytes >= 0),
         assert(scaleBarMaxWidth > 0 && scaleBarMaxWidth < double.infinity),
         assert(fractionalZoom == null ||
             (fractionalZoom >= 0 && fractionalZoom <= 30)),
@@ -1321,7 +1352,10 @@ class _MapViewState extends State<MapView>
     if (widget.maxRenderedCacheBytes != oldWidget.maxRenderedCacheBytes ||
         widget.renderedCacheRetention != oldWidget.renderedCacheRetention) {
       _tileManager?.updateRenderedCachePolicy(
-        maxBytes: widget.maxRenderedCacheBytes,
+        maxBytes: MapView.resolvedRenderedCacheBytes(
+          vectorPayload: _vectorRuntime != null,
+          maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+        ),
         retention: widget.renderedCacheRetention,
       );
     }
@@ -1616,7 +1650,10 @@ class _MapViewState extends State<MapView>
           : 12,
       speculativeDecoder: runtime?.speculativeDecoder,
       cameraBounds: widget.cameraBounds,
-      maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+      maxRenderedCacheBytes: MapView.resolvedRenderedCacheBytes(
+        vectorPayload: runtime != null,
+        maxRenderedCacheBytes: widget.maxRenderedCacheBytes,
+      ),
       renderedCacheRetention: widget.renderedCacheRetention,
       requestTimeout: widget.requestTimeout,
     );
