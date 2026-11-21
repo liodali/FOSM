@@ -3,7 +3,7 @@
 A high-performance Flutter map library with native raster and vector tile rendering, featuring OpenFreeMap integration, persistent background isolates, and advanced performance optimizations.
 
 ![Flutter Version](https://img.shields.io/badge/flutter-%3E%3D3.47.0-blue.svg)
-![Dart Version](https://img.shields.io/badge/dart-%3E%3D3.0.0-blue.svg)
+![Dart Version](https://img.shields.io/badge/dart-%3E%3D3.13.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 ## ✨ Features
