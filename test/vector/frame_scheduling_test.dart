@@ -64,7 +64,7 @@ void main() {
     final pixels = Pixels(bytes!, size);
     expect(pixels.blue(at(40), at(100)), 255);
     expect(pixels.red(at(220), at(100)), 255);
-    for (final image in images!) {
+    for (final image in images) {
       image.dispose();
     }
   });
