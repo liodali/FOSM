@@ -70,9 +70,23 @@ class TileManager with CacheTiles {
   /// wide (the browser's per-host connection limit): idle-time adjacent-zoom
   /// preloads at 2 wide filled too slowly to matter at realistic latency
   /// (400 ms RTT: no zoom-in gain; 6 wide: 1.68 s → ~0.5 s to 95 % sharp).
-  /// Native keeps 2 (not re-measured).
+  /// Native raster keeps 2; native vector uses [vectorBackgroundLoads].
   static const int _backgroundLoadsDefine =
       int.fromEnvironment('fosm.backgroundLoads');
+
+  /// Background lane width for vector payloads. Vector padding is bytes-only
+  /// and the adjacent-zoom preload and the prepared zoom window share this
+  /// lane, so a lane that is too narrow never finishes preparing the next
+  /// zoom level inside an idle pause once tiles take a network round trip.
+  /// iPhone 12 mini, one-level zoom after a 4 s idle, three launches per
+  /// arm, stale area: at 250 ms latency 2 wide 454 to 553 ms, 6 and 12 wide
+  /// 0 ms; at 600 ms 2 wide 880 to 917 ms, 6 wide 744 to 784 ms (prepared
+  /// window promoted 0), 12 wide 0 ms (promoted 11 to 12). The cold pinch and
+  /// cold fling (foreground work arriving while idle work is in flight)
+  /// stayed within noise at every width and no frame went over 16.7 ms.
+  /// Raster padding is foreground work and never needed this.
+  static const int vectorBackgroundLoads =
+      _backgroundLoadsDefine > 0 ? _backgroundLoadsDefine : 12;
 
   /// Test/debug hook: receives a compact trace line for every
   /// speculative admission decision, revocation and camera-generation
@@ -549,6 +563,12 @@ class TileManager with CacheTiles {
   /// demand.
   final bool byteOnlyPadding;
 
+  /// How many background jobs (bytes-only padding, adjacent-zoom preload,
+  /// speculative and prepared-window work) may execute at once. Defaults to
+  /// [maxConcurrentBackgroundLoads]; vector payloads pass
+  /// [vectorBackgroundLoads].
+  final int backgroundLoadLimit;
+
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
 
@@ -705,7 +725,7 @@ class TileManager with CacheTiles {
   int _activeForegroundLoads = 0;
 
   /// Background preload jobs currently executing. Bounded by
-  /// [maxConcurrentBackgroundLoads].
+  /// [backgroundLoadLimit].
   int _activeBackgroundLoads = 0;
 
   // ── Presentation stage (split from resource fetching) ───────────────
@@ -997,6 +1017,7 @@ class TileManager with CacheTiles {
     this.maxPreparedPerGeneration = defaultMaxPreparedPerGeneration,
     this.maxConcurrentPrepared = defaultMaxConcurrentPrepared,
     this.byteOnlyPadding = false,
+    int? backgroundLoads,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
@@ -1014,6 +1035,7 @@ class TileManager with CacheTiles {
         ),
         _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
+        backgroundLoadLimit = backgroundLoads ?? maxConcurrentBackgroundLoads,
         _urlBuilder = urlBuilder {
     validateRequestTimeout(requestTimeout);
     if (cameraZoom != null) {
@@ -2117,7 +2139,7 @@ class TileManager with CacheTiles {
   /// stay queued so a newer generation can take the next freed slot instead
   /// of sitting behind dozens of older requests. Background preloads only
   /// run when no foreground download/presentation is queued or active, and are bounded by
-  /// [maxConcurrentBackgroundLoads].
+  /// [backgroundLoadLimit].
   void _pumpLoadQueue() {
     if (_disposed) return;
     _queuePreviewUpgrades();
@@ -2148,7 +2170,7 @@ class TileManager with CacheTiles {
           keep.add(job);
         }
       } else if (backgroundBlocked ||
-          _activeBackgroundLoads >= maxConcurrentBackgroundLoads) {
+          _activeBackgroundLoads >= backgroundLoadLimit) {
         keep.add(job);
       } else {
         _queued.remove(job.key);

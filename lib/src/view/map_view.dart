@@ -739,6 +739,13 @@ class MapView extends StatefulWidget {
           ? vectorRenderedCacheDefaultBytes
           : RenderedTileCache.defaultMaxBytes);
 
+  /// Background lane width for a payload: vector payloads get
+  /// [TileManager.vectorBackgroundLoads]; raster returns null so the manager
+  /// keeps its default ([TileManager.maxConcurrentBackgroundLoads]).
+  @visibleForTesting
+  static int? resolvedBackgroundLoads({required bool vectorPayload}) =>
+      vectorPayload ? TileManager.vectorBackgroundLoads : null;
+
   /// Plan-13 attribution: why the retained grid layer recaptured since
   /// process start. One capture-identity change can match several
   /// reasons (e.g. a zoom switch changes both [GridLayerRecaptureStats.zoom]
@@ -1636,6 +1643,12 @@ class _MapViewState extends State<MapView>
       // on demand when it scrolls into view. Raster decodes are cheap and
       // keep decoding the padding ring for instant panning.
       byteOnlyPadding: runtime != null,
+      // Vector idle work (padding bytes, adjacent-zoom preload, prepared
+      // window) shares the background lane; it needs more than raster's 2
+      // slots to finish inside an idle pause once tiles take a network
+      // round trip. Raster keeps the default.
+      backgroundLoads:
+          MapView.resolvedBackgroundLoads(vectorPayload: runtime != null),
       // Plan-13 Phase E: the prepared zoom window ships enabled for the
       // product surface (`fosm.preparedZoomWindow=false` disables) — the
       // manager-level default stays off so direct manager consumers opt

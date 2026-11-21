@@ -1706,6 +1706,64 @@ void main() {
       manager.dispose();
     });
 
+    testWidgets('the background lane runs exactly backgroundLoads jobs at once',
+        (tester) async {
+      Future<int> backgroundInFlight({int? backgroundLoads}) async {
+        late TileManager manager;
+        final started = <String>[];
+        final backgroundStarted = <String>[];
+        final completers = <String, Completer<Uint8List>>{};
+
+        bool relevant(String key) {
+          final parts = key.split('/');
+          return manager.isTileRelevant(
+            int.parse(parts[0]),
+            int.parse(parts[1]),
+            int.parse(parts[2]),
+          );
+        }
+
+        Future<Uint8List> fetcher(int z, int x, int y) {
+          final key = '$z/$x/$y';
+          started.add(key);
+          if (!manager.isTileRelevant(z, x, y)) backgroundStarted.add(key);
+          final completer = Completer<Uint8List>();
+          completers[key] = completer;
+          return completer.future;
+        }
+
+        manager = TileManager.init(
+          width: 256,
+          height: 256,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 3,
+          fetcher: fetcher,
+          tilePadding: 2,
+          preloadAdjacentZoom: false,
+          byteOnlyPadding: true,
+          backgroundLoads: backgroundLoads,
+        );
+        addTearDown(manager.dispose);
+        manager.calculate();
+        for (final key in started.where(relevant).toList()) {
+          completers[key]!.complete(fakeTilePng);
+        }
+        final expected =
+            backgroundLoads ?? TileManager.maxConcurrentBackgroundLoads;
+        await _runUntil(tester, () => backgroundStarted.length >= expected);
+        // Background jobs never finish here, so extra starts would show up
+        // after the lane has had time to refill.
+        await _flushAsync(tester);
+        return backgroundStarted.length;
+      }
+
+      expect(
+          await backgroundInFlight(), TileManager.maxConcurrentBackgroundLoads,
+          reason: 'the default lane is unchanged for raster and direct use');
+      expect(await backgroundInFlight(backgroundLoads: 6), 6,
+          reason: 'a widened lane overlaps more idle fetches at once');
+    });
+
     testWidgets('a camera move starts no new background while visible waits',
         (tester) async {
       late TileManager manager;
