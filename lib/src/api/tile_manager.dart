@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
@@ -10,12 +9,14 @@ import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
+import 'package:fosm/src/common/url_digest.dart';
 import 'package:fosm/src/common/tile_coverage.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/lat_lng_bounds.dart';
+import 'package:fosm/src/api/lane_budget.dart';
 import 'package:fosm/src/isolate/http_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/http_isolate_native.dart'
     if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart';
@@ -62,6 +63,12 @@ class TileManager with CacheTiles {
   /// lane width for measurement A/B runs (0 = shipped default).
   static const int _visibleLoadsDefine =
       int.fromEnvironment('fosm.visibleLoads');
+
+  /// Whether a `fosm.visibleLoads` or `fosm.backgroundLoads` define pins the
+  /// lane widths. A pinned run measures that exact width, so the adaptive
+  /// [LaneBudget] stays off for it.
+  static bool get laneWidthPinned =>
+      _visibleLoadsDefine > 0 || _backgroundLoadsDefine > 0;
 
   /// Foreground lane width for vector payloads. A pinch exposes about 30 new
   /// cells at once; a 6 wide lane fetches them in waves of one network round
@@ -586,13 +593,38 @@ class TileManager with CacheTiles {
   /// How many background jobs (bytes-only padding, adjacent-zoom preload,
   /// speculative and prepared-window work) may execute at once. Defaults to
   /// [maxConcurrentBackgroundLoads]; vector payloads pass
-  /// [vectorBackgroundLoads].
-  final int backgroundLoadLimit;
+  /// [vectorBackgroundLoads]. With a [laneBudget] the width follows the link.
+  int get backgroundLoadLimit =>
+      laneBudget?.backgroundLimit(activeForeground: _activeForegroundLoads) ??
+      _fixedBackgroundLoads;
+  final int _fixedBackgroundLoads;
 
   /// How many foreground (strict-viewport) loads may execute at once.
   /// Defaults to [maxConcurrentVisibleLoads]; vector payloads pass
-  /// [vectorVisibleLoads].
-  final int visibleLoadLimit;
+  /// [vectorVisibleLoads]. With a [laneBudget] the width follows the link.
+  int get visibleLoadLimit =>
+      laneBudget?.foregroundLimit ?? _fixedVisibleLoads;
+  final int _fixedVisibleLoads;
+
+  /// Sizes both lanes from measured throughput and first-byte latency instead
+  /// of fixed constants (see [LaneBudget]). Null keeps the fixed widths.
+  /// [MapView] creates one for native vector payloads.
+  final LaneBudget? laneBudget;
+
+  /// Aborts requests the camera has moved away from when visible tiles are
+  /// waiting for a lane slot, so their slot and their share of the link go to
+  /// the viewport instead of finishing a download nobody wants. Only requests
+  /// whose every waiting job is stale are aborted, and only where the
+  /// transport can abort (the native HTTP worker and the Dio fetcher).
+  final bool cancelStaleLoads;
+
+  /// How long a request's tile must have been unwanted before it is aborted.
+  /// A pinch oscillates across zoom levels about every second and a half; a
+  /// request aborted on the way out is requested again on the way back, and
+  /// with no grace period nothing ever finishes (Galaxy A33, 8 Mbit/s, cold
+  /// pinch: 270 requests aborted for 14 completed). A tile that comes back
+  /// inside the grace period keeps its download.
+  final Duration cancelStaleGrace;
 
   /// Gesture-driven prefetch: while a zoom gesture moves, fetch the bytes of
   /// the next level in its direction (z+1 zooming in, z-1 zooming out) around
@@ -776,6 +808,26 @@ class TileManager with CacheTiles {
   /// [backgroundLoadLimit].
   int _activeBackgroundLoads = 0;
 
+  /// Lane slots held by resource-stage jobs, so a request the camera has left
+  /// can be found and aborted.
+  final Set<_LanePermit> _permits = {};
+
+  /// Re-runs the scheduler when the first unwanted request's grace period ends.
+  Timer? _staleTimer;
+
+  /// Abort handle of the network request behind each in-flight resource.
+  final Map<String, HttpFetchHandle> _resourceHandles = {};
+
+  /// Monotonic clock for fetch durations fed to [laneBudget]. One clock for the
+  /// whole process: the budget is shared between maps, so timestamps from
+  /// different managers must be on the same time base (a per-manager clock
+  /// mixed bases and turned a 1 MB/s link into a 14 MB/s estimate).
+  static final Stopwatch _fetchClock = Stopwatch()..start();
+
+  /// Current time on the fetch clock, in microseconds.
+  @visibleForTesting
+  static int get fetchClockMicros => _fetchClock.elapsedMicroseconds;
+
   // ── Presentation stage (split from resource fetching) ───────────────
   //
   // Resource jobs (disk/network) only acquire bytes and populate the byte
@@ -820,7 +872,9 @@ class TileManager with CacheTiles {
   final Map<String, _LoadJob> _jobsByKey = {};
 
   // ── HTTP isolate (persistent background isolate for all network I/O) ─
-  final HttpIsolate _httpIsolate = HttpIsolate();
+  /// Handed in by the caller when a worker was started earlier (with warm
+  /// connections); this manager owns and disposes it either way.
+  final HttpIsolate _httpIsolate;
 
   /// Builds a tile URL from coordinates. When set, network requests
   /// go through the HTTP isolate for TCP connection reuse. When null,
@@ -1067,6 +1121,9 @@ class TileManager with CacheTiles {
     this.byteOnlyPadding = false,
     int? backgroundLoads,
     int? visibleLoads,
+    this.laneBudget,
+    this.cancelStaleLoads = false,
+    this.cancelStaleGrace = const Duration(seconds: 1),
     this.gesturePrefetch = false,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
@@ -1079,14 +1136,16 @@ class TileManager with CacheTiles {
     int maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
     Duration renderedCacheRetention = RenderedTileCache.defaultRetention,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
-  })  : _memoryCache = RenderedTileCache(
+    HttpIsolate? httpIsolate,
+  })  : _httpIsolate = httpIsolate ?? HttpIsolate(),
+        _memoryCache = RenderedTileCache(
           maxBytes: maxRenderedCacheBytes,
           retention: renderedCacheRetention,
         ),
         _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
-        backgroundLoadLimit = backgroundLoads ?? maxConcurrentBackgroundLoads,
-        visibleLoadLimit = visibleLoads ?? maxConcurrentVisibleLoads,
+        _fixedBackgroundLoads = backgroundLoads ?? maxConcurrentBackgroundLoads,
+        _fixedVisibleLoads = visibleLoads ?? maxConcurrentVisibleLoads,
         _urlBuilder = urlBuilder {
     validateRequestTimeout(requestTimeout);
     if (cameraZoom != null) {
@@ -1121,6 +1180,10 @@ class TileManager with CacheTiles {
     _retryTimers.clear();
     _jobsByKey.clear();
     _resourceFetches.clear();
+    _permits.clear();
+    _resourceHandles.clear();
+    _staleTimer?.cancel();
+    _staleTimer = null;
     _resourceWrites.clear();
     _legacyDiskKeys.clear();
     _httpIsolate.dispose();
@@ -2306,7 +2369,10 @@ class TileManager with CacheTiles {
     // rebuilds are exactly the moments the foreground may have settled.
     _admitSpeculativeWork();
     _admitPreparedZoomWork();
-    if (_loadQueue.isEmpty) return;
+    if (_loadQueue.isEmpty) {
+      if (cancelStaleLoads) _cancelStaleForWire();
+      return;
+    }
     _loadQueue.sort(_compareJobs);
 
     final foregroundPending = _loadQueue.any(_isForeground);
@@ -2316,6 +2382,12 @@ class TileManager with CacheTiles {
     final backgroundBlocked =
         foregroundPending || _activeForegroundLoads > 0 || presentationPending;
     var foregroundSlots = visibleLoadLimit - _activeForegroundLoads;
+
+    // Visible tiles are waiting for a slot: hand the slots (and the link) of
+    // requests the camera has left back to them.
+    if (cancelStaleLoads && foregroundPending && foregroundSlots <= 0) {
+      _cancelStaleLoads(_loadQueue.where(_isForeground).length);
+    }
 
     final keep = <_LoadJob>[];
     for (final job in _loadQueue) {
@@ -2340,10 +2412,15 @@ class TileManager with CacheTiles {
     _loadQueue
       ..clear()
       ..addAll(keep);
+    // After the lanes are filled: what the link carries now includes the
+    // requests this pass just started.
+    if (cancelStaleLoads) _cancelStaleForWire();
   }
 
   Future<void> _runJob(_LoadJob job, {required bool foreground}) async {
     var presenting = false;
+    final permit = _LanePermit(job, foreground, _fetchClock.elapsedMicroseconds);
+    _permits.add(permit);
     try {
       if (_disposed) return;
       _inFlight.add(job.key);
@@ -2355,6 +2432,7 @@ class TileManager with CacheTiles {
       // Keep the key in flight while a presentation is outstanding so a
       // duplicate resource job is not started for the same slot.
       if (!presenting) _inFlight.remove(job.key);
+      _permits.remove(permit);
       if (foreground) {
         if (_activeForegroundLoads > 0) _activeForegroundLoads--;
       } else {
@@ -2362,6 +2440,98 @@ class TileManager with CacheTiles {
       }
       if (!_disposed) _pumpLoadQueue();
     }
+  }
+
+  /// Whether [error] is the scheduler aborting a request it no longer wants.
+  /// Such a job is dropped quietly: no failure record, no backoff retry, no
+  /// error callback. The tile is requested again by the next admission pass if
+  /// the camera comes back to it.
+  bool _isSchedulerCancel(Object error) =>
+      error is TileLoadException &&
+      error.kind == TileFailureKind.cancelled &&
+      !_disposed;
+
+  /// Whether the camera no longer wants what [job] is loading: its tile left
+  /// the render set and no speculative or prepared relevance holds it.
+  /// Adjacent-zoom loads are off-grid by design and never stale this way.
+  bool _isStaleInFlight(_LoadJob job) =>
+      job.jobClass != _JobClass.adjacentZoom &&
+      !_speculativeOffGridLive(job) &&
+      !_preparedOffGridLive(job) &&
+      _renderIndex(job.key) == -1;
+
+  /// Returns the link to the viewport: while visible tiles load, requests
+  /// nobody wants any more are aborted once the link carries more of them
+  /// than its bandwidth-delay width. Below that width an idle request costs
+  /// the visible ones nothing, so it is left to finish (the camera may come
+  /// back to it); above it every extra request takes its share of the wire.
+  /// Needs a measured width, so it never acts on fixed lanes or before the
+  /// first fetches have finished.
+  void _cancelStaleForWire() {
+    final budget = laneBudget;
+    if (budget == null || !budget.hasEstimate) return;
+    if (_activeForegroundLoads == 0 && !_loadQueue.any(_isForeground)) return;
+    final excess = _liveFetchCount() - budget.totalWidth;
+    if (excess > 0) _cancelStaleLoads(excess);
+  }
+
+  /// Network requests in flight that the scheduler has not already aborted.
+  int _liveFetchCount() {
+    final aborted = <String>{};
+    for (final permit in _permits) {
+      if (permit.cancelled) aborted.add(permit.job.resourceKey);
+    }
+    return _resourceHandles.length - aborted.length;
+  }
+
+  /// Aborts up to [wanted] network requests nobody wants any more, youngest
+  /// first (least downloaded, so least wasted). A request is only aborted when
+  /// every job waiting on its resource has been unwanted for [cancelStaleGrace]
+  /// (siblings and promoted preloads share one download, and a tile the camera
+  /// returns to inside the grace period keeps its progress).
+  void _cancelStaleLoads(int wanted) {
+    if (wanted <= 0 || _permits.isEmpty) return;
+    final now = _fetchClock.elapsedMicroseconds;
+    final graceUs = cancelStaleGrace.inMicroseconds;
+    int? nextDueUs;
+    final live = <String>{};
+    final stale = <_LanePermit>[];
+    for (final permit in _permits) {
+      final resource = permit.job.resourceKey;
+      if (permit.cancelled || !_resourceHandles.containsKey(resource)) continue;
+      if (!_isStaleInFlight(permit.job)) {
+        permit.staleSinceUs = null;
+        live.add(resource);
+        continue;
+      }
+      final dueUs = (permit.staleSinceUs ??= now) + graceUs;
+      if (now >= dueUs) {
+        stale.add(permit);
+      } else {
+        // Unwanted, but not for long enough: keeps its resource alive.
+        live.add(resource);
+        if (nextDueUs == null || dueUs < nextDueUs) nextDueUs = dueUs;
+      }
+    }
+    if (nextDueUs != null && _staleTimer == null) {
+      _staleTimer = Timer(Duration(microseconds: nextDueUs - now), () {
+        _staleTimer = null;
+        if (!_disposed) _pumpLoadQueue();
+      });
+    }
+    stale.sort((a, b) => b.startedUs.compareTo(a.startedUs));
+    final aborted = <String>{};
+    for (final permit in stale) {
+      if (aborted.length >= wanted) break;
+      final resource = permit.job.resourceKey;
+      if (live.contains(resource)) continue;
+      if (aborted.add(resource)) _resourceHandles[resource]?.cancel();
+    }
+    if (aborted.isEmpty) return;
+    for (final permit in stale) {
+      if (aborted.contains(permit.job.resourceKey)) permit.cancelled = true;
+    }
+    _trace('cancel-stale: ${aborted.length} of ${stale.length} stale');
   }
 
   /// Records a failure and schedules a retry after [failureBackoff] so a
@@ -2532,7 +2702,7 @@ class TileManager with CacheTiles {
     try {
       bytes = await _fetchResource(job);
     } catch (error) {
-      _markFailed(job, error);
+      if (!_isSchedulerCancel(error)) _markFailed(job, error);
       return false;
     }
     if (_disposed) return false;
@@ -2599,7 +2769,7 @@ class TileManager with CacheTiles {
       try {
         bytes = await _fetchResource(job);
       } catch (error) {
-        _markFailed(job, error);
+        if (!_isSchedulerCancel(error)) _markFailed(job, error);
         return false;
       }
       if (_disposed) return false;
@@ -3006,10 +3176,31 @@ class TileManager with CacheTiles {
     // the logical slots that await this resource.
     final completer = Completer<Uint8List>();
     _resourceFetches[resource] = completer.future;
-    VectorTrace.async('fetch', () => _fetchBytes(job.z, job.x, job.y),
-            tile: '${job.z}/${job.x}/${job.y}', source: resource)
+    final handle = HttpFetchHandle();
+    _resourceHandles[resource] = handle;
+    final budget = laneBudget;
+    final startedUs = _fetchClock.elapsedMicroseconds;
+    budget?.fetchStarted(startedUs);
+    if (debugSpeculativeTrace != null) {
+      _trace('fetch-start $resource ${job.jobClass.name} '
+          '${_traceWanted(job)} t=$startedUs');
+    }
+    Duration? firstByte;
+    VectorTrace.async(
+            'fetch',
+            () => _fetchBytes(job.z, job.x, job.y,
+                handle: handle, onFirstByte: (value) => firstByte = value),
+            tile: '${job.z}/${job.x}/${job.y}',
+            source: resource)
         .then(
       (bytes) {
+        _resourceHandles.remove(resource);
+        budget?.fetchFinished(_fetchClock.elapsedMicroseconds,
+            bytes: bytes.length, firstByteUs: firstByte?.inMicroseconds);
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-done $resource ${_traceWanted(job)} '
+              'bytes=${bytes.length} t=${_fetchClock.elapsedMicroseconds}');
+        }
         // Publish the bytes to the shared memory cache *before* clearing the
         // in-flight entry. A slot enqueued while the first logical decoder is
         // still running then reads these bytes instead of starting a
@@ -3019,12 +3210,34 @@ class TileManager with CacheTiles {
         if (!completer.isCompleted) completer.complete(bytes);
       },
       onError: (Object error, StackTrace stack) {
+        _resourceHandles.remove(resource);
+        budget?.fetchAbandoned();
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-end $resource ${_traceWanted(job)} '
+              '${_isSchedulerCancel(error) ? 'cancelled' : 'failed'} '
+              't=${_fetchClock.elapsedMicroseconds}');
+        }
         // Drop the in-flight entry so a retry can refetch.
         _resourceFetches.remove(resource);
         if (!completer.isCompleted) completer.completeError(error, stack);
       },
     );
     return completer.future;
+  }
+
+  /// Debug label for how much the camera wants [job]'s tile right now:
+  /// `visible` (strict viewport), `ring` (padding ring), `live` (speculative,
+  /// prepared or adjacent-zoom work that is deliberately off-grid) or `off`
+  /// (nobody wants it: the camera left).
+  String _traceWanted(_LoadJob job) {
+    if (_visibleKeys.contains(job.key)) return 'visible';
+    if (_renderIndex(job.key) != -1) return 'ring';
+    if (job.jobClass == _JobClass.adjacentZoom ||
+        _speculativeOffGridLive(job) ||
+        _preparedOffGridLive(job)) {
+      return 'live';
+    }
+    return 'off';
   }
 
   /// Converts a bytes-only preload descriptor into the foreground decode
@@ -3041,16 +3254,58 @@ class TileManager with CacheTiles {
         byteOnly: false,
       );
 
-  Future<Uint8List> _fetchBytes(int z, int x, int y) {
+  Future<Uint8List> _fetchThroughWorker(
+    String url,
+    int z,
+    int x,
+    int y,
+    HttpFetchHandle? handle,
+    void Function(Duration firstByte)? onFirstByte,
+  ) async {
+    if (!_httpIsolate.isReady) {
+      final waited = Stopwatch()..start();
+      try {
+        await _httpIsolate.spawn();
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-worker-wait ${waited.elapsedMilliseconds}ms');
+        }
+      } catch (_) {
+        // The worker failed to start: behave as if it never existed.
+        return _fetcher(z, x, y);
+      }
+    }
+    final result = await _httpIsolate.fetchUrlTimed(url,
+        requestTimeout: requestTimeout, handle: handle);
+    onFirstByte?.call(result.firstByte);
+    return result.bytes;
+  }
+
+  /// Starts one network request. [handle] aborts it where the transport can
+  /// (the HTTP worker and the Dio fetcher; a custom fetcher cannot).
+  /// [onFirstByte] receives the response-header latency where it is measured
+  /// (the HTTP worker only).
+  Future<Uint8List> _fetchBytes(
+    int z,
+    int x,
+    int y, {
+    HttpFetchHandle? handle,
+    void Function(Duration firstByte)? onFirstByte,
+  }) {
     Future<Uint8List> fetch;
     try {
-      if (_httpIsolate.isReady && _urlBuilder != null) {
-        // Use persistent HTTP isolate (native) — reuses TCP connections.
-        fetch = _httpIsolate.fetchUrl(_urlBuilder(z, x, y),
-            requestTimeout: requestTimeout);
+      if ((_httpIsolate.isReady || _httpIsolate.isStarting) &&
+          _urlBuilder != null) {
+        // Use persistent HTTP isolate (native) — reuses TCP connections. A
+        // request that arrives while it is still spawning waits for it: the
+        // first wave of a cold start would otherwise take the fallback fetcher
+        // (other connections, no first-byte timing for the lane budget).
+        fetch = _fetchThroughWorker(
+            _urlBuilder(z, x, y), z, x, y, handle, onFirstByte);
       } else if (identical(_fetcher, osmTileFetcher)) {
         fetch = downloadTileBytes(tileUrl(z, x, y),
-            requestTimeout: requestTimeout, requestSession: _networkCancel);
+            requestTimeout: requestTimeout,
+            requestSession: _networkCancel,
+            handle: handle);
       } else {
         fetch = _fetcher(z, x, y);
       }
@@ -3441,60 +3696,7 @@ class TileManager with CacheTiles {
     return ((x % n) + n) % n;
   }
 
-  /// Stable digest of the public URL identity.
-  ///
-  /// Content-affecting query parameters are retained in sorted order while
-  /// credentials and request-signing fields are removed. The digest therefore
-  /// distinguishes public variants such as `style=dark`/`style=light` without
-  /// persisting secrets or changing when a token rotates.
-  static String _digestUrl(String url) {
-    final uri = Uri.tryParse(url);
-    if (uri == null) return 'u${_fnv1a64(url)}';
-
-    final publicQuery = <String, List<String>>{};
-    final keys = uri.queryParametersAll.keys.toList()..sort();
-    for (final key in keys) {
-      if (_isCredentialQueryParameter(key)) continue;
-      publicQuery[key] = List<String>.of(uri.queryParametersAll[key]!)..sort();
-    }
-    final public = Uri(
-      scheme: uri.scheme,
-      host: uri.host,
-      port: uri.hasPort ? uri.port : null,
-      path: uri.path,
-      queryParameters: publicQuery.isEmpty ? null : publicQuery,
-    ).toString();
-    return 'u${_fnv1a64(public)}';
-  }
-
-  static bool _isCredentialQueryParameter(String name) {
-    final lower = name.toLowerCase();
-    return lower == 'access_token' ||
-        lower == 'access-token' ||
-        lower == 'token' ||
-        lower == 'api_key' ||
-        lower == 'api-key' ||
-        lower == 'apikey' ||
-        lower == 'key' ||
-        lower == 'signature' ||
-        lower == 'sig' ||
-        lower == 'expires' ||
-        lower.startsWith('x-amz-') ||
-        lower.startsWith('x-goog-');
-  }
-
-  /// FNV-1a 64-bit implemented with [BigInt] so the exact same 16-hex-digit
-  /// key is produced by native and JavaScript backends. This preserves all
-  /// cache keys written by the previous native integer implementation.
-  static String _fnv1a64(String value) {
-    var hash = BigInt.parse('cbf29ce484222325', radix: 16);
-    final prime = BigInt.parse('100000001b3', radix: 16);
-    final mask = BigInt.parse('ffffffffffffffff', radix: 16);
-    for (final byte in utf8.encode(value)) {
-      hash = ((hash ^ BigInt.from(byte)) * prime) & mask;
-    }
-    return hash.toRadixString(16).padLeft(16, '0');
-  }
+  static String _digestUrl(String url) => digestPublicUrl(url);
 
   static String tileKey(int z, int x, int y) => '$z/$x/$y';
 
@@ -3602,6 +3804,25 @@ class _LoadJob {
     required this.byteOnly,
     this.gesture = false,
   });
+}
+
+/// A lane slot held by a resource-stage job, so a request the camera has left
+/// can be found and aborted.
+class _LanePermit {
+  _LanePermit(this.job, this.foreground, this.startedUs);
+
+  final _LoadJob job;
+  final bool foreground;
+
+  /// When the job took its slot, in [TileManager._fetchClock] microseconds.
+  final int startedUs;
+
+  /// Set once its request was aborted by the scheduler.
+  bool cancelled = false;
+
+  /// When the scheduler first saw its tile unwanted (fetch clock microseconds),
+  /// or null while the tile is wanted.
+  int? staleSinceUs;
 }
 
 /// Where presentation bytes came from. Only matters for corruption

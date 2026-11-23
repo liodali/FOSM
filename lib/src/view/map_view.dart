@@ -18,6 +18,7 @@ import 'package:fosm/src/api/map_polygon.dart';
 import 'package:fosm/src/api/marker_cluster.dart';
 import 'package:fosm/src/api/marker_manager.dart';
 import 'package:fosm/src/api/tile.dart';
+import 'package:fosm/src/api/lane_budget.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/api/tile_source.dart';
 import 'package:fosm/src/api/map_load_state.dart';
@@ -27,6 +28,10 @@ import 'package:fosm/src/common/tile_coverage.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
 import 'package:fosm/src/common/memory_attribution.dart';
+import 'package:fosm/src/isolate/http_isolate.dart'
+    if (dart.library.io) 'package:fosm/src/isolate/http_isolate_native.dart'
+    if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart'
+    show HttpIsolate;
 import 'package:fosm/src/vector/render/vector_tile_runtime.dart';
 import 'package:fosm/src/vector/render/vector_trace.dart';
 import 'package:fosm/src/vector/style/style_loader.dart';
@@ -757,6 +762,44 @@ class MapView extends StatefulWidget {
   static bool resolvedGesturePrefetch({required bool vectorPayload}) =>
       vectorPayload && gesturePrefetchByDefine;
 
+  /// Sizes the vector load lanes from the measured link (see [LaneBudget]),
+  /// on by default (`--dart-define=fosm.adaptiveLanes=false` keeps the fixed
+  /// widths). Galaxy A33, 100 ms latency and a shared downlink: fixed 12 wide
+  /// lanes were 20 to 100 % slower to clear the stale area than 6 / 2 wide
+  /// ones at 2 and 8 Mbit/s, and faster on links with spare bandwidth.
+  static const bool adaptiveLanesByDefine =
+      bool.fromEnvironment('fosm.adaptiveLanes', defaultValue: true);
+
+  /// Aborts requests the camera has left when visible tiles wait for a lane
+  /// slot (`--dart-define=fosm.cancelStaleLoads=true` enables).
+  static const bool cancelStaleLoadsByDefine =
+      bool.fromEnvironment('fosm.cancelStaleLoads', defaultValue: false);
+
+  /// The lane budget for a payload: native vector payloads share one adaptive
+  /// budget unless a `fosm.visibleLoads` / `fosm.backgroundLoads` define pins the
+  /// widths; raster and web (the browser caps connections per host and has no
+  /// first-byte timing) keep fixed widths.
+  @visibleForTesting
+  static LaneBudget? resolvedLaneBudget({required bool vectorPayload}) {
+    final adaptive = vectorPayload &&
+        !kIsWeb &&
+        adaptiveLanesByDefine &&
+        !TileManager.laneWidthPinned;
+    return adaptive ? _sharedLaneBudget : null;
+  }
+
+  /// One budget for every vector map in the process: the link is shared, so
+  /// what one map measured is what the next one should start from. Galaxy A33
+  /// at 2 Mbit/s: a budget that started cold for each map ran a first wave of
+  /// 8 requests (about four seconds to complete) and the cold gestures ended
+  /// with 0.20 of the viewport sharp against 0.53 on the old 6 wide lanes.
+  static final LaneBudget _sharedLaneBudget = LaneBudget();
+
+  /// Whether a payload aborts stale requests: vector only.
+  @visibleForTesting
+  static bool resolvedCancelStaleLoads({required bool vectorPayload}) =>
+      vectorPayload && cancelStaleLoadsByDefine;
+
   /// Background lane width for a payload: vector payloads get
   /// [TileManager.vectorBackgroundLoads]; raster returns null so the manager
   /// keeps its default ([TileManager.maxConcurrentBackgroundLoads]).
@@ -1164,6 +1207,17 @@ class _MapViewState extends State<MapView>
   int _styleLoadGeneration = 0;
   MapRequestSession? _styleCancel;
 
+  /// HTTP worker started while the style documents download, with connections
+  /// to the tile host already open. The first tile manager adopts it, so its
+  /// first wave of tiles skips the TCP/TLS setup (see [HttpIsolate.warmUp]).
+  HttpIsolate? _warmHttp;
+
+  HttpIsolate? _takeWarmHttp() {
+    final warm = _warmHttp;
+    _warmHttp = null;
+    return warm;
+  }
+
   // ── Zoom animation ──────────────────────────────────────────────────
   late AnimationController _animController;
   Animation<double>? _scaleAnimation;
@@ -1321,9 +1375,17 @@ class _MapViewState extends State<MapView>
     final cancel = MapRequestSession();
     _styleCancel = cancel;
     setState(() => _vectorError = null);
+    _warmHttp?.dispose();
+    final warm = _warmHttp = HttpIsolate();
     try {
-      final loaded = await loadVectorStyle(style,
-          requestTimeout: widget.requestTimeout, requestSession: cancel);
+      final loaded = await loadVectorStyle(
+        style,
+        requestTimeout: widget.requestTimeout,
+        requestSession: cancel,
+        onSourceUrl: (url) {
+          if (identical(_warmHttp, warm)) unawaited(warm.warmUp(url));
+        },
+      );
       if (!mounted ||
           widget.vectorStyle != style ||
           generation != _styleLoadGeneration) {
@@ -1344,6 +1406,10 @@ class _MapViewState extends State<MapView>
       }
       _vectorError =
           TileLoadException.from(error, fallback: TileFailureKind.style);
+      if (identical(_warmHttp, warm)) {
+        warm.dispose();
+        _warmHttp = null;
+      }
     }
     if (mounted) setState(() {});
   }
@@ -1508,6 +1574,8 @@ class _MapViewState extends State<MapView>
     _animWaitTimer?.cancel();
     _clearZoomSnapshot();
     _tileManager?.dispose();
+    _warmHttp?.dispose();
+    _warmHttp = null;
     _vectorRuntime?.dispose();
     super.dispose();
   }
@@ -1661,6 +1729,7 @@ class _MapViewState extends State<MapView>
       decoder: runtime?.decoder,
       workScheduler: _tileWorkScheduler,
       urlBuilder: runtime?.urlBuilder,
+      httpIsolate: runtime == null ? null : _takeWarmHttp(),
       resourceKeyBuilder: runtime?.resourceKeyBuilder,
       cacheNamespace: runtime?.namespace ?? '',
       // Vector decodes are expensive (MVT parse + style passes + toImage),
@@ -1676,6 +1745,9 @@ class _MapViewState extends State<MapView>
           MapView.resolvedBackgroundLoads(vectorPayload: runtime != null),
       visibleLoads:
           MapView.resolvedVisibleLoads(vectorPayload: runtime != null),
+      laneBudget: MapView.resolvedLaneBudget(vectorPayload: runtime != null),
+      cancelStaleLoads:
+          MapView.resolvedCancelStaleLoads(vectorPayload: runtime != null),
       gesturePrefetch:
           MapView.resolvedGesturePrefetch(vectorPayload: runtime != null),
       // Plan-13 Phase E: the prepared zoom window ships enabled for the

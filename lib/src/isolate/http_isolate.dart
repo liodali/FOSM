@@ -3,6 +3,9 @@
 
 import 'dart:typed_data';
 import 'package:fosm/src/api/map_load_state.dart';
+import 'package:fosm/src/isolate/http_fetch.dart';
+
+export 'package:fosm/src/isolate/http_fetch.dart';
 
 /// Persistent HTTP isolate for tile downloads.
 ///
@@ -13,12 +16,27 @@ import 'package:fosm/src/api/map_load_state.dart';
 class HttpIsolate {
   bool get isReady => false;
 
+  bool get isStarting => false;
+
   Future<void> spawn() async {}
+
+  /// Opens connections ahead of the first request. No-op here.
+  Future<void> warmUp(String url, {int connections = 6}) async {}
 
   /// Fetches [url] and returns the raw bytes.
   Future<Uint8List> fetchUrl(
     String url, {
     Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+    HttpFetchHandle? handle,
+  }) {
+    throw UnsupportedError('HttpIsolate is not available on this platform');
+  }
+
+  /// Fetches [url] and reports the time to the first byte.
+  Future<HttpFetchResult> fetchUrlTimed(
+    String url, {
+    Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+    HttpFetchHandle? handle,
   }) {
     throw UnsupportedError('HttpIsolate is not available on this platform');
   }

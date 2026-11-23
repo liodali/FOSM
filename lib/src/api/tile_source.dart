@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:fosm/src/api/map_load_state.dart';
+import 'package:fosm/src/isolate/http_fetch.dart';
 
 /// Fetches raw image bytes for a single map tile.
 ///
@@ -102,16 +103,67 @@ Dio get _dio => _sharedDio ??= Dio(BaseOptions(
       },
     ));
 
+/// A downloaded document and how long its server says it stays fresh.
+class FetchedDocument {
+  const FetchedDocument(this.bytes, this.freshFor);
+
+  final Uint8List bytes;
+
+  /// Remaining freshness from `Cache-Control: max-age` less the `Age` a CDN
+  /// reports. Zero when the server asks for revalidation (`no-store`,
+  /// `no-cache`, `max-age=0`) or sends no usable directive.
+  final Duration freshFor;
+}
+
+/// Remaining freshness announced by response headers. Only `max-age` is
+/// honoured; every other case reads as not fresh so a document is revalidated
+/// exactly as before.
+@visibleForTesting
+Duration freshnessFromHeaders({String? cacheControl, String? age}) {
+  if (cacheControl == null) return Duration.zero;
+  int? maxAge;
+  for (final raw in cacheControl.split(',')) {
+    final directive = raw.trim().toLowerCase();
+    if (directive == 'no-store' || directive == 'no-cache') {
+      return Duration.zero;
+    }
+    if (directive.startsWith('max-age=')) {
+      maxAge = int.tryParse(directive.substring(8).replaceAll('"', ''));
+    }
+  }
+  if (maxAge == null || maxAge <= 0) return Duration.zero;
+  final elapsed = int.tryParse(age?.trim() ?? '') ?? 0;
+  final remaining = maxAge - (elapsed < 0 ? 0 : elapsed);
+  return remaining <= 0 ? Duration.zero : Duration(seconds: remaining);
+}
+
 /// Downloads bytes with a deadline covering connection, headers, and body.
 /// Throws [TileLoadException] rather than leaking transport-specific errors.
 Future<Uint8List> downloadTileBytes(
   String url, {
   Duration requestTimeout = TileLoadException.defaultRequestTimeout,
   MapRequestSession? requestSession,
+  HttpFetchHandle? handle,
+}) async =>
+    (await downloadDocument(
+      url,
+      requestTimeout: requestTimeout,
+      requestSession: requestSession,
+      handle: handle,
+    ))
+        .bytes;
+
+/// [downloadTileBytes] that also reports the response's freshness.
+Future<FetchedDocument> downloadDocument(
+  String url, {
+  Duration requestTimeout = TileLoadException.defaultRequestTimeout,
+  MapRequestSession? requestSession,
+  HttpFetchHandle? handle,
 }) async {
   validateRequestTimeout(requestTimeout);
   final cancel = CancelToken();
   requestSession?.add(cancel);
+  handle?.attach(() => cancel.cancel('Request no longer needed'));
   try {
     final response = await _dio
         .get<List<int>>(
@@ -124,7 +176,13 @@ Future<Uint8List> downloadTileBytes(
       throw const TileLoadException(
           TileFailureKind.timeout, 'Map request timed out');
     });
-    return Uint8List.fromList(response.data!);
+    return FetchedDocument(
+      Uint8List.fromList(response.data!),
+      freshnessFromHeaders(
+        cacheControl: response.headers.value('cache-control'),
+        age: response.headers.value('age'),
+      ),
+    );
   } on DioException catch (error) {
     final kind = switch (error.type) {
       DioExceptionType.connectionTimeout ||
@@ -147,6 +205,7 @@ Future<Uint8List> downloadTileBytes(
   } catch (error) {
     throw TileLoadException.from(error);
   } finally {
+    handle?.detach();
     requestSession?.remove(cancel);
   }
 }
