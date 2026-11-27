@@ -788,12 +788,20 @@ class MapView extends StatefulWidget {
     return adaptive ? _sharedLaneBudget : null;
   }
 
+  /// `--dart-define=fosm.initialLaneWidth=N` overrides the width the
+  /// adaptive budget runs at before the link has been measured (the cold
+  /// first wave) for measurement A/B runs (0 = shipped default 6).
+  static const int _initialLaneWidthDefine =
+      int.fromEnvironment('fosm.initialLaneWidth');
+
   /// One budget for every vector map in the process: the link is shared, so
   /// what one map measured is what the next one should start from. Galaxy A33
   /// at 2 Mbit/s: a budget that started cold for each map ran a first wave of
   /// 8 requests (about four seconds to complete) and the cold gestures ended
   /// with 0.20 of the viewport sharp against 0.53 on the old 6 wide lanes.
-  static final LaneBudget _sharedLaneBudget = LaneBudget();
+  static final LaneBudget _sharedLaneBudget = _initialLaneWidthDefine > 0
+      ? LaneBudget(initialWidth: _initialLaneWidthDefine)
+      : LaneBudget();
 
   /// Whether a payload aborts stale requests: vector only.
   @visibleForTesting
