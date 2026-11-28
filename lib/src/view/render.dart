@@ -1,6 +1,6 @@
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/common/utils.dart';
@@ -37,6 +37,14 @@ class RenderCanvasOSM extends CustomPainter {
   final bool paintBackground;
   final bool paintPlaceholders;
 
+  /// Vector payloads set this: their captured tile images may exceed the
+  /// 256 px tile-space resolution (the `fosm.vectorTileResolution` knob),
+  /// so non-preview images are drawn mapped onto the cell rect. Raster
+  /// imagery keeps the historical natural-size path (drawn at its own
+  /// pixel size × `tileScale`) regardless of the source resolution —
+  /// raster output is pixel-identical to the pre-knob painter.
+  final bool fitImagesToTile;
+
   RenderCanvasOSM({
     required this.horizontalTileCount,
     required this.verticalTileCount,
@@ -49,6 +57,7 @@ class RenderCanvasOSM extends CustomPainter {
     this.tileScale = 1,
     this.paintBackground = true,
     this.paintPlaceholders = true,
+    this.fitImagesToTile = false,
   });
 
   static const Color _checkerLight = Color(0xFFF5F5F5);
@@ -137,6 +146,17 @@ class RenderCanvasOSM extends CustomPainter {
                 ui.Rect.fromLTWH(tileCanvasX, tileCanvasY,
                     tileWidth * tileScale, tileHeight * tileScale),
                 _imagePaint);
+          } else if (fitImagesToTile && image.width != tileWidth) {
+            // Vector capture above the tile-space resolution: map natural
+            // pixels onto the cell rect uniformly (scale then draw at
+            // natural size, so a resolution knob never leaks past the
+            // cell). Raster imagery never enters this branch.
+            final drawScale = tileWidth * tileScale / image.width;
+            canvas.save();
+            canvas.translate(tileCanvasX, tileCanvasY);
+            canvas.scale(drawScale);
+            canvas.drawImage(image, Offset.zero, _imagePaint);
+            canvas.restore();
           } else if (tileScale == 1) {
             canvas.drawImage(
                 image, Offset(tileCanvasX, tileCanvasY), _imagePaint);
@@ -148,17 +168,13 @@ class RenderCanvasOSM extends CustomPainter {
             canvas.restore();
           }
         } else if (paintPlaceholders) {
-          // Reusable checkerboard placeholder — a single picture replay
-          // per missing tile instead of hundreds of rect draws. The
-          // picture is recorded at (0,0), so translate to the tile origin.
-          final picture =
-              checkerPicture((tileLngIndex + tileLatIndex) % 2 == 0);
-          canvas
-            ..save()
-            ..translate(tileCanvasX, tileCanvasY)
-            ..scale(tileScale)
-            ..drawPicture(picture)
-            ..restore();
+          drawPlaceholder(
+              canvas,
+              (tileLngIndex + tileLatIndex) % 2 == 0,
+              tileCanvasX,
+              tileCanvasY,
+              tileWidth * tileScale,
+              tileHeight * tileScale);
         }
       }
     }
@@ -168,6 +184,80 @@ class RenderCanvasOSM extends CustomPainter {
     }
   }
 
+  /// Draws the missing-tile checkerboard into the [width] x [height] cell at
+  /// ([x], [y]). Shared by the grid painter and the zoom-fallback painter so
+  /// both pay the same cost per missing cell.
+  ///
+  /// One pre-rasterized image draw per cell (`fosm.gridPlaceholderImage`, on
+  /// by default). On a device the picture replay below cost about 150 us per
+  /// tile against about 6 us for an image draw, and dominated the grid
+  /// repaint.
+  static void drawPlaceholder(ui.Canvas canvas, bool darkTopLeft, double x,
+      double y, double width, double height) {
+    final checker = placeholderImage ? _checkerImage(darkTopLeft) : null;
+    if (checker != null) {
+      canvas.drawImageRect(
+          checker,
+          ui.Rect.fromLTWH(0, 0, tileWidth.toDouble(), tileHeight.toDouble()),
+          ui.Rect.fromLTWH(x, y, width, height),
+          _checkerImagePaint);
+      return;
+    }
+    // Reusable checkerboard placeholder: a single picture replay per missing
+    // tile instead of hundreds of rect draws. The picture is recorded at
+    // (0,0), so translate to the cell origin.
+    canvas
+      ..save()
+      ..translate(x, y)
+      ..scale(width / tileWidth, height / tileHeight)
+      ..drawPicture(checkerPicture(darkTopLeft))
+      ..restore();
+  }
+
+  /// Draws missing-tile placeholders as one pre-rasterized image instead of
+  /// replaying the checkerboard picture. On by default: on an iPhone 12 mini
+  /// the replay cost about 150 us per tile against about 6 us for an image
+  /// draw and made up 95 % of the grid repaint (warm pinch UI p99 8.9 to
+  /// 3.8 ms, warm fling 4.5 to 2.8 ms). Edges differ from the replay by at
+  /// most 14/255 per channel at fractional offsets. Revert per build with
+  /// `--dart-define=fosm.gridPlaceholderImage=false`. Non-const so tests can
+  /// toggle it.
+  static bool placeholderImage =
+      const bool.fromEnvironment('fosm.gridPlaceholderImage',
+          defaultValue: true);
+
+  static final Paint _checkerImagePaint = Paint()
+    ..filterQuality = FilterQuality.none;
+  static ui.Image? _checkerImageEven;
+  static ui.Image? _checkerImageOdd;
+  static bool _checkerImageFailed = false;
+
+  /// The checkerboard rasterized once at tile size, or null when the
+  /// platform cannot snapshot synchronously (callers fall back to the
+  /// picture replay).
+  static ui.Image? _checkerImage(bool darkTopLeft) {
+    if (_checkerImageFailed) return null;
+    final cached = darkTopLeft ? _checkerImageEven : _checkerImageOdd;
+    if (cached != null) return cached;
+    try {
+      final image =
+          checkerPicture(darkTopLeft).toImageSync(tileWidth, tileHeight);
+      if (darkTopLeft) {
+        _checkerImageEven = image;
+      } else {
+        _checkerImageOdd = image;
+      }
+      return image;
+    } catch (_) {
+      _checkerImageFailed = true;
+      return null;
+    }
+  }
+
+  /// Whether the pre-rasterized placeholder is usable on this platform.
+  @visibleForTesting
+  static bool get debugCheckerImageAvailable => _checkerImage(true) != null;
+
   @override
   bool shouldRepaint(covariant RenderCanvasOSM oldDelegate) =>
       oldDelegate.revision != revision ||
@@ -175,7 +265,8 @@ class RenderCanvasOSM extends CustomPainter {
       oldDelegate.leftColumnTilesCanvasX != leftColumnTilesCanvasX ||
       oldDelegate.topRowTilesCanvasY != topRowTilesCanvasY ||
       oldDelegate.paintBackground != paintBackground ||
-      oldDelegate.paintPlaceholders != paintPlaceholders;
+      oldDelegate.paintPlaceholders != paintPlaceholders ||
+      oldDelegate.fitImagesToTile != fitImagesToTile;
 }
 
 /// Paints the vector label overlay (place names, road shields, POI icons)

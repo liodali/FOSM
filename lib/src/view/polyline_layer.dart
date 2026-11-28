@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:fosm/src/api/map_polyline.dart';
 import 'package:fosm/src/api/tile_manager.dart';
 import 'package:fosm/src/common/geometry_trace.dart';

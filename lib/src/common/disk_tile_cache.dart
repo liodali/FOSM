@@ -59,17 +59,38 @@ class TileDiskCache {
   TileDiskCache(
     this.box, {
     MapDiskCacheOptions options = const MapDiskCacheOptions(),
-    DateTime Function() now = DateTime.now,
-  })  : _options = options,
-        _now = now {
+    this._now = DateTime.now,
+  })  : _options = options {
     options.validate();
+    _lastMaintenanceMs = _lastMetadataFlushMs = _now().millisecondsSinceEpoch;
   }
+
+  /// Minimum spacing of the full expiry/consistency scan that runs on the
+  /// write path. A full pass touches every record, so doing it per write made
+  /// each tile store cost milliseconds that grow with the cache.
+  static const int _maintenanceIntervalMs = 60 * 1000;
+
+  /// Spacing of write-path metadata flushes, and how stale a persisted
+  /// last-access time must be before a read earns a rewrite. The record is
+  /// rewritten whole (payload included), so a flush for every read cost one
+  /// extra tile-sized write per tile read. In-memory recency stays exact;
+  /// only the value kept for the next launch is coarse.
+  static const int _lazyFlushIntervalMs = 30 * 1000;
+  static const int _touchGranularityMs = 60 * 60 * 1000;
 
   final Box box;
   final DateTime Function() _now;
   MapDiskCacheOptions _options;
+
+  /// Oldest-first by last access: reads and writes re-insert at the end, and
+  /// a full index pass re-sorts adopted records, so LRU eviction takes the
+  /// front without sorting.
   final LinkedHashMap<dynamic, _DiskEntry> _entries = LinkedHashMap();
   final Set<dynamic> _invalidKeys = {};
+  final Set<dynamic> _dirtyKeys = {};
+  bool _adoptedSinceSort = false;
+  int _lastMaintenanceMs = 0;
+  int _lastMetadataFlushMs = 0;
   Future<void> _pending = Future.value();
   int _bytes = 0;
   int _hits = 0;
@@ -79,7 +100,7 @@ class TileDiskCache {
 
   Future<T> _serialize<T>(Future<T> Function() action) {
     final result = _pending.then((_) => action());
-    _pending = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    _pending = result.then<void>((_) {}, onError: (Object _, StackTrace _) {});
     return result;
   }
 
@@ -120,8 +141,14 @@ class TileDiskCache {
         _invalidKeys.remove(key);
         _entries[key] = entry;
         _bytes += entry.size;
-        await _prune();
-        await _flushMetadata();
+        // Incremental: evict from the LRU front and only run the full scan
+        // now and then. Maintenance calls (stats, prune, configure) still do
+        // the complete pass and flush everything.
+        await _evictLeastRecentlyUsed();
+        if (now - _lastMaintenanceMs >= _maintenanceIntervalMs) {
+          await _prune();
+        }
+        await _flushMetadata(lazy: true);
       });
 
   /// Reads synchronously for the manager's byte-recovery path. Expired tiles
@@ -143,6 +170,7 @@ class TileDiskCache {
     entry.accessedAt = _now().millisecondsSinceEpoch;
     entry.accessOrder = ++_accessOrder;
     entry.dirty = true;
+    _dirtyKeys.add(key);
     _entries[key] = entry;
     return record;
   }
@@ -163,6 +191,7 @@ class TileDiskCache {
         await box.clear();
         _entries.clear();
         _invalidKeys.clear();
+        _dirtyKeys.clear();
         _bytes = 0;
         _hits = 0;
         _misses = 0;
@@ -199,6 +228,7 @@ class TileDiskCache {
 
   void _removeIndex(dynamic key) {
     final previous = _entries.remove(key);
+    _dirtyKeys.remove(key);
     if (previous != null) _bytes -= previous.size;
   }
 
@@ -238,13 +268,18 @@ class TileDiskCache {
           : now,
       ++_accessOrder,
       payload: record['image'],
+      // A record without a usable stamp has nothing persisted yet.
+      persistedAccessedAt:
+          accessedAt is int && accessedAt >= 0 ? accessedAt : -1,
     );
     entry.dirty = record['cachedAt'] != entry.storedAt ||
         record['lastAccessedAt'] != entry.accessedAt ||
         record['byteLength'] != bytes.length;
+    if (entry.dirty) _dirtyKeys.add(key);
     _invalidKeys.remove(key);
     _entries[key] = entry;
     _bytes += entry.size;
+    _adoptedSinceSort = true;
   }
 
   void _syncIndex() {
@@ -256,9 +291,47 @@ class TileDiskCache {
     for (final key in keys) {
       _indexKey(key);
     }
+    if (_adoptedSinceSort) _sortLeastRecentFirst();
+  }
+
+  /// Orders [_entries] oldest access first. Adopted records arrive in the
+  /// box's key order, which says nothing about recency.
+  void _sortLeastRecentFirst() {
+    _adoptedSinceSort = false;
+    final sorted = _entries.entries.toList()
+      ..sort((a, b) {
+        final time = a.value.accessedAt.compareTo(b.value.accessedAt);
+        return time != 0
+            ? time
+            : a.value.accessOrder.compareTo(b.value.accessOrder);
+      });
+    _entries
+      ..clear()
+      ..addEntries(sorted);
+  }
+
+  /// Drops the least recently used records until the payload bytes fit,
+  /// without scanning or sorting the index.
+  Future<int> _evictLeastRecentlyUsed() async {
+    if (_bytes <= _options.maxBytes) return 0;
+    final remove = <dynamic>[];
+    var remaining = _bytes;
+    for (final entry in _entries.entries) {
+      if (remaining <= _options.maxBytes) break;
+      remove.add(entry.key);
+      remaining -= entry.value.size;
+    }
+    if (remove.isEmpty) return 0;
+    await box.deleteAll(remove);
+    for (final key in remove) {
+      _removeIndex(key);
+    }
+    _evictions += remove.length;
+    return remove.length;
   }
 
   Future<int> _prune() async {
+    _lastMaintenanceMs = _now().millisecondsSinceEpoch;
     _syncIndex();
     final remove = <dynamic>{..._invalidKeys};
     var remainingBytes = _bytes;
@@ -269,14 +342,8 @@ class TileDiskCache {
       }
     }
     if (remainingBytes > _options.maxBytes) {
-      final lru = _entries.entries.toList()
-        ..sort((a, b) {
-          final time = a.value.accessedAt.compareTo(b.value.accessedAt);
-          return time != 0
-              ? time
-              : a.value.accessOrder.compareTo(b.value.accessOrder);
-        });
-      for (final entry in lru) {
+      // [_entries] is already oldest-first.
+      for (final entry in _entries.entries) {
         if (remainingBytes <= _options.maxBytes) break;
         if (remove.add(entry.key)) remainingBytes -= entry.value.size;
       }
@@ -292,22 +359,44 @@ class TileDiskCache {
     return remove.length;
   }
 
-  Future<void> _flushMetadata() async {
+  /// Writes last-access metadata back to the records. A forced flush (every
+  /// maintenance call) writes every changed record. The lazy flush on the
+  /// write path runs at most every [_lazyFlushIntervalMs] and only for
+  /// records whose persisted stamp is [_touchGranularityMs] behind, because
+  /// each rewrite carries the tile payload.
+  Future<void> _flushMetadata({bool lazy = false}) async {
+    if (_dirtyKeys.isEmpty) return;
+    final now = _now().millisecondsSinceEpoch;
+    if (lazy && now - _lastMetadataFlushMs < _lazyFlushIntervalMs) return;
     final records = <dynamic, Map>{};
-    final changed = <_DiskEntry, int>{};
-    for (final pair in _entries.entries) {
-      final entry = pair.value;
-      if (!entry.dirty) continue;
-      final record = box.get(pair.key);
+    final changed = <dynamic, (_DiskEntry, int)>{};
+    for (final key in _dirtyKeys.toList()) {
+      final entry = _entries[key];
+      if (entry == null || !entry.dirty) {
+        _dirtyKeys.remove(key);
+        continue;
+      }
+      if (lazy &&
+          entry.persistedAccessedAt >= 0 &&
+          entry.accessedAt - entry.persistedAccessedAt < _touchGranularityMs) {
+        continue;
+      }
+      final record = box.get(key);
       if (record is! Map) continue;
-      records[pair.key] = Map.of(record)..addAll(entry.metadata);
-      changed[entry] = entry.accessedAt;
+      records[key] = Map.of(record)..addAll(entry.metadata);
+      changed[key] = (entry, entry.accessedAt);
     }
+    _lastMetadataFlushMs = now;
     if (records.isEmpty) return;
     await box.putAll(records);
     for (final pair in changed.entries) {
+      final (entry, stamp) = pair.value;
       // A synchronous read can touch an entry during the Hive commit.
-      if (pair.key.accessedAt == pair.value) pair.key.dirty = false;
+      if (entry.accessedAt == stamp) {
+        entry.dirty = false;
+        entry.persistedAccessedAt = stamp;
+        _dirtyKeys.remove(pair.key);
+      }
     }
   }
 
@@ -327,12 +416,16 @@ class TileDiskCache {
 
 class _DiskEntry {
   _DiskEntry(this.size, this.storedAt, this.accessedAt, this.accessOrder,
-      {this.payload});
+      {this.payload, int? persistedAccessedAt})
+      : persistedAccessedAt = persistedAccessedAt ?? accessedAt;
   final int size;
   final int storedAt;
   int accessedAt;
   int accessOrder;
   final Object? payload;
+
+  /// The last-access stamp stored with the record, or -1 when it has none.
+  int persistedAccessedAt;
   bool dirty = false;
   Map<String, int> get metadata => {
         'cachedAt': storedAt,

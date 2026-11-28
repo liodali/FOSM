@@ -5,12 +5,18 @@ enum TileFailureKind { timeout, http, network, decode, style, cancelled }
 /// A transport or rendering failure. Built-in messages omit request URLs
 /// and credentials; applications may also supply their own [message].
 class TileLoadException implements Exception {
-  const TileLoadException(this.kind, this.message, {this.statusCode});
+  const TileLoadException(this.kind, this.message,
+      {this.statusCode, this.cause});
 
   static const Duration defaultRequestTimeout = Duration(seconds: 30);
   final TileFailureKind kind;
   final String message;
   final int? statusCode;
+
+  /// The transport error this wraps, when one exists. Never surfaced in the
+  /// built-in [message] (URLs and credentials stay out of app-facing text);
+  /// for logs and diagnostics.
+  final Object? cause;
 
   bool get isRetryable => switch (kind) {
         TileFailureKind.cancelled || TileFailureKind.style => false,
@@ -27,18 +33,23 @@ class TileLoadException implements Exception {
       return const TileLoadException(
           TileFailureKind.timeout, 'Map request timed out');
     }
+    // The built-in message stays URL-free, but the cause must survive for
+    // diagnostics: an unspecific 'network' failure is undebuggable without
+    // what actually threw.
     return TileLoadException(
         fallback,
         switch (fallback) {
           TileFailureKind.decode => 'Unable to render map tile',
           TileFailureKind.style => 'Unable to load map style',
           _ => 'Unable to download map data',
-        });
+        },
+        cause: error);
   }
 
   @override
   String toString() => 'TileLoadException(${kind.name}, $message'
-      '${statusCode == null ? '' : ', HTTP $statusCode'})';
+      '${statusCode == null ? '' : ', HTTP $statusCode'}'
+      '${cause == null ? '' : ' [${cause.runtimeType}: $cause]'})';
 }
 
 void validateRequestTimeout(Duration timeout) {

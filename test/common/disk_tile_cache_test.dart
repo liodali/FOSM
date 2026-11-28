@@ -227,6 +227,64 @@ void main() {
     expect(store.hasStoredTile('new'), isFalse);
   });
 
+  group('write path', () {
+    test('stores do not rewrite tiles that were only read', () async {
+      await cache.store('read', _record(3));
+      final stored = (box.get('read') as Map)['lastAccessedAt'];
+      now = now.add(const Duration(minutes: 10));
+      cache.read('read');
+      await cache.store('other', _record(3));
+      // Within the touch granularity the stamp stays as stored: a flush
+      // would rewrite the whole record, payload included.
+      expect((box.get('read') as Map)['lastAccessedAt'], stored);
+      // Maintenance still persists the exact stamp.
+      await cache.stats();
+      expect((box.get('read') as Map)['lastAccessedAt'],
+          now.millisecondsSinceEpoch);
+    });
+
+    test('a stale persisted stamp is refreshed by a later store', () async {
+      await cache.store('read', _record(3));
+      now = now.add(const Duration(hours: 2));
+      cache.read('read');
+      await cache.store('other', _record(3));
+      expect((box.get('read') as Map)['lastAccessedAt'],
+          now.millisecondsSinceEpoch);
+    });
+
+    test('eviction on store follows recency, not insertion order', () async {
+      await cache.configure(const MapDiskCacheOptions(maxBytes: 9));
+      await cache.store('a', _record(3));
+      now = now.add(const Duration(seconds: 1));
+      await cache.store('b', _record(3));
+      now = now.add(const Duration(seconds: 1));
+      await cache.store('c', _record(3));
+      now = now.add(const Duration(seconds: 1));
+      cache.read('a');
+      await cache.store('d', _record(3));
+      expect(cache.contains('a'), isTrue);
+      expect(cache.contains('b'), isFalse);
+      expect(cache.contains('c'), isTrue);
+      expect(cache.contains('d'), isTrue);
+      expect((await cache.stats()).sizeBytes, 9);
+    });
+
+    test('expired records leave on a store once the scan interval passed',
+        () async {
+      await cache
+          .configure(const MapDiskCacheOptions(maxAge: Duration(seconds: 5)));
+      await cache.store('old', _record(3));
+      now = now.add(const Duration(seconds: 10));
+      await cache.store('soon', _record(3));
+      // Inside the interval the full scan is skipped; reads still miss.
+      expect(box.containsKey('old'), isTrue);
+      expect(cache.contains('old'), isFalse);
+      now = now.add(const Duration(minutes: 2));
+      await cache.store('later', _record(3));
+      expect(box.containsKey('old'), isFalse);
+    });
+  });
+
   test('invalid policies fail without changing valid cache contents', () async {
     await cache.store('tile', _record(3));
     expect(

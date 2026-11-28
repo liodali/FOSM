@@ -1,7 +1,7 @@
 import 'package:flutter/foundation.dart';
 
-import 'marker.dart';
-import 'marker_index.dart';
+import 'package:fosm/src/api/marker.dart';
+import 'package:fosm/src/api/marker_index.dart';
 
 /// Owns the marker collection shown on a [MapView].
 ///

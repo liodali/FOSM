@@ -25,7 +25,7 @@ import 'package:fosm/src/vector/style/style_loader.dart';
 import 'package:fosm/src/vector/render/label_overlay.dart';
 import 'package:fosm/src/vector/render/sprite_atlas.dart';
 import 'package:fosm/src/vector/render/vector_tile_renderer.dart';
-import 'vector_trace.dart';
+import 'package:fosm/src/vector/render/vector_trace.dart';
 
 /// A parsed source tile, shared by every logical tile that over-zooms from
 /// it (e.g. four z15 tiles reading one z14 source tile parse it once).
@@ -53,6 +53,20 @@ class VectorTileRuntime {
   /// Experimental lower-resolution snapshots during camera motion.
   final bool adaptiveResolution;
   bool motionActive = false;
+
+  /// Vector tile render resolution, in square pixels per side
+  /// (`--dart-define=fosm.vectorTileResolution`, default 512). Rendered
+  /// tile images are enlarged whenever the fractional camera zoom exceeds
+  /// the integer grid zoom (zoomScale up to √2 ≈ 1.41 between source
+  /// zooms); 512 px quarters that bitmap upscale versus the tile-space
+  /// identity — measured 2.3× edge energy at the max-enlargement pose on
+  /// macOS/Impeller (see
+  /// docs/performance/vector-render-improvement/zoom-softness-diagnostic.md)
+  /// — at 4× pixel memory and `toImage` cost. The static stays mutable for
+  /// tests and the benchmark harness.
+  static const int resolutionByDefine =
+      int.fromEnvironment('fosm.vectorTileResolution', defaultValue: 512);
+  static int resolution = resolutionByDefine;
 
   /// Span-log identity of this runtime instance (`r3`): runtime #3.
   ///
@@ -692,7 +706,9 @@ class VectorTileRuntime {
       // Use the time-budgeted renderer. It cooperatively yields between
       // layers, features, and large geometry batches on every platform.
       final imageSize =
-          adaptiveResolution && motionActive && !speculative ? 128 : 256;
+          adaptiveResolution && motionActive && !speculative
+              ? 128
+              : resolution;
       final picture = await VectorTrace.async(
           'record',
           () => VectorTileRenderer(loaded).renderAsync(
@@ -847,7 +863,7 @@ class VectorTileRuntime {
     // shared parse is cancelled.
     unawaited(future.then<void>(
       (_) => _clearParseBookkeeping(coord),
-      onError: (Object _, StackTrace __) => _clearParseBookkeeping(coord),
+      onError: (Object _, StackTrace _) => _clearParseBookkeeping(coord),
     ));
     return future;
   }

@@ -94,6 +94,7 @@ Future<void> _flushAsync(WidgetTester tester, {int turns = 20}) async {
 }
 
 void main() {
+  _gesturePrefetchTests();
   group('TileManager grid construction', () {
     test('creates one tile per visible cell (no duplicates)', () {
       final manager = TileManager.init(
@@ -1205,7 +1206,7 @@ void main() {
         height: 600,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 4,
-        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        fetcher: (_, _, _) => Completer<Uint8List>().future,
         tilePadding: 0,
         preloadAdjacentZoom: false,
       );
@@ -1258,7 +1259,7 @@ void main() {
         height: 512,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 3,
-        fetcher: (_, __, ___) => Completer<Uint8List>().future,
+        fetcher: (_, _, _) => Completer<Uint8List>().future,
         tilePadding: 0,
         preloadAdjacentZoom: false,
       );
@@ -1706,6 +1707,100 @@ void main() {
       manager.dispose();
     });
 
+    testWidgets('the foreground lane runs exactly visibleLoads jobs at once',
+        (tester) async {
+      Future<int> foregroundInFlight({int? visibleLoads}) async {
+        final started = <String>[];
+        Future<Uint8List> fetcher(int z, int x, int y) {
+          started.add('$z/$x/$y');
+          return Completer<Uint8List>().future;
+        }
+
+        final manager = TileManager.init(
+          width: 1024,
+          height: 768,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 4,
+          fetcher: fetcher,
+          tilePadding: 0,
+          preloadAdjacentZoom: false,
+          visibleLoads: visibleLoads,
+        );
+        addTearDown(manager.dispose);
+        manager.calculate();
+        expect(manager.missingVisibleTileCount, greaterThan(12),
+            reason: 'the viewport must need more tiles than the widest lane');
+        final expected = visibleLoads ?? TileManager.maxConcurrentVisibleLoads;
+        await _runUntil(tester, () => started.length >= expected);
+        // Held fetches never finish, so extra starts would show up here.
+        await _flushAsync(tester);
+        return started.length;
+      }
+
+      expect(await foregroundInFlight(), TileManager.maxConcurrentVisibleLoads,
+          reason: 'the default lane is unchanged for raster and direct use');
+      expect(await foregroundInFlight(visibleLoads: 12), 12,
+          reason: 'a widened lane fetches more of the viewport at once');
+    });
+
+    testWidgets('the background lane runs exactly backgroundLoads jobs at once',
+        (tester) async {
+      Future<int> backgroundInFlight({int? backgroundLoads}) async {
+        late TileManager manager;
+        final started = <String>[];
+        final backgroundStarted = <String>[];
+        final completers = <String, Completer<Uint8List>>{};
+
+        bool relevant(String key) {
+          final parts = key.split('/');
+          return manager.isTileRelevant(
+            int.parse(parts[0]),
+            int.parse(parts[1]),
+            int.parse(parts[2]),
+          );
+        }
+
+        Future<Uint8List> fetcher(int z, int x, int y) {
+          final key = '$z/$x/$y';
+          started.add(key);
+          if (!manager.isTileRelevant(z, x, y)) backgroundStarted.add(key);
+          final completer = Completer<Uint8List>();
+          completers[key] = completer;
+          return completer.future;
+        }
+
+        manager = TileManager.init(
+          width: 256,
+          height: 256,
+          centerLatLng: const LatLng(latitude: 0, longitude: 0),
+          zoom: 3,
+          fetcher: fetcher,
+          tilePadding: 2,
+          preloadAdjacentZoom: false,
+          byteOnlyPadding: true,
+          backgroundLoads: backgroundLoads,
+        );
+        addTearDown(manager.dispose);
+        manager.calculate();
+        for (final key in started.where(relevant).toList()) {
+          completers[key]!.complete(fakeTilePng);
+        }
+        final expected =
+            backgroundLoads ?? TileManager.maxConcurrentBackgroundLoads;
+        await _runUntil(tester, () => backgroundStarted.length >= expected);
+        // Background jobs never finish here, so extra starts would show up
+        // after the lane has had time to refill.
+        await _flushAsync(tester);
+        return backgroundStarted.length;
+      }
+
+      expect(
+          await backgroundInFlight(), TileManager.maxConcurrentBackgroundLoads,
+          reason: 'the default lane is unchanged for raster and direct use');
+      expect(await backgroundInFlight(backgroundLoads: 6), 6,
+          reason: 'a widened lane overlaps more idle fetches at once');
+    });
+
     testWidgets('a camera move starts no new background while visible waits',
         (tester) async {
       late TileManager manager;
@@ -1805,7 +1900,7 @@ void main() {
         height: 512,
         centerLatLng: const LatLng(latitude: 0, longitude: 0),
         zoom: 4,
-        fetcher: (_, __, ___) async => fakeTilePng,
+        fetcher: (_, _, _) async => fakeTilePng,
         decoder: nestedDecoder,
         workScheduler: scheduler,
         // Padding decodes too: with scheduling ownership tied to this flag
@@ -3561,6 +3656,115 @@ class _SpecCounts {
     specInside++;
     return Tile.decodeImage(bytes);
   }
+}
+
+
+/// Gesture-driven prefetch: while a zoom gesture moves, the next level in its
+/// direction is fetched as bytes only, even while the foreground is busy.
+void _gesturePrefetchTests() {
+  group('gesture prefetch', () {
+    ({TileManager manager, List<String> started, List<String> decoded})
+        build({
+      required bool prefetch,
+      int backgroundLoads = 40,
+    }) {
+      final started = <String>[];
+      final decoded = <String>[];
+      final manager = TileManager.init(
+        width: 512,
+        height: 512,
+        centerLatLng: const LatLng(latitude: 0, longitude: 0),
+        zoom: 4,
+        // Held forever: the foreground stays busy for the whole test.
+        fetcher: (z, x, y) {
+          started.add('$z/$x/$y');
+          return Completer<Uint8List>().future;
+        },
+        decoder: (bytes, z, x, y) {
+          decoded.add('$z/$x/$y');
+          return Tile.decodeImage(bytes);
+        },
+        tilePadding: 1,
+        preloadAdjacentZoom: false,
+        byteOnlyPadding: true,
+        backgroundLoads: backgroundLoads,
+        gesturePrefetch: prefetch,
+      );
+      manager.calculate();
+      return (manager: manager, started: started, decoded: decoded);
+    }
+
+    testWidgets('zooming in fetches the next level while visible loads wait',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      expect(_containsZoom(t.started, 4), isTrue,
+          reason: 'visible work is in flight and never finishes');
+      expect(_containsZoom(t.started, 5), isFalse);
+
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      expect(_containsZoom(t.started, 3), isFalse,
+          reason: 'only the level in the gesture direction is fetched');
+    });
+
+    testWidgets('zooming out fetches the level below', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(3.9);
+      await _runUntil(tester, () => _containsZoom(t.started, 3));
+      expect(_containsZoom(t.started, 5), isFalse);
+    });
+
+    testWidgets('is off unless enabled', (tester) async {
+      final t = build(prefetch: false);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _flushAsync(tester);
+      expect(_containsZoom(t.started, 5), isFalse);
+    });
+
+    testWidgets('waits for a real direction before fetching', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.02);
+      await _flushAsync(tester);
+      expect(_containsZoom(t.started, 5), isFalse,
+          reason: 'a 0.02 level nudge is below the direction threshold');
+    });
+
+    testWidgets('a reversal switches to the other level', (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      t.manager.setCameraZoom(3.95);
+      await _runUntil(tester, () => _containsZoom(t.started, 3));
+    });
+
+    testWidgets('admits a bounded number of tiles per direction',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      for (final zoom in [4.1, 4.2, 4.3, 4.4]) {
+        t.manager.setCameraZoom(zoom);
+      }
+      await _flushAsync(tester);
+      final next = t.started.where((key) => key.startsWith('5/')).length;
+      expect(next, greaterThan(0));
+      expect(next, lessThanOrEqualTo(TileManager.maxGesturePrefetch));
+    });
+
+    testWidgets('fetches bytes only: nothing is decoded for the next level',
+        (tester) async {
+      final t = build(prefetch: true);
+      addTearDown(t.manager.dispose);
+      t.manager.setCameraZoom(4.1);
+      await _runUntil(tester, () => _containsZoom(t.started, 5));
+      await _flushAsync(tester);
+      expect(t.decoded.where((key) => key.startsWith('5/')), isEmpty);
+    });
+  });
 }
 
 bool _containsZoom(List<String> keys, int zoom) =>

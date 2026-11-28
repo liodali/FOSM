@@ -3,7 +3,7 @@
 A high-performance Flutter map library with native raster and vector tile rendering, featuring OpenFreeMap integration, persistent background isolates, and advanced performance optimizations.
 
 ![Flutter Version](https://img.shields.io/badge/flutter-%3E%3D3.47.0-blue.svg)
-![Dart Version](https://img.shields.io/badge/dart-%3E%3D3.0.0-blue.svg)
+![Dart Version](https://img.shields.io/badge/dart-%3E%3D3.13.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
 ## ✨ Features
@@ -31,6 +31,12 @@ dependencies:
     git:
       url: https://github.com/yourusername/fosm.git
 ```
+
+> **Note:** FOSM builds its UI with [`material_ui`](https://pub.dev/packages/material_ui),
+> the official Material library for Flutter 3.47+. Import
+> `package:material_ui/material_ui.dart` in your app instead of the deprecated
+> `package:flutter/material.dart` so themes and scaffolds integrate with the
+> map's built-in controls.
 
 ## 🚀 Quick Start
 

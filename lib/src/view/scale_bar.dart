@@ -1,10 +1,10 @@
 import 'dart:math' as math;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
-import '../common/scale_bar_metrics.dart';
+import 'package:fosm/src/common/scale_bar_metrics.dart';
 
-export '../common/scale_bar_metrics.dart' show ScaleBarUnit;
+export 'package:fosm/src/common/scale_bar_metrics.dart' show ScaleBarUnit;
 
 /// A distance ruler using approximate ground scale at [latitude].
 ///

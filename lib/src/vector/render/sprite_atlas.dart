@@ -1,9 +1,9 @@
 import 'dart:convert';
 import 'dart:ui' as ui;
 
-import '../../api/tile_source.dart' show downloadTileBytes, MapRequestSession;
-import '../../api/tile.dart' show Tile;
-import '../../api/map_load_state.dart';
+import 'package:fosm/src/api/tile_source.dart' show downloadTileBytes, MapRequestSession;
+import 'package:fosm/src/api/tile.dart' show Tile;
+import 'package:fosm/src/api/map_load_state.dart';
 
 /// A loaded style sprite sheet: one PNG atlas plus the JSON metadata that
 /// names each icon's rectangle.

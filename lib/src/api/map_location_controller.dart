@@ -2,7 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
-import 'map_location.dart';
+import 'package:fosm/src/api/map_location.dart';
 
 /// [waiting] and [following] express follow intent. Panning changes it to
 /// [paused]; [off] means following was never requested or explicitly stopped.

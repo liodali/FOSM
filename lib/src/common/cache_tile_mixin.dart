@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:fosm/src/api/tile.dart';
 import 'package:fosm/src/common/disk_tile_cache.dart';
+import 'package:fosm/src/common/url_digest.dart';
 import 'package:hive_ce/hive.dart';
 
 /// Persistent (Hive) tile cache.
@@ -72,6 +73,23 @@ mixin CacheTiles {
   }
 }
 
+/// A provider document (style JSON, TileJSON) read back from the persistent
+/// cache together with the freshness its server announced when it was stored.
+class CachedDocument {
+  const CachedDocument(this.bytes, this.fetchedAt, this.freshFor);
+
+  final Uint8List bytes;
+  final DateTime fetchedAt;
+  final Duration freshFor;
+
+  /// Whether [now] is still inside the announced freshness. A clock that ran
+  /// backwards since the fetch reads as stale.
+  bool isFresh(DateTime now) {
+    final age = now.difference(fetchedAt);
+    return !age.isNegative && age < freshFor;
+  }
+}
+
 /// Controls the persistent tile cache shared by all FOSM maps. Call [initMap]
 /// first to open it. Clearing leaves rendered/compressed memory caches intact;
 /// subsequent map activity can store tiles again.
@@ -108,6 +126,51 @@ class MapDiskCache {
       if (identical(_opening, future)) _opening = null;
     }
   }
+
+  /// Reads a cached provider document, or null when absent, expired, or the
+  /// cache is not open. Documents share the tile box, its byte budget and its
+  /// absolute lifetime; the key is a credential-free digest of [url].
+  static CachedDocument? readDocument(String url) {
+    final cache = _cache;
+    if (cache == null || !cache.box.isOpen) return null;
+    final record = cache.read(_documentKey(url));
+    if (record == null) return null;
+    final bytes = TileDiskCache.extractBytes(record['image']);
+    final fetchedAt = record['fetchedAt'];
+    final freshForMs = record['freshForMs'];
+    if (bytes == null || bytes.isEmpty || fetchedAt is! int) return null;
+    return CachedDocument(
+      bytes,
+      DateTime.fromMillisecondsSinceEpoch(fetchedAt),
+      Duration(
+        milliseconds: freshForMs is int && freshForMs > 0 ? freshForMs : 0,
+      ),
+    );
+  }
+
+  /// Persists a provider document with the [freshFor] its server announced.
+  static Future<void> storeDocument(
+    String url,
+    Uint8List bytes, {
+    required Duration freshFor,
+  }) async {
+    final cache = _cache;
+    if (cache == null || !cache.box.isOpen) return;
+    await cache.store(_documentKey(url), {
+      'image': bytes,
+      'fetchedAt': DateTime.now().millisecondsSinceEpoch,
+      'freshForMs': freshFor.inMilliseconds,
+    });
+  }
+
+  /// Drops a cached document, for example one that no longer parses.
+  static Future<void> deleteDocument(String url) async {
+    final cache = _cache;
+    if (cache == null || !cache.box.isOpen) return;
+    await cache.delete(_documentKey(url));
+  }
+
+  static String _documentKey(String url) => 'doc|${digestPublicUrl(url)}';
 
   /// Updates the global policy and immediately prunes excess/expired entries.
   /// Before initialization, saves the policy for the next [initMap] call.

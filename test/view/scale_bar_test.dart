@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fosm/fosm.dart';
 import 'package:fosm/src/common/scale_bar_metrics.dart';
@@ -44,7 +44,7 @@ Future<void> _map(WidgetTester tester, MapController controller,
         scaleBarUnit: unit,
         controller: controller,
         onTap: onTap,
-        tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+        tileFetcher: (_, _, _) => Completer<Uint8List>().future,
       )),
     ));
 
@@ -196,7 +196,7 @@ void main() {
       latLng: const LatLng(latitude: 0, longitude: 0),
       zoom: 10,
       showZoomControls: false,
-      tileFetcher: (_, __, ___) => Completer<Uint8List>().future,
+      tileFetcher: (_, _, _) => Completer<Uint8List>().future,
     ))));
     expect(find.byType(MapScaleBar), findsNothing);
     await tester.pumpWidget(_ruler());

@@ -254,9 +254,9 @@ class VectorTrace {
       {String? tile, String? attempt, String? source}) {
     if (tile == null && attempt == null && source == null) return null;
     return {
-      if (tile != null) 'tile': tile,
-      if (attempt != null) 'attempt': attempt,
-      if (source != null) 'source': source,
+      'tile': ?tile,
+      'attempt': ?attempt,
+      'source': ?source,
     };
   }
 }

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' show Size, Offset;
 import 'dart:ui' as ui;
@@ -10,12 +9,14 @@ import 'package:flutter/scheduler.dart';
 
 import 'package:fosm/src/common/cache_tile_mixin.dart';
 import 'package:fosm/src/common/rendered_tile_cache.dart';
+import 'package:fosm/src/common/url_digest.dart';
 import 'package:fosm/src/common/tile_coverage.dart';
 import 'package:fosm/src/common/tile_work_scheduler.dart';
 import 'package:fosm/src/common/osm_transformation_utilities.dart';
 import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/api/geo_point.dart';
 import 'package:fosm/src/api/lat_lng_bounds.dart';
+import 'package:fosm/src/api/lane_budget.dart';
 import 'package:fosm/src/isolate/http_isolate.dart'
     if (dart.library.io) 'package:fosm/src/isolate/http_isolate_native.dart'
     if (dart.library.js_interop) 'package:fosm/src/isolate/http_isolate.dart';
@@ -58,6 +59,32 @@ class TileManager with CacheTiles {
   /// queued requests instead of them leaving the queue immediately.
   static const int maxConcurrentVisibleLoads = 6;
 
+  /// `--dart-define=fosm.visibleLoads=N` overrides the vector foreground
+  /// lane width for measurement A/B runs (0 = shipped default).
+  static const int _visibleLoadsDefine =
+      int.fromEnvironment('fosm.visibleLoads');
+
+  /// Whether a `fosm.visibleLoads` or `fosm.backgroundLoads` define pins the
+  /// lane widths. A pinned run measures that exact width, so the adaptive
+  /// [LaneBudget] stays off for it.
+  static bool get laneWidthPinned =>
+      _visibleLoadsDefine > 0 || _backgroundLoadsDefine > 0;
+
+  /// Foreground lane width for vector payloads. A pinch exposes about 30 new
+  /// cells at once; a 6 wide lane fetches them in waves of one network round
+  /// trip each. iPhone 12 mini, cold gestures, three launches per arm, median
+  /// stale area at 6 / 12 / 24 wide: cold pinch 1979 / 1445 / 1335 ms at
+  /// 250 ms latency and 3765 / 2124 / 1620 ms at 600 ms; cold pinch and pan
+  /// 1634 / 1387 / 1384 ms and 2682 / 1892 / 1510 ms; cold fling mean time for
+  /// a new cell to turn sharp at 250 ms 1617 / 982 / 348 ms. UI p99 stayed at
+  /// or below 5.8 ms, no frame went over 16.7 ms and peak memory did not
+  /// change. 12 is chosen over 24 because the measurement link had unlimited
+  /// bandwidth: on a slow link a very wide lane delivers the whole viewport
+  /// at once instead of the centre first (not measured). Raster keeps
+  /// [maxConcurrentVisibleLoads].
+  static const int vectorVisibleLoads =
+      _visibleLoadsDefine > 0 ? _visibleLoadsDefine : 12;
+
   /// Maximum number of background preload jobs executing at once. Background
   /// work is bytes-only vector padding, adjacent-zoom preloading and (when
   /// enabled) speculative preparation; it only starts when no foreground
@@ -70,9 +97,23 @@ class TileManager with CacheTiles {
   /// wide (the browser's per-host connection limit): idle-time adjacent-zoom
   /// preloads at 2 wide filled too slowly to matter at realistic latency
   /// (400 ms RTT: no zoom-in gain; 6 wide: 1.68 s → ~0.5 s to 95 % sharp).
-  /// Native keeps 2 (not re-measured).
+  /// Native raster keeps 2; native vector uses [vectorBackgroundLoads].
   static const int _backgroundLoadsDefine =
       int.fromEnvironment('fosm.backgroundLoads');
+
+  /// Background lane width for vector payloads. Vector padding is bytes-only
+  /// and the adjacent-zoom preload and the prepared zoom window share this
+  /// lane, so a lane that is too narrow never finishes preparing the next
+  /// zoom level inside an idle pause once tiles take a network round trip.
+  /// iPhone 12 mini, one-level zoom after a 4 s idle, three launches per
+  /// arm, stale area: at 250 ms latency 2 wide 454 to 553 ms, 6 and 12 wide
+  /// 0 ms; at 600 ms 2 wide 880 to 917 ms, 6 wide 744 to 784 ms (prepared
+  /// window promoted 0), 12 wide 0 ms (promoted 11 to 12). The cold pinch and
+  /// cold fling (foreground work arriving while idle work is in flight)
+  /// stayed within noise at every width and no frame went over 16.7 ms.
+  /// Raster padding is foreground work and never needed this.
+  static const int vectorBackgroundLoads =
+      _backgroundLoadsDefine > 0 ? _backgroundLoadsDefine : 12;
 
   /// Test/debug hook: receives a compact trace line for every
   /// speculative admission decision, revocation and camera-generation
@@ -112,6 +153,30 @@ class TileManager with CacheTiles {
   /// A/B runs; the default keeps the shipped ±1.
   static const int preloadZoomDepthByDefine =
       int.fromEnvironment('fosm.preloadZoomDepth', defaultValue: 1);
+
+  /// Prepared zoom window (plan 13 Phase E, separately gated): predict
+  /// the next viewport from zoom direction and the gesture focal point,
+  /// then prepare full drawable tile images for the nearest zoom levels
+  /// first, expanding toward ±2 within budgets.
+  ///
+  /// Accepted on the phone A/B (plan13-phasee-ab/): zoom-step reveal
+  /// 102–332 ms → 0 ms every leg both pairs, minSharp 0.0 → 1.0, labels
+  /// 5–8× faster, 0 over-budget frames; bounded costs (peak rendered
+  /// 4–5 → 18 MB, +12–20 fetches/window).
+  ///
+  /// The manager-level default is off; [MapView] enables it for the
+  /// product surface via `fosm.preparedZoomWindow` (its own define,
+  /// default true — `=false` disables). The bytes-only idle preload
+  /// remains enabled alongside it.
+  static const bool preparedWindowByDefine =
+      bool.fromEnvironment('fosm.preparedZoomWindow', defaultValue: false);
+
+  /// Prepared window depth in zoom levels either side: 1 prepares only
+  /// the nearest levels; 2 extends the rolling window per the plan's
+  /// product direction (nearest levels complete before outer shells
+  /// admit). Values < 1 disable the window.
+  static const int preparedWindowDepthByDefine =
+      int.fromEnvironment('fosm.preparedWindowDepth', defaultValue: 1);
 
   /// Whether to speculatively prepare nearest-ring vector padding tiles
   /// during idle time: their bytes are already cached bytes-only, and a
@@ -354,6 +419,32 @@ class TileManager with CacheTiles {
       // asked for memory back and idle decodes would rebuild it.
       _speculativeSuspended = true;
     }
+    // Prepared zoom window: identical treatment — its queue entries and
+    // relevance keys drop so in-flight decodes abort at their next gate,
+    // and admission suspends until the camera generation changes (a
+    // cleared cache must not refill with offscreen speculation).
+    if (preparedZoomWindow && _preparedKeys.isNotEmpty) {
+      var cancelled = 0;
+      for (final key in _preparedKeys) {
+        if (!_hasRenderedImage(key)) cancelled++;
+      }
+      _loadQueue.removeWhere((job) {
+        if (job.jobClass != _JobClass.preparedZoom) return false;
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+        return true;
+      });
+      _presentQueue.removeWhere((entry) {
+        if (entry.job.jobClass != _JobClass.preparedZoom) return false;
+        _inFlight.remove(entry.job.key);
+        return true;
+      });
+      _preparedStats['cancelled'] = _preparedStats['cancelled']! + cancelled;
+      _preparedKeys.clear();
+      _preparedAdmitted = 0;
+      _preparedSuspended = true;
+      _trace('prepared: pressure-cancelled=$cancelled');
+    }
     _byteCache.clear();
     _byteCacheSize = 0;
     _memoryCache.flushUnused();
@@ -454,6 +545,32 @@ class TileManager with CacheTiles {
   /// [preloadZoomDepthByDefine].
   final int preloadZoomDepth;
 
+  /// Prepared zoom window enabled. See [preparedWindowByDefine].
+  final bool preparedZoomWindow;
+
+  /// Prepared window depth (levels either side). See
+  /// [preparedWindowDepthByDefine].
+  final int preparedWindowDepth;
+
+  /// Maximum prepared-window jobs outstanding (queued or in flight) at
+  /// once — the shipped default. Prepared jobs run the full pipeline, so
+  /// this bounds their CPU/network share of the background lane; the
+  /// per-generation budget bounds the total.
+  static const int defaultMaxConcurrentPrepared = 12;
+
+  /// Default per-generation prepared admissions (~256 KB rendered each,
+  /// so this also bounds the extra rendered-cache occupancy while the
+  /// camera rests).
+  static const int defaultMaxPreparedPerGeneration = 48;
+
+  /// Upper bound on prepared tiles admitted per camera generation. See
+  /// [defaultMaxPreparedPerGeneration].
+  final int maxPreparedPerGeneration;
+
+  /// Upper bound on prepared-window jobs executing at once. See
+  /// [defaultMaxConcurrentPrepared].
+  final int maxConcurrentPrepared;
+
   /// Optional hard bounding box the camera can never leave. `null`
   /// disables the constraint.
   LatLngBounds? cameraBounds;
@@ -473,8 +590,74 @@ class TileManager with CacheTiles {
   /// demand.
   final bool byteOnlyPadding;
 
+  /// How many background jobs (bytes-only padding, adjacent-zoom preload,
+  /// speculative and prepared-window work) may execute at once. Defaults to
+  /// [maxConcurrentBackgroundLoads]; vector payloads pass
+  /// [vectorBackgroundLoads]. With a [laneBudget] the width follows the link.
+  int get backgroundLoadLimit =>
+      laneBudget?.backgroundLimit(activeForeground: _activeForegroundLoads) ??
+      _fixedBackgroundLoads;
+  final int _fixedBackgroundLoads;
+
+  /// How many foreground (strict-viewport) loads may execute at once.
+  /// Defaults to [maxConcurrentVisibleLoads]; vector payloads pass
+  /// [vectorVisibleLoads]. With a [laneBudget] the width follows the link.
+  int get visibleLoadLimit =>
+      laneBudget?.foregroundLimit ?? _fixedVisibleLoads;
+  final int _fixedVisibleLoads;
+
+  /// Sizes both lanes from measured throughput and first-byte latency instead
+  /// of fixed constants (see [LaneBudget]). Null keeps the fixed widths.
+  /// [MapView] creates one for native vector payloads.
+  final LaneBudget? laneBudget;
+
+  /// Aborts requests the camera has moved away from when visible tiles are
+  /// waiting for a lane slot, so their slot and their share of the link go to
+  /// the viewport instead of finishing a download nobody wants. Only requests
+  /// whose every waiting job is stale are aborted, and only where the
+  /// transport can abort (the native HTTP worker and the Dio fetcher).
+  final bool cancelStaleLoads;
+
+  /// How long a request's tile must have been unwanted before it is aborted.
+  /// A pinch oscillates across zoom levels about every second and a half; a
+  /// request aborted on the way out is requested again on the way back, and
+  /// with no grace period nothing ever finishes (Galaxy A33, 8 Mbit/s, cold
+  /// pinch: 270 requests aborted for 14 completed). A tile that comes back
+  /// inside the grace period keeps its download.
+  final Duration cancelStaleGrace;
+
+  /// Gesture-driven prefetch: while a zoom gesture moves, fetch the bytes of
+  /// the next level in its direction (z+1 zooming in, z-1 zooming out) around
+  /// the predicted viewport, so the grid switch finds them cached. Bytes only:
+  /// nothing is parsed, recorded or rasterized during the gesture, so it adds
+  /// no UI work. Off by default at the manager level; [MapView] enables it
+  /// for vector payloads.
+  final bool gesturePrefetch;
+
+  /// Upper bound on prefetch tiles admitted per gesture direction.
+  static const int maxGesturePrefetch = 32;
+
+  /// Zoom distance (levels) a gesture must travel before its direction is
+  /// trusted, and the hysteresis against jitter reversals is twice this.
+  static const double gesturePrefetchMinZoomDelta = 0.05;
+
+  /// A pause this long between zoom updates starts a new gesture.
+  static const Duration _gestureIdleReset = Duration(milliseconds: 400);
+
+  int _gestureDirection = 0;
+  double _gestureExtremeZoom = 0;
+  int _gestureAdmitted = 0;
+  DateTime? _gestureLastAt;
+
   /// Debounce timer for adjacent zoom pre-loading.
   Timer? _preloadTimer;
+
+  /// Debounce timer for prepared-window re-admission after ANY camera
+  /// change (pans included): prediction inputs are invalidated by a pan,
+  /// and the idle tick re-predicts around the live center so a zoom
+  /// shortly after a pan finds its level already prepared. Zoom changes
+  /// admit instantly through the queue pump instead.
+  Timer? _preparedIdleTimer;
 
   /// The zoom level that was last pre-loaded for.
   int _lastPreloadedZoom = -1;
@@ -486,6 +669,81 @@ class TileManager with CacheTiles {
   /// True while a preload pass left candidates unqueued (cap or byte-cache
   /// share reached); a continuation timer re-runs it as the lane drains.
   bool _preloadPending = false;
+
+  // ── Prepared zoom window (plan 13 Phase E) ───────────────────────────
+
+  /// Admitted prepared-window keys at the current camera generation:
+  /// queued, in flight or imaged-but-unseen. Gates the queue relevance
+  /// check (prepared tiles live off-grid) and bounds double admission.
+  final Set<String> _preparedKeys = {};
+
+  /// Prepared tiles admitted this camera generation (budget counter).
+  int _preparedAdmitted = 0;
+
+  /// The camera generation the prepared budget belongs to.
+  int _preparedGeneration = -1;
+
+  /// Prediction inputs captured at the last camera change, in the
+  /// capture-time zoom's tile units: the gesture focal point, the camera
+  /// center and the captured fractional scale. The focal-preserving
+  /// projection maps the camera center to a target zoom z' as
+  /// `C' = [C + (F − C)·(1 − zoomScale)]·2^(z' − captureZoom)` — the
+  /// geographic point under the fingers stays at its screen offset.
+  /// Null until the first camera change; a pan invalidates the capture
+  /// (it moves the camera without re-capturing the focal relation), and
+  /// prediction then falls back to the live center.
+  double? _preparedFocalLng;
+  double? _preparedFocalLat;
+  double? _preparedCenterLng;
+  double? _preparedCenterLat;
+  double? _preparedZoomScale;
+
+  /// The integer zoom the prediction inputs were captured at. Growth
+  /// factors are computed against this base, never against the current
+  /// zoom — after a zoom change the capture lives in a different
+  /// coordinate system than `zoom + dz`.
+  int? _preparedCaptureZoom;
+
+  /// Guard while a zoom-change method performs its own center mutation:
+  /// the setters below invalidate a stale capture, but the zoom methods
+  /// immediately install a fresh one.
+  bool _suppressPredictionInvalidation = false;
+
+  /// A pan moves the camera without re-capturing the focal relation.
+  /// Drop the capture so prediction follows the live center instead of
+  /// continuing around a previous location.
+  void _invalidatePreparedCapture() {
+    if (_suppressPredictionInvalidation) return;
+    _preparedFocalLng = null;
+    _preparedFocalLat = null;
+    _preparedCenterLng = null;
+    _preparedCenterLat = null;
+    _preparedZoomScale = null;
+    _preparedCaptureZoom = null;
+  }
+
+  /// Sign of the most recent camera zoom change (+1 in, −1 out, 0 none):
+  /// orders which level sign prepares first within a shell.
+  int _zoomDirection = 0;
+
+  /// True after memory pressure cleared prepared work; admission stays
+  /// suspended until the camera generation changes (the system just asked
+  /// for memory back — idle preparation would rebuild it).
+  bool _preparedSuspended = false;
+
+  /// A/B counters: admitted (jobs enqueued), promoted (image became
+  /// visible through the cache-hit path), cancelled (dropped by a camera
+  /// change before completing).
+  final Map<String, int> _preparedStats = {
+    'admitted': 0,
+    'promoted': 0,
+    'cancelled': 0,
+  };
+
+  /// Prepared-window A/B counters (process-lifetime). Wasted preparation
+  /// rate ≈ (admitted − promoted) / admitted.
+  Map<String, int> get debugPreparedWindowStats =>
+      Map.unmodifiable(_preparedStats);
 
   // ── Strict viewport (Phase 1) ───────────────────────────────────────
   //
@@ -547,8 +805,28 @@ class TileManager with CacheTiles {
   int _activeForegroundLoads = 0;
 
   /// Background preload jobs currently executing. Bounded by
-  /// [maxConcurrentBackgroundLoads].
+  /// [backgroundLoadLimit].
   int _activeBackgroundLoads = 0;
+
+  /// Lane slots held by resource-stage jobs, so a request the camera has left
+  /// can be found and aborted.
+  final Set<_LanePermit> _permits = {};
+
+  /// Re-runs the scheduler when the first unwanted request's grace period ends.
+  Timer? _staleTimer;
+
+  /// Abort handle of the network request behind each in-flight resource.
+  final Map<String, HttpFetchHandle> _resourceHandles = {};
+
+  /// Monotonic clock for fetch durations fed to [laneBudget]. One clock for the
+  /// whole process: the budget is shared between maps, so timestamps from
+  /// different managers must be on the same time base (a per-manager clock
+  /// mixed bases and turned a 1 MB/s link into a 14 MB/s estimate).
+  static final Stopwatch _fetchClock = Stopwatch()..start();
+
+  /// Current time on the fetch clock, in microseconds.
+  @visibleForTesting
+  static int get fetchClockMicros => _fetchClock.elapsedMicroseconds;
 
   // ── Presentation stage (split from resource fetching) ───────────────
   //
@@ -594,7 +872,9 @@ class TileManager with CacheTiles {
   final Map<String, _LoadJob> _jobsByKey = {};
 
   // ── HTTP isolate (persistent background isolate for all network I/O) ─
-  final HttpIsolate _httpIsolate = HttpIsolate();
+  /// Handed in by the caller when a worker was started earlier (with warm
+  /// connections); this manager owns and disposes it either way.
+  final HttpIsolate _httpIsolate;
 
   /// Builds a tile URL from coordinates. When set, network requests
   /// go through the HTTP isolate for TCP connection reuse. When null,
@@ -773,7 +1053,9 @@ class TileManager with CacheTiles {
   bool isTileRelevant(int z, int x, int y) {
     final key = _key(z, x, y);
     if (byteOnlyPadding) {
-      return _visibleKeys.contains(key) || _speculativeKeys.contains(key);
+      return _visibleKeys.contains(key) ||
+          _speculativeKeys.contains(key) ||
+          _preparedKeys.contains(key);
     }
     return _renderIndex(key) != -1;
   }
@@ -827,12 +1109,22 @@ class TileManager with CacheTiles {
     TileDecoder? decoder,
     this.workScheduler,
     String Function(int z, int x, int y)? urlBuilder,
-    TileResourceKeyBuilder? resourceKeyBuilder,
+    this._resourceKeyBuilder,
     this.cacheNamespace = '',
     this.tilePadding = defaultTilePadding,
     this.preloadAdjacentZoom = true,
     this.preloadZoomDepth = preloadZoomDepthByDefine,
+    this.preparedZoomWindow = preparedWindowByDefine,
+    this.preparedWindowDepth = preparedWindowDepthByDefine,
+    this.maxPreparedPerGeneration = defaultMaxPreparedPerGeneration,
+    this.maxConcurrentPrepared = defaultMaxConcurrentPrepared,
     this.byteOnlyPadding = false,
+    int? backgroundLoads,
+    int? visibleLoads,
+    this.laneBudget,
+    this.cancelStaleLoads = false,
+    this.cancelStaleGrace = const Duration(seconds: 1),
+    this.gesturePrefetch = false,
     this.decoderOwnsImageScheduling = false,
     this.adaptiveResolution = false,
     this.preloadDebounce = const Duration(milliseconds: 500),
@@ -844,14 +1136,17 @@ class TileManager with CacheTiles {
     int maxRenderedCacheBytes = RenderedTileCache.defaultMaxBytes,
     Duration renderedCacheRetention = RenderedTileCache.defaultRetention,
     this.requestTimeout = TileLoadException.defaultRequestTimeout,
-  })  : _memoryCache = RenderedTileCache(
+    HttpIsolate? httpIsolate,
+  })  : _httpIsolate = httpIsolate ?? HttpIsolate(),
+        _memoryCache = RenderedTileCache(
           maxBytes: maxRenderedCacheBytes,
           retention: renderedCacheRetention,
         ),
         _fetcher = fetcher ?? osmTileFetcher,
         _decoder = decoder ?? _decodeRasterTile,
-        _urlBuilder = urlBuilder,
-        _resourceKeyBuilder = resourceKeyBuilder {
+        _fixedBackgroundLoads = backgroundLoads ?? maxConcurrentBackgroundLoads,
+        _fixedVisibleLoads = visibleLoads ?? maxConcurrentVisibleLoads,
+        _urlBuilder = urlBuilder {
     validateRequestTimeout(requestTimeout);
     if (cameraZoom != null) {
       _validateCameraZoom(cameraZoom);
@@ -877,12 +1172,18 @@ class TileManager with CacheTiles {
     _tileNotificationScheduled = false;
     _preloadTimer?.cancel();
     _preloadTimer = null;
+    _preparedIdleTimer?.cancel();
+    _preparedIdleTimer = null;
     for (final timer in _retryTimers.values) {
       timer.cancel();
     }
     _retryTimers.clear();
     _jobsByKey.clear();
     _resourceFetches.clear();
+    _permits.clear();
+    _resourceHandles.clear();
+    _staleTimer?.cancel();
+    _staleTimer = null;
     _resourceWrites.clear();
     _legacyDiskKeys.clear();
     _httpIsolate.dispose();
@@ -937,6 +1238,7 @@ class TileManager with CacheTiles {
         longitude: tileX2Lng(centerTileLng, zoom),
       );
     }
+    _invalidatePreparedCapture();
   }
 
   void setCenterFromTileCoords(double tileLng, double tileLat) {
@@ -948,6 +1250,7 @@ class TileManager with CacheTiles {
       latitude: tileY2Lat(centerTileLat, zoom),
       longitude: tileX2Lng(centerTileLng, zoom),
     );
+    _invalidatePreparedCapture();
   }
 
   void _clampTileCoords() {
@@ -1034,22 +1337,43 @@ class TileManager with CacheTiles {
 
   void setZoom(int newZoom) {
     if (newZoom == zoom && _cameraZoom == null) return;
+    _zoomDirection = newZoom > zoom ? 1 : -1;
+    // Capture at the pre-change zoom.
+    final captureZoom = zoom;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedScale = _zoomScale;
+    _suppressPredictionInvalidation = true;
     _cameraZoom = null;
     _zoomScale = 1;
     zoom = newZoom;
     setCenterTile();
+    _suppressPredictionInvalidation = false;
+    // Center-preserving integer jump: focal == center.
+    _preparedFocalLng = capturedCenterLng;
+    _preparedFocalLat = capturedCenterLat;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
   }
 
   void setZoomWithFocalPoint(int newZoom, Offset focalLocal, int oldZoom) {
     if (newZoom == zoom && cameraZoom == newZoom) return;
-
-    final focalTileLng =
+    _zoomDirection = newZoom > oldZoom ? 1 : -1;
+    // Capture at the pre-change zoom (the focal vars below are already
+    // in old-zoom tile units) before anything mutates.
+    final captureZoom = zoom;
+    final capturedScale = _zoomScale;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedFocalLng =
         centerTileLng + (focalLocal.dx - centerCanvasX) / renderedTileWidth;
-    final focalTileLat =
+    final capturedFocalLat =
         centerTileLat + (focalLocal.dy - centerCanvasY) / renderedTileHeight;
-    final focalLng = tileX2Lng(focalTileLng, oldZoom);
-    final focalLat = tileY2Lat(focalTileLat, oldZoom);
+    final focalLng = tileX2Lng(capturedFocalLng, oldZoom);
+    final focalLat = tileY2Lat(capturedFocalLat, oldZoom);
 
     final newFocalTileLng = lon2TileX(focalLng, newZoom);
     final newFocalTileLat = lat2TileY(focalLat, newZoom);
@@ -1062,7 +1386,15 @@ class TileManager with CacheTiles {
         newFocalTileLat - (focalLocal.dy - centerCanvasY) / renderedTileHeight;
 
     zoom = newZoom;
+    _suppressPredictionInvalidation = true;
     setCenterFromTileCoords(newCenterTileLng, newCenterTileLat);
+    _suppressPredictionInvalidation = false;
+    _preparedFocalLng = capturedFocalLng;
+    _preparedFocalLat = capturedFocalLat;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
   }
 
@@ -1079,21 +1411,146 @@ class TileManager with CacheTiles {
   void setCameraZoom(double value, {Offset? focalPoint}) {
     _validateCameraZoom(value);
     if (value == cameraZoom) return;
+    final previousCameraZoom = cameraZoom;
+    // Prepared-window prediction inputs: zoom direction, the gesture
+    // focal point, the camera center, the fractional scale and the
+    // capture zoom — all in capture-time tile units, so the
+    // focal-preserving projection can map the center to each target
+    // zoom from the capture's own coordinate system.
+    _zoomDirection = value > cameraZoom ? 1 : -1;
     final focal = focalPoint ?? Offset(centerCanvasX, centerCanvasY);
     final focalX =
         centerTileLng + (focal.dx - centerCanvasX) / renderedTileWidth;
     final focalY =
         centerTileLat + (focal.dy - centerCanvasY) / renderedTileHeight;
+    final captureZoom = zoom;
+    final capturedCenterLng = centerTileLng;
+    final capturedCenterLat = centerTileLat;
+    final capturedScale = _zoomScale;
     final oldZoom = zoom;
     zoom = value.round();
     _cameraZoom = value;
     _zoomScale = math.pow(2, value - zoom).toDouble();
     final ratio = math.pow(2, zoom - oldZoom).toDouble();
+    _suppressPredictionInvalidation = true;
     setCenterFromTileCoords(
       focalX * ratio - (focal.dx - centerCanvasX) / renderedTileWidth,
       focalY * ratio - (focal.dy - centerCanvasY) / renderedTileHeight,
     );
+    _suppressPredictionInvalidation = false;
+    _preparedFocalLng = focalX;
+    _preparedFocalLat = focalY;
+    _preparedCenterLng = capturedCenterLng;
+    _preparedCenterLat = capturedCenterLat;
+    _preparedZoomScale = capturedScale;
+    _preparedCaptureZoom = captureZoom;
     calculate();
+    if (gesturePrefetch) _prefetchAlongGesture(previousCameraZoom, value);
+  }
+
+  /// Tracks the zoom gesture's direction and admits the prefetch for it.
+  void _prefetchAlongGesture(double from, double to) {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final last = _gestureLastAt;
+    _gestureLastAt = now;
+    if (last == null || now.difference(last) > _gestureIdleReset) {
+      // A new gesture: forget the old direction and budget.
+      _gestureDirection = 0;
+      _gestureExtremeZoom = from;
+      _gestureAdmitted = 0;
+    }
+    if (_gestureDirection == 0) {
+      if ((to - _gestureExtremeZoom).abs() < gesturePrefetchMinZoomDelta) {
+        return;
+      }
+      _gestureDirection = to > _gestureExtremeZoom ? 1 : -1;
+      _gestureExtremeZoom = to;
+      _gestureAdmitted = 0;
+    } else if ((to - _gestureExtremeZoom) * _gestureDirection > 0) {
+      _gestureExtremeZoom = to;
+    } else if ((_gestureExtremeZoom - to) * _gestureDirection >=
+        2 * gesturePrefetchMinZoomDelta) {
+      // The user reversed: the old level is no longer the one needed.
+      _gestureDirection = -_gestureDirection;
+      _gestureExtremeZoom = to;
+      _gestureAdmitted = 0;
+      _loadQueue.removeWhere((job) {
+        if (!job.gesture) return false;
+        _queued.remove(job.key);
+        _jobsByKey.remove(job.key);
+        return true;
+      });
+    }
+    _admitGesturePrefetch();
+  }
+
+  /// Enqueues byte-only jobs for the tiles the next level in the gesture's
+  /// direction will need. The viewport is predicted with the same
+  /// focal-preserving projection as the prepared zoom window; the +1 pad
+  /// absorbs the prediction error.
+  void _admitGesturePrefetch() {
+    if (_gestureAdmitted >= maxGesturePrefetch) return;
+    final target = zoom + _gestureDirection;
+    if (target < 0 || target > 19) return;
+    final growth =
+        math.pow(2, (target - (_preparedCaptureZoom ?? zoom)).toDouble());
+    final captureScale = _preparedZoomScale ?? 1.0;
+    final focalLng = _preparedFocalLng ?? centerTileLng;
+    final focalLat = _preparedFocalLat ?? centerTileLat;
+    final capCenterLng = _preparedCenterLng ?? centerTileLng;
+    final capCenterLat = _preparedCenterLat ?? centerTileLat;
+    final predictedLng =
+        focalLng * growth - (focalLng - capCenterLng) * captureScale;
+    final predictedLat =
+        focalLat * growth - (focalLat - capCenterLat) * captureScale;
+    final halfW = width / 512 + 1;
+    final halfH = height / 512 + 1;
+    final world = 1 << target;
+    final minY = (predictedLat - halfH).floor().clamp(0, world - 1);
+    final maxY = (predictedLat + halfH).floor().clamp(0, world - 1);
+    final byteBudget = (maxByteCacheBytes * _preloadByteShare).round();
+    final candidates = <_LoadJob>[];
+    for (var y = minY; y <= maxY; y++) {
+      for (var x = (predictedLng - halfW).floor();
+          x <= (predictedLng + halfW).floor();
+          x++) {
+        final wx = ((x % world) + world) % world;
+        final key = _key(target, wx, y);
+        final resource = _resourceKey(target, wx, y);
+        if (_memoryCache.containsKey(key) ||
+            _byteCache.containsKey(resource) ||
+            _inFlight.contains(key) ||
+            _queued.contains(key)) {
+          continue;
+        }
+        final dx = x + 0.5 - predictedLng;
+        final dy = y + 0.5 - predictedLat;
+        candidates.add(_LoadJob(
+          key: key,
+          resourceKey: resource,
+          z: target,
+          x: wx,
+          y: y,
+          generation: _generation,
+          jobClass: _JobClass.adjacentZoom,
+          distance: dx * dx + dy * dy,
+          byteOnly: true,
+          gesture: true,
+        ));
+      }
+    }
+    if (candidates.isEmpty) return;
+    candidates.sort((a, b) => a.distance.compareTo(b.distance));
+    for (final job in candidates) {
+      if (_gestureAdmitted >= maxGesturePrefetch ||
+          _byteCacheSize >= byteBudget) {
+        break;
+      }
+      _gestureAdmitted++;
+      _enqueueJob(job);
+    }
+    _pumpLoadQueue();
   }
 
   // ── Grid computation ────────────────────────────────────────────────
@@ -1128,6 +1585,13 @@ class TileManager with CacheTiles {
   /// split grid reconciliation cost by path.
   void calculate() {
     if (_disposed) return;
+    // Prepared-window re-admission re-arms on every camera change (pan
+    // frames included): pans invalidate the prediction capture, and the
+    // debounced tick re-predicts around the live center so a zoom
+    // shortly after a pan finds its level prepared (plan-13 Phase E:
+    // reevaluate on pan). Zoom changes admit instantly through the
+    // queue pump instead.
+    _schedulePreparedIdleAdmission();
     if (!VectorSpanLog.enabled) {
       _calculateGrid();
       return;
@@ -1226,6 +1690,11 @@ class TileManager with CacheTiles {
     _speculativeAdmitted = 0;
     _speculativeSuspended = false;
     _revokeSpeculativeWork();
+    // A camera change lifts the pressure suspension too: the pressure
+    // landscape moved with the camera, and supersede re-admits the new
+    // prediction from a clean budget.
+    _preparedSuspended = false;
+    _supersedePreparedWindow();
 
     _memoryCache.setActiveKeys(_protectedImageKeys({
       for (var h = 0; h < horizontalTileCount; h++)
@@ -1343,6 +1812,7 @@ class TileManager with CacheTiles {
     }
     final cls = a.jobClass.index.compareTo(b.jobClass.index);
     if (cls != 0) return cls;
+    if (a.gesture != b.gesture) return a.gesture ? -1 : 1;
     return a.distance.compareTo(b.distance);
   }
 
@@ -1436,8 +1906,9 @@ class TileManager with CacheTiles {
         }
         return false;
       }
-      final relevant =
-          _renderIndex(job.key) != -1 || _speculativeOffGridLive(job);
+      final relevant = _renderIndex(job.key) != -1 ||
+          _speculativeOffGridLive(job) ||
+          _preparedOffGridLive(job);
       if (!relevant) {
         _queued.remove(job.key);
         _jobsByKey.remove(job.key);
@@ -1467,6 +1938,13 @@ class TileManager with CacheTiles {
       job.jobClass == _JobClass.speculative &&
       _speculativeKeys.contains(job.key);
 
+  /// Same for prepared-window jobs (plan 13 Phase E): deliberately
+  /// off-grid, live while their admitted key has not been superseded by
+  /// a camera generation change.
+  bool _preparedOffGridLive(_LoadJob job) =>
+      job.jobClass == _JobClass.preparedZoom &&
+      _preparedKeys.contains(job.key);
+
   /// Cancels every admitted speculative job at a camera change. Queued
   /// load and presentation entries are dropped (in-flight key released),
   /// so only decodes already inside the runtime remain and they abort at
@@ -1495,6 +1973,241 @@ class TileManager with CacheTiles {
     _trace('revoke: dropped queued=$queued presenting=$presentingQueued '
         'inflight=${_speculativeKeys.length}');
     _speculativeKeys.clear();
+  }
+
+  /// Drops every prepared-window key at a camera generation change and
+  /// cancels its queued-but-unfinished work. In-flight jobs finish
+  /// normally: their imagery is valid at its zoom either way and simply
+  /// lands in the rendered cache for a possible reversal. Images already
+  /// prepared stay in the cache (bounded by its own budget) — that is
+  /// requirement 4's retention side. Promotion is counted here, at the
+  /// only moment a prepared zoom level can become visible: an integer
+  /// grid switch.
+  void _supersedePreparedWindow() {
+    if (_preparedKeys.isEmpty) return;
+    // Visibility is judged against the NEW grid: supersede runs inside
+    // the membership-change branch of [calculate], before the view's
+    // visible-key set is refreshed. The strict viewport of the rebuilt
+    // grid is derivable from the already-updated camera fields.
+    final strictH = horizontalTileCount - 2 * tilePadding;
+    final strictV = verticalTileCount - 2 * tilePadding;
+    final newVisible = <String>{
+      for (var h = 0; h < strictH; h++)
+        for (var v = 0; v < strictV; v++)
+          _key(zoom, leftColumnTilesLngIndex + tilePadding + h,
+              topRowTilesLatIndex + tilePadding + v),
+    };
+    var promoted = 0;
+    var cancelled = 0;
+    var presentingQueued = 0;
+    for (final key in _preparedKeys) {
+      if (_hasRenderedImage(key)) {
+        if (newVisible.contains(key)) promoted++;
+        // Imaged but never visible: retained in the cache for reversals.
+      } else {
+        cancelled++;
+      }
+    }
+    _loadQueue.removeWhere((job) {
+      if (job.jobClass != _JobClass.preparedZoom) return false;
+      if (_hasRenderedImage(job.key)) return false;
+      cancelled++;
+      _queued.remove(job.key);
+      _jobsByKey.remove(job.key);
+      return true;
+    });
+    _presentQueue.removeWhere((entry) {
+      final job = entry.job;
+      if (job.jobClass != _JobClass.preparedZoom) return false;
+      presentingQueued++;
+      _inFlight.remove(job.key);
+      return true;
+    });
+    _preparedStats['promoted'] = _preparedStats['promoted']! + promoted;
+    _preparedStats['cancelled'] = _preparedStats['cancelled']! + cancelled;
+    _preparedKeys.clear();
+    _preparedAdmitted = 0;
+    _preparedGeneration = _generation;
+    _trace('prepared: supersede promoted=$promoted cancelled=$cancelled '
+        'presentingQueued=$presentingQueued');
+  }
+
+  /// Whether the prepared window may admit right now: enabled, quiet
+  /// foreground (no queued or active foreground downloads or
+  /// presentations), and per-generation budget remaining. Mirrors the
+  /// speculative admission gates.
+  bool get _preparedWindowMayAdmit {
+    if (!preparedZoomWindow || _disposed) return false;
+    if (preparedWindowDepth < 1) return false;
+    if (_preparedSuspended) {
+      return false; // memory pressure: stay suspended until the camera moves
+    }
+    if (_preparedGeneration != _generation) {
+      // A generation the supersede hook missed (membership unchanged —
+      // e.g. a sub-tile pan): keep counting against the old budget only
+      // until the next integer switch; the caps below still bound work.
+      _preparedGeneration = _generation;
+      _preparedAdmitted = 0;
+    }
+    if (_preparedAdmitted >= maxPreparedPerGeneration) return false;
+    if (_loadQueue.any(_isForeground) || _activeForegroundLoads > 0) {
+      return false;
+    }
+    if (_presentQueue.any((entry) => _isForeground(entry.job)) ||
+        _activePresentEntries.any((entry) => _isForeground(entry.job))) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Admits prepared zoom window jobs (plan 13 Phase E): the predicted
+  /// viewport at zoom ±1 (then ±2, shells in order) prepared as full
+  /// drawable images on the background lane. A later zoom reveals them
+  /// through the synchronous rendered-cache-hit path.
+  ///
+  /// Target bounds come from the screen dimensions and the
+  /// focal-preserving camera projection — the screen shows `width / 256`
+  /// tiles of the target level, and the projected camera center is
+  /// `C' = F·2^dz − (F − C)·zoomScale` (the geographic point under the
+  /// fingers keeps its screen offset). Longitude wraps across the
+  /// antimeridian and deduplicates by canonical key; latitude clips at
+  /// the poles. Candidates rank by shell, direction sign, then distance
+  /// from the predicted center — the budget buys central tiles first.
+  ///
+  /// Runs on every queue pump, mirroring speculative admission: job
+  /// completions and grid rebuilds are exactly the moments the foreground
+  /// may have settled. Caps: outstanding prepared jobs
+  /// ([maxConcurrentPrepared]), admitted per camera generation
+  /// ([maxPreparedPerGeneration]), and the shared byte-cache share gate.
+  void _admitPreparedZoomWork() {
+    if (!_preparedWindowMayAdmit) return;
+    final depth = preparedWindowDepth.clamp(1, 2);
+
+    // Screen extent in target-level tiles: a tile of an integer zoom is
+    // 256 logical px, so the screen always shows width/256 by height/256
+    // tiles; +1 is the bounded surface pad (mirrors the retained scale).
+    final halfW = width / 512 + 1;
+    final halfH = height / 512 + 1;
+
+    // Projection inputs, all in the capture zoom's tile units. The
+    // focal-preserving projection keeps the screen offset pixel-fixed:
+    // the offset in target-level tile units stays (F − C)·capturedScale
+    // (a tile of any integer zoom is 256 px), while the focal point's
+    // coordinates grow by 2^(target − captureZoom):
+    // C' = F·growth − (F − C)·capturedScale. Without a capture (first
+    // pass, or invalidated by a pan) focal == center and captureScale is
+    // 1, reducing to the live center scaled by 2^(target − zoom).
+    final captureZoom = _preparedCaptureZoom;
+    final captureScale = _preparedZoomScale ?? 1.0;
+    final focalLng = _preparedFocalLng ?? centerTileLng;
+    final focalLat = _preparedFocalLat ?? centerTileLat;
+    final capCenterLng = _preparedCenterLng ?? centerTileLng;
+    final capCenterLat = _preparedCenterLat ?? centerTileLat;
+
+    double predictedLngFor(int zTarget) {
+      final growth =
+          math.pow(2, (zTarget - (captureZoom ?? zoom)).toDouble());
+      return focalLng * growth - (focalLng - capCenterLng) * captureScale;
+    }
+
+    double predictedLatFor(int zTarget) {
+      final growth =
+          math.pow(2, (zTarget - (captureZoom ?? zoom)).toDouble());
+      return focalLat * growth - (focalLat - capCenterLat) * captureScale;
+    }
+
+    final preferredSign = _zoomDirection < 0 ? -1 : 1;
+    final candidates = <({_LoadJob job, int level, int signRank})>[];
+    final seen = <String>{};
+    var shallowerCandidates = false;
+    for (var level = 1; level <= depth; level++) {
+      for (final dz in [preferredSign * level, -preferredSign * level]) {
+        final z = zoom + dz;
+        if (z < 0 || z > 19) continue;
+        final predictedLng = predictedLngFor(z);
+        final predictedLat = predictedLatFor(z);
+        final world = 1 << z;
+        final minX = (predictedLng - halfW).floor();
+        final maxX = (predictedLng + halfW).floor();
+        final minY = (predictedLat - halfH).floor().clamp(0, world - 1);
+        final maxY = (predictedLat + halfH).floor().clamp(0, world - 1);
+        for (var y = minY; y <= maxY; y++) {
+          for (var x = minX; x <= maxX; x++) {
+            // Longitude wraps (antimeridian-crossing viewports keep their
+            // far-side coverage); latitude clipped above.
+            final wx = ((x % world) + world) % world;
+            final key = _key(z, wx, y);
+            if (!seen.add(key)) continue;
+            if (_memoryCache.containsKey(key) ||
+                _inFlight.contains(key) ||
+                _queued.contains(key) ||
+                _preparedKeys.contains(key)) {
+              continue;
+            }
+            // Distance from the unwrapped x: the raw position is the
+            // rect-relative one, so wrapped tiles rank by their true
+            // proximity instead of appearing a world away.
+            final dx = x + 0.5 - predictedLng;
+            final dy = y + 0.5 - predictedLat;
+            candidates.add((
+              job: _LoadJob(
+                key: key,
+                resourceKey: _resourceKey(z, wx, y),
+                z: z,
+                x: wx,
+                y: y,
+                generation: _generation,
+                jobClass: _JobClass.preparedZoom,
+                distance: dx * dx + dy * dy,
+                byteOnly: false,
+              ),
+              level: level,
+              signRank: (dz > 0) == (preferredSign > 0) ? 0 : 1,
+            ));
+          }
+        }
+      }
+      // Shell discipline: the next level out only admits once this level
+      // has no unresolved candidates (they clear as their images land or
+      // their keys are dropped, so later pumps expand the shell).
+      if (candidates.isNotEmpty && level < depth) {
+        shallowerCandidates = true;
+      }
+      if (shallowerCandidates) break;
+    }
+    if (candidates.isEmpty) return;
+
+    // Rank before spending the budget: shell, direction sign, then
+    // distance — row-scan order would exhaust the budget on a far edge.
+    candidates.sort((a, b) {
+      if (a.level != b.level) return a.level.compareTo(b.level);
+      if (a.signRank != b.signRank) return a.signRank.compareTo(b.signRank);
+      return a.job.distance.compareTo(b.job.distance);
+    });
+
+    var outstanding = 0;
+    for (final job in _loadQueue) {
+      if (job.jobClass == _JobClass.preparedZoom) outstanding++;
+    }
+    outstanding += _preparedKeys
+        .where((key) => _inFlight.contains(key) || _queued.contains(key))
+        .length;
+    final byteBudget = (maxByteCacheBytes * _preloadByteShare).round();
+    for (final c in candidates) {
+      final job = c.job;
+      if (outstanding >= maxConcurrentPrepared) break;
+      if (_preparedAdmitted >= maxPreparedPerGeneration) break;
+      if (_byteCacheSize >= byteBudget) break;
+      if (_failedUntil.containsKey(job.key)) {
+        continue; // under failure backoff: not this pass
+      }
+      _preparedKeys.add(job.key);
+      _preparedAdmitted++;
+      _preparedStats['admitted'] = _preparedStats['admitted']! + 1;
+      _trace('prepared: admit ${job.key} outstanding=$outstanding');
+      _enqueueJob(job);
+      outstanding++;
+    }
   }
 
   /// Admits idle-time speculative preparation jobs (plan 06): the nearest
@@ -1648,14 +2361,18 @@ class TileManager with CacheTiles {
   /// stay queued so a newer generation can take the next freed slot instead
   /// of sitting behind dozens of older requests. Background preloads only
   /// run when no foreground download/presentation is queued or active, and are bounded by
-  /// [maxConcurrentBackgroundLoads].
+  /// [backgroundLoadLimit].
   void _pumpLoadQueue() {
     if (_disposed) return;
     _queuePreviewUpgrades();
     // Speculative admission runs on every pump: job completions and grid
     // rebuilds are exactly the moments the foreground may have settled.
     _admitSpeculativeWork();
-    if (_loadQueue.isEmpty) return;
+    _admitPreparedZoomWork();
+    if (_loadQueue.isEmpty) {
+      if (cancelStaleLoads) _cancelStaleForWire();
+      return;
+    }
     _loadQueue.sort(_compareJobs);
 
     final foregroundPending = _loadQueue.any(_isForeground);
@@ -1664,7 +2381,13 @@ class TileManager with CacheTiles {
             _activePresentEntries.any((entry) => _isForeground(entry.job));
     final backgroundBlocked =
         foregroundPending || _activeForegroundLoads > 0 || presentationPending;
-    var foregroundSlots = maxConcurrentVisibleLoads - _activeForegroundLoads;
+    var foregroundSlots = visibleLoadLimit - _activeForegroundLoads;
+
+    // Visible tiles are waiting for a slot: hand the slots (and the link) of
+    // requests the camera has left back to them.
+    if (cancelStaleLoads && foregroundPending && foregroundSlots <= 0) {
+      _cancelStaleLoads(_loadQueue.where(_isForeground).length);
+    }
 
     final keep = <_LoadJob>[];
     for (final job in _loadQueue) {
@@ -1677,8 +2400,8 @@ class TileManager with CacheTiles {
         } else {
           keep.add(job);
         }
-      } else if (backgroundBlocked ||
-          _activeBackgroundLoads >= maxConcurrentBackgroundLoads) {
+      } else if ((backgroundBlocked && !job.gesture) ||
+          _activeBackgroundLoads >= backgroundLoadLimit) {
         keep.add(job);
       } else {
         _queued.remove(job.key);
@@ -1689,10 +2412,15 @@ class TileManager with CacheTiles {
     _loadQueue
       ..clear()
       ..addAll(keep);
+    // After the lanes are filled: what the link carries now includes the
+    // requests this pass just started.
+    if (cancelStaleLoads) _cancelStaleForWire();
   }
 
   Future<void> _runJob(_LoadJob job, {required bool foreground}) async {
     var presenting = false;
+    final permit = _LanePermit(job, foreground, _fetchClock.elapsedMicroseconds);
+    _permits.add(permit);
     try {
       if (_disposed) return;
       _inFlight.add(job.key);
@@ -1704,6 +2432,7 @@ class TileManager with CacheTiles {
       // Keep the key in flight while a presentation is outstanding so a
       // duplicate resource job is not started for the same slot.
       if (!presenting) _inFlight.remove(job.key);
+      _permits.remove(permit);
       if (foreground) {
         if (_activeForegroundLoads > 0) _activeForegroundLoads--;
       } else {
@@ -1711,6 +2440,98 @@ class TileManager with CacheTiles {
       }
       if (!_disposed) _pumpLoadQueue();
     }
+  }
+
+  /// Whether [error] is the scheduler aborting a request it no longer wants.
+  /// Such a job is dropped quietly: no failure record, no backoff retry, no
+  /// error callback. The tile is requested again by the next admission pass if
+  /// the camera comes back to it.
+  bool _isSchedulerCancel(Object error) =>
+      error is TileLoadException &&
+      error.kind == TileFailureKind.cancelled &&
+      !_disposed;
+
+  /// Whether the camera no longer wants what [job] is loading: its tile left
+  /// the render set and no speculative or prepared relevance holds it.
+  /// Adjacent-zoom loads are off-grid by design and never stale this way.
+  bool _isStaleInFlight(_LoadJob job) =>
+      job.jobClass != _JobClass.adjacentZoom &&
+      !_speculativeOffGridLive(job) &&
+      !_preparedOffGridLive(job) &&
+      _renderIndex(job.key) == -1;
+
+  /// Returns the link to the viewport: while visible tiles load, requests
+  /// nobody wants any more are aborted once the link carries more of them
+  /// than its bandwidth-delay width. Below that width an idle request costs
+  /// the visible ones nothing, so it is left to finish (the camera may come
+  /// back to it); above it every extra request takes its share of the wire.
+  /// Needs a measured width, so it never acts on fixed lanes or before the
+  /// first fetches have finished.
+  void _cancelStaleForWire() {
+    final budget = laneBudget;
+    if (budget == null || !budget.hasEstimate) return;
+    if (_activeForegroundLoads == 0 && !_loadQueue.any(_isForeground)) return;
+    final excess = _liveFetchCount() - budget.totalWidth;
+    if (excess > 0) _cancelStaleLoads(excess);
+  }
+
+  /// Network requests in flight that the scheduler has not already aborted.
+  int _liveFetchCount() {
+    final aborted = <String>{};
+    for (final permit in _permits) {
+      if (permit.cancelled) aborted.add(permit.job.resourceKey);
+    }
+    return _resourceHandles.length - aborted.length;
+  }
+
+  /// Aborts up to [wanted] network requests nobody wants any more, youngest
+  /// first (least downloaded, so least wasted). A request is only aborted when
+  /// every job waiting on its resource has been unwanted for [cancelStaleGrace]
+  /// (siblings and promoted preloads share one download, and a tile the camera
+  /// returns to inside the grace period keeps its progress).
+  void _cancelStaleLoads(int wanted) {
+    if (wanted <= 0 || _permits.isEmpty) return;
+    final now = _fetchClock.elapsedMicroseconds;
+    final graceUs = cancelStaleGrace.inMicroseconds;
+    int? nextDueUs;
+    final live = <String>{};
+    final stale = <_LanePermit>[];
+    for (final permit in _permits) {
+      final resource = permit.job.resourceKey;
+      if (permit.cancelled || !_resourceHandles.containsKey(resource)) continue;
+      if (!_isStaleInFlight(permit.job)) {
+        permit.staleSinceUs = null;
+        live.add(resource);
+        continue;
+      }
+      final dueUs = (permit.staleSinceUs ??= now) + graceUs;
+      if (now >= dueUs) {
+        stale.add(permit);
+      } else {
+        // Unwanted, but not for long enough: keeps its resource alive.
+        live.add(resource);
+        if (nextDueUs == null || dueUs < nextDueUs) nextDueUs = dueUs;
+      }
+    }
+    if (nextDueUs != null && _staleTimer == null) {
+      _staleTimer = Timer(Duration(microseconds: nextDueUs - now), () {
+        _staleTimer = null;
+        if (!_disposed) _pumpLoadQueue();
+      });
+    }
+    stale.sort((a, b) => b.startedUs.compareTo(a.startedUs));
+    final aborted = <String>{};
+    for (final permit in stale) {
+      if (aborted.length >= wanted) break;
+      final resource = permit.job.resourceKey;
+      if (live.contains(resource)) continue;
+      if (aborted.add(resource)) _resourceHandles[resource]?.cancel();
+    }
+    if (aborted.isEmpty) return;
+    for (final permit in stale) {
+      if (aborted.contains(permit.job.resourceKey)) permit.cancelled = true;
+    }
+    _trace('cancel-stale: ${aborted.length} of ${stale.length} stale');
   }
 
   /// Records a failure and schedules a retry after [failureBackoff] so a
@@ -1782,10 +2603,13 @@ class TileManager with CacheTiles {
   Future<bool> _acquireBytes(_LoadJob job) async {
     if (_disposed) return false;
     // The tile may have scrolled off screen between queueing and starting.
-    // Adjacent-zoom preloads target tiles outside the render set on purpose,
-    // so they bypass this check.
+    // Adjacent-zoom preloads target tiles outside the render set on
+    // purpose, so they bypass this check; speculative and prepared-window
+    // jobs are deliberately off-grid too — their relevance keys keep them
+    // alive while admitted.
     if (job.jobClass != _JobClass.adjacentZoom &&
         !_speculativeOffGridLive(job) &&
+        !_preparedOffGridLive(job) &&
         _renderIndex(job.key) == -1) {
       return false;
     }
@@ -1878,7 +2702,7 @@ class TileManager with CacheTiles {
     try {
       bytes = await _fetchResource(job);
     } catch (error) {
-      _markFailed(job, error);
+      if (!_isSchedulerCancel(error)) _markFailed(job, error);
       return false;
     }
     if (_disposed) return false;
@@ -1945,7 +2769,7 @@ class TileManager with CacheTiles {
       try {
         bytes = await _fetchResource(job);
       } catch (error) {
-        _markFailed(job, error);
+        if (!_isSchedulerCancel(error)) _markFailed(job, error);
         return false;
       }
       if (_disposed) return false;
@@ -1985,9 +2809,12 @@ class TileManager with CacheTiles {
   }) {
     if (_disposed) return false;
     // A resource that finished after the camera moved keeps its bytes but
-    // must not occupy the newest presentation queue.
+    // must not occupy the newest presentation queue. Speculative and
+    // prepared-window jobs are deliberately off-grid: their relevance
+    // keys keep them presenting into the rendered cache.
     if (job.jobClass != _JobClass.adjacentZoom &&
         !_speculativeOffGridLive(job) &&
+        !_preparedOffGridLive(job) &&
         _renderIndex(job.key) == -1) {
       return false;
     }
@@ -2018,6 +2845,7 @@ class TileManager with CacheTiles {
       final job = entry.job;
       if (job.jobClass != _JobClass.adjacentZoom &&
           !_speculativeOffGridLive(job) &&
+          !_preparedOffGridLive(job) &&
           _renderIndex(job.key) == -1) {
         _inFlight.remove(job.key);
         continue;
@@ -2224,10 +3052,11 @@ class TileManager with CacheTiles {
       // submits its own image work through the same scheduler (vector
       // runtimes) must not be nested inside another image-lane reservation,
       // or every slot ends up held by a decode waiting for a slot.
-      // Speculative jobs decode through the variant decoder (skips label
-      // preparation for offscreen tiles) when one is wired; otherwise the
-      // regular decoder serves both classes.
-      final decode = job.jobClass == _JobClass.speculative
+      // Speculative and prepared-window jobs decode through the variant
+      // decoder (skips label preparation for offscreen tiles) when one is
+      // wired; otherwise the regular decoder serves all classes.
+      final decode = job.jobClass == _JobClass.speculative ||
+              job.jobClass == _JobClass.preparedZoom
           ? (speculativeDecoder ?? _decoder)
           : _decoder;
       final image = scheduler != null && !decoderOwnsImageScheduling
@@ -2347,10 +3176,31 @@ class TileManager with CacheTiles {
     // the logical slots that await this resource.
     final completer = Completer<Uint8List>();
     _resourceFetches[resource] = completer.future;
-    VectorTrace.async('fetch', () => _fetchBytes(job.z, job.x, job.y),
-            tile: '${job.z}/${job.x}/${job.y}', source: resource)
+    final handle = HttpFetchHandle();
+    _resourceHandles[resource] = handle;
+    final budget = laneBudget;
+    final startedUs = _fetchClock.elapsedMicroseconds;
+    budget?.fetchStarted(startedUs);
+    if (debugSpeculativeTrace != null) {
+      _trace('fetch-start $resource ${job.jobClass.name} '
+          '${_traceWanted(job)} t=$startedUs');
+    }
+    Duration? firstByte;
+    VectorTrace.async(
+            'fetch',
+            () => _fetchBytes(job.z, job.x, job.y,
+                handle: handle, onFirstByte: (value) => firstByte = value),
+            tile: '${job.z}/${job.x}/${job.y}',
+            source: resource)
         .then(
       (bytes) {
+        _resourceHandles.remove(resource);
+        budget?.fetchFinished(_fetchClock.elapsedMicroseconds,
+            bytes: bytes.length, firstByteUs: firstByte?.inMicroseconds);
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-done $resource ${_traceWanted(job)} '
+              'bytes=${bytes.length} t=${_fetchClock.elapsedMicroseconds}');
+        }
         // Publish the bytes to the shared memory cache *before* clearing the
         // in-flight entry. A slot enqueued while the first logical decoder is
         // still running then reads these bytes instead of starting a
@@ -2360,12 +3210,34 @@ class TileManager with CacheTiles {
         if (!completer.isCompleted) completer.complete(bytes);
       },
       onError: (Object error, StackTrace stack) {
+        _resourceHandles.remove(resource);
+        budget?.fetchAbandoned();
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-end $resource ${_traceWanted(job)} '
+              '${_isSchedulerCancel(error) ? 'cancelled' : 'failed'} '
+              't=${_fetchClock.elapsedMicroseconds}');
+        }
         // Drop the in-flight entry so a retry can refetch.
         _resourceFetches.remove(resource);
         if (!completer.isCompleted) completer.completeError(error, stack);
       },
     );
     return completer.future;
+  }
+
+  /// Debug label for how much the camera wants [job]'s tile right now:
+  /// `visible` (strict viewport), `ring` (padding ring), `live` (speculative,
+  /// prepared or adjacent-zoom work that is deliberately off-grid) or `off`
+  /// (nobody wants it: the camera left).
+  String _traceWanted(_LoadJob job) {
+    if (_visibleKeys.contains(job.key)) return 'visible';
+    if (_renderIndex(job.key) != -1) return 'ring';
+    if (job.jobClass == _JobClass.adjacentZoom ||
+        _speculativeOffGridLive(job) ||
+        _preparedOffGridLive(job)) {
+      return 'live';
+    }
+    return 'off';
   }
 
   /// Converts a bytes-only preload descriptor into the foreground decode
@@ -2382,16 +3254,58 @@ class TileManager with CacheTiles {
         byteOnly: false,
       );
 
-  Future<Uint8List> _fetchBytes(int z, int x, int y) {
+  Future<Uint8List> _fetchThroughWorker(
+    String url,
+    int z,
+    int x,
+    int y,
+    HttpFetchHandle? handle,
+    void Function(Duration firstByte)? onFirstByte,
+  ) async {
+    if (!_httpIsolate.isReady) {
+      final waited = Stopwatch()..start();
+      try {
+        await _httpIsolate.spawn();
+        if (debugSpeculativeTrace != null) {
+          _trace('fetch-worker-wait ${waited.elapsedMilliseconds}ms');
+        }
+      } catch (_) {
+        // The worker failed to start: behave as if it never existed.
+        return _fetcher(z, x, y);
+      }
+    }
+    final result = await _httpIsolate.fetchUrlTimed(url,
+        requestTimeout: requestTimeout, handle: handle);
+    onFirstByte?.call(result.firstByte);
+    return result.bytes;
+  }
+
+  /// Starts one network request. [handle] aborts it where the transport can
+  /// (the HTTP worker and the Dio fetcher; a custom fetcher cannot).
+  /// [onFirstByte] receives the response-header latency where it is measured
+  /// (the HTTP worker only).
+  Future<Uint8List> _fetchBytes(
+    int z,
+    int x,
+    int y, {
+    HttpFetchHandle? handle,
+    void Function(Duration firstByte)? onFirstByte,
+  }) {
     Future<Uint8List> fetch;
     try {
-      if (_httpIsolate.isReady && _urlBuilder != null) {
-        // Use persistent HTTP isolate (native) — reuses TCP connections.
-        fetch = _httpIsolate.fetchUrl(_urlBuilder!(z, x, y),
-            requestTimeout: requestTimeout);
+      if ((_httpIsolate.isReady || _httpIsolate.isStarting) &&
+          _urlBuilder != null) {
+        // Use persistent HTTP isolate (native) — reuses TCP connections. A
+        // request that arrives while it is still spawning waits for it: the
+        // first wave of a cold start would otherwise take the fallback fetcher
+        // (other connections, no first-byte timing for the lane budget).
+        fetch = _fetchThroughWorker(
+            _urlBuilder(z, x, y), z, x, y, handle, onFirstByte);
       } else if (identical(_fetcher, osmTileFetcher)) {
         fetch = downloadTileBytes(tileUrl(z, x, y),
-            requestTimeout: requestTimeout, requestSession: _networkCancel);
+            requestTimeout: requestTimeout,
+            requestSession: _networkCancel,
+            handle: handle);
       } else {
         fetch = _fetcher(z, x, y);
       }
@@ -2505,6 +3419,22 @@ class TileManager with CacheTiles {
   }
 
   // ── Adjacent zoom pre-loading (debounced, bytes-only) ───────────────
+
+  /// Re-arms the prepared-window admission timer after any camera change.
+  /// The debounce matches the preload's so both idle paths fire together;
+  /// the admission itself re-checks the quiet-foreground gates.
+  void _schedulePreparedIdleAdmission() {
+    if (!preparedZoomWindow || _disposed) return;
+    _preparedIdleTimer?.cancel();
+    if (preloadDebounce == Duration.zero) {
+      _admitPreparedZoomWork();
+      _pumpLoadQueue();
+      return;
+    }
+    _preparedIdleTimer = Timer(preloadDebounce, () {
+      if (!_disposed) _pumpLoadQueue(); // admits at its head
+    });
+  }
 
   /// Schedules adjacent zoom pre-loading with a debounce timer.
   /// Only fires after the user stops panning for [preloadDebounce].
@@ -2748,7 +3678,7 @@ class TileManager with CacheTiles {
       // Never persist the raw URL: a query string can carry an API token.
       // A digest of the credential-free URL keeps the resource identity
       // public while still invalidating when scheme/host/path changes.
-      raw = _digestUrl(_urlBuilder!(z, x, y));
+      raw = _digestUrl(_urlBuilder(z, x, y));
     } else {
       // Opaque coordinate identity: wraps X so antimeridian duplicates share,
       // without encoding any URL.
@@ -2766,60 +3696,7 @@ class TileManager with CacheTiles {
     return ((x % n) + n) % n;
   }
 
-  /// Stable digest of the public URL identity.
-  ///
-  /// Content-affecting query parameters are retained in sorted order while
-  /// credentials and request-signing fields are removed. The digest therefore
-  /// distinguishes public variants such as `style=dark`/`style=light` without
-  /// persisting secrets or changing when a token rotates.
-  static String _digestUrl(String url) {
-    final uri = Uri.tryParse(url);
-    if (uri == null) return 'u${_fnv1a64(url)}';
-
-    final publicQuery = <String, List<String>>{};
-    final keys = uri.queryParametersAll.keys.toList()..sort();
-    for (final key in keys) {
-      if (_isCredentialQueryParameter(key)) continue;
-      publicQuery[key] = List<String>.of(uri.queryParametersAll[key]!)..sort();
-    }
-    final public = Uri(
-      scheme: uri.scheme,
-      host: uri.host,
-      port: uri.hasPort ? uri.port : null,
-      path: uri.path,
-      queryParameters: publicQuery.isEmpty ? null : publicQuery,
-    ).toString();
-    return 'u${_fnv1a64(public)}';
-  }
-
-  static bool _isCredentialQueryParameter(String name) {
-    final lower = name.toLowerCase();
-    return lower == 'access_token' ||
-        lower == 'access-token' ||
-        lower == 'token' ||
-        lower == 'api_key' ||
-        lower == 'api-key' ||
-        lower == 'apikey' ||
-        lower == 'key' ||
-        lower == 'signature' ||
-        lower == 'sig' ||
-        lower == 'expires' ||
-        lower.startsWith('x-amz-') ||
-        lower.startsWith('x-goog-');
-  }
-
-  /// FNV-1a 64-bit implemented with [BigInt] so the exact same 16-hex-digit
-  /// key is produced by native and JavaScript backends. This preserves all
-  /// cache keys written by the previous native integer implementation.
-  static String _fnv1a64(String value) {
-    var hash = BigInt.parse('cbf29ce484222325', radix: 16);
-    final prime = BigInt.parse('100000001b3', radix: 16);
-    final mask = BigInt.parse('ffffffffffffffff', radix: 16);
-    for (final byte in utf8.encode(value)) {
-      hash = ((hash ^ BigInt.from(byte)) * prime) & mask;
-    }
-    return hash.toRadixString(16).padLeft(16, '0');
-  }
+  static String _digestUrl(String url) => digestPublicUrl(url);
 
   static String tileKey(int z, int x, int y) => '$z/$x/$y';
 
@@ -2873,6 +3750,14 @@ enum _JobClass {
   /// Adjacent zoom level preload (bytes only).
   adjacentZoom,
 
+  /// Prepared zoom window (plan 13 Phase E): full-pipeline preparation —
+  /// bytes, decode and image — of a predicted next viewport at zoom ±1,
+  /// expanding toward ±2 within budgets. Admission requires a quiet
+  /// foreground; the job travels the background lane and never outranks
+  /// demand. A prepared image promotes through the ordinary
+  /// rendered-cache-hit path when its zoom becomes visible.
+  preparedZoom,
+
   /// Idle-time full-pipeline preparation of a vector tile: ring-1 works
   /// on an already bytes-cached padding tile; deep-ring (ring ≥ 2, plan-06
   /// revision arm) fetches the bytes itself. Never outranks foreground
@@ -2902,6 +3787,11 @@ class _LoadJob {
   /// When `true`, only source bytes are fetched — no decode.
   final bool byteOnly;
 
+  /// Gesture prefetch (bytes of the next zoom level, admitted while a zoom
+  /// gesture is moving): runs on the background lane even while foreground
+  /// work is queued or active, and outranks idle preloads.
+  final bool gesture;
+
   const _LoadJob({
     required this.key,
     required this.resourceKey,
@@ -2912,7 +3802,27 @@ class _LoadJob {
     required this.jobClass,
     required this.distance,
     required this.byteOnly,
+    this.gesture = false,
   });
+}
+
+/// A lane slot held by a resource-stage job, so a request the camera has left
+/// can be found and aborted.
+class _LanePermit {
+  _LanePermit(this.job, this.foreground, this.startedUs);
+
+  final _LoadJob job;
+  final bool foreground;
+
+  /// When the job took its slot, in [TileManager._fetchClock] microseconds.
+  final int startedUs;
+
+  /// Set once its request was aborted by the scheduler.
+  bool cancelled = false;
+
+  /// When the scheduler first saw its tile unwanted (fetch clock microseconds),
+  /// or null while the tile is wanted.
+  int? staleSinceUs;
 }
 
 /// Where presentation bytes came from. Only matters for corruption

@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'dart:ui' show Color;
 
-import 'css_color.dart';
+import 'package:fosm/src/vector/style/css_color.dart';
 
 /// Evaluation context for style expressions: the current zoom plus (for
 /// data-driven expressions) the feature's property map.

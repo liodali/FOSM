@@ -1,9 +1,8 @@
 import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'package:fosm/src/api/tile_manager.dart';
-import 'package:fosm/src/common/utils.dart';
 import 'package:fosm/src/view/render.dart';
 import 'package:fosm/src/vector/render/vector_trace.dart';
 
@@ -543,7 +542,9 @@ class _TileCoord {
 class ZoomFallbackPainter extends CustomPainter {
   /// The zoom snapshot's gaussian sigma — the softened appearance that
   /// persists over the handoff (plan 09). Zero per-engine/gesture gates;
-  /// sub-0.1 is treated as off.
+  /// sub-0.1 is treated as off. The view passes 0 for vector payloads:
+  /// plan 13's product direction keeps vector transitions unblurred and
+  /// reserves this blur for raster.
   final double blurSigma;
 
   ZoomFallbackPainter({
@@ -611,15 +612,15 @@ class ZoomFallbackPainter extends CustomPainter {
         final cellX = originX + (pad + h) * tileW;
         final cellY = originY + (pad + v) * tileH;
 
-        // Checkerboard placeholder, same parity rule as the grid painter.
-        final picture = RenderCanvasOSM.checkerPicture(
-            (tile.lngIndex + tile.latIndex) % 2 == 0);
-        canvas
-          ..save()
-          ..translate(cellX, cellY)
-          ..scale(tileW / tileWidth, tileH / tileHeight)
-          ..drawPicture(picture)
-          ..restore();
+        // Checkerboard placeholder, same parity rule and draw path as the
+        // grid painter.
+        RenderCanvasOSM.drawPlaceholder(
+            canvas,
+            (tile.lngIndex + tile.latIndex) % 2 == 0,
+            cellX,
+            cellY,
+            tileW,
+            tileH);
 
         final region = coverage._region(tile.index);
         if (region == null) continue;

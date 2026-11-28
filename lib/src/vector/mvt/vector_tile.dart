@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'protobuf_reader.dart';
+import 'package:fosm/src/vector/mvt/protobuf_reader.dart';
 
 /// Geometry kinds defined by the Mapbox Vector Tile spec.
 enum MvtGeomType { unknown, point, lineString, polygon }
