@@ -40,7 +40,7 @@ class LaneBudget {
     this.foregroundMax = 12,
     this.backgroundMax = 12,
     this.minimumWidth = 3,
-    this.initialWidth = 6,
+    this.initialWidth = 4,
     this.initialBackgroundWidth = 2,
     this.gain = 1.5,
     this.rateWindowUs = 8000000,
@@ -60,12 +60,21 @@ class LaneBudget {
   /// Foreground lane floor: below this a lane stops being a pipeline.
   final int minimumWidth;
 
-  /// Width used while there is nothing to estimate from (the first fetches of
-  /// a process, or a quiet minute): the fixed width this replaces, so a cold
-  /// start is never worse than before. A first wave on a slow link shares the
-  /// link until it completes (about four seconds at 8 requests and 2 Mbit/s),
-  /// and the estimate cannot improve before then, so this stays low and the
-  /// gain probes upward.
+  /// Width used while there is nothing to estimate from (the first fetches
+  /// of a process, or a quiet minute): the fixed width this replaces, so a
+  /// cold start is never wider than before. A first wave on a slow link
+  /// shares the link until it completes (about four seconds at 8 requests
+  /// and 2 Mbit/s), and the estimate cannot improve before then, so this
+  /// stays low and the gain probes upward.
+  ///
+  /// 4 is measured (Galaxy A33 and vivo V2542, cold static first loads,
+  /// production tiles, two counterbalanced runs per arm): at 2 Mbit/s the
+  /// first tile turned sharp 30–32 % earlier (about 1.1 s) and full sharp
+  /// coverage stayed neutral, because after the first wave the measured
+  /// budget clamps at [minimumWidth] anyway; a 3 wide first wave wins more
+  /// (−46 % center tile) only by paying +0.4–0.6 s full coverage on a
+  /// 250 ms uncapped link, where a 4 wide wave costs +0.16–0.22 s. The old
+  /// 6 stays one define away: `--dart-define=fosm.initialLaneWidth=6`.
   final int initialWidth;
 
   /// Background width until the link has been measured: the fixed width this

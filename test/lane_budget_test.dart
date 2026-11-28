@@ -39,7 +39,7 @@ void main() {
     test('uses the initial width until it has measured anything', () {
       final budget = LaneBudget();
       expect(budget.hasEstimate, isFalse);
-      expect(budget.foregroundLimit, 6);
+      expect(budget.foregroundLimit, 4);
       expect(budget.backgroundLimit(activeForeground: 0), 2,
           reason: 'idle work starts as narrow as the lane it replaces');
     });
@@ -49,7 +49,7 @@ void main() {
       // in the pipe, so a wide lane only queues.
       final link = _Link(bytesPerSecond: 250000, latencyUs: 100000);
       final widths = link.run(LaneBudget(), tileBytes: 120000);
-      expect(widths.first, 6, reason: 'starts at the initial width');
+      expect(widths.first, 4, reason: 'starts at the initial width');
       expect(widths.last, lessThanOrEqualTo(4));
       expect(widths.last, greaterThanOrEqualTo(3));
     });
@@ -153,7 +153,7 @@ void main() {
       budget.fetchStarted(0);
       budget.fetchAbandoned();
       expect(budget.inFlight, 0);
-      expect(budget.foregroundLimit, 6);
+      expect(budget.foregroundLimit, 4);
     });
 
     test('an idle gap does not dilute the next burst', () {
@@ -174,7 +174,7 @@ void main() {
         budget.fetchFinished(i * 300000 + 250000,
             bytes: 0, firstByteUs: 250000);
       }
-      expect(budget.foregroundLimit, 6, reason: 'still the initial width');
+      expect(budget.foregroundLimit, 4, reason: 'still the initial width');
     });
   });
 }

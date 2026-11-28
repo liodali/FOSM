@@ -790,7 +790,7 @@ class MapView extends StatefulWidget {
 
   /// `--dart-define=fosm.initialLaneWidth=N` overrides the width the
   /// adaptive budget runs at before the link has been measured (the cold
-  /// first wave) for measurement A/B runs (0 = shipped default 6).
+  /// first wave) for measurement A/B runs (0 = shipped default 4).
   static const int _initialLaneWidthDefine =
       int.fromEnvironment('fosm.initialLaneWidth');
 
