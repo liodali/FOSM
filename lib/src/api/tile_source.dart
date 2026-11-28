@@ -176,11 +176,17 @@ Future<FetchedDocument> downloadDocument(
       throw const TileLoadException(
           TileFailureKind.timeout, 'Map request timed out');
     });
+    final bytes = response.data;
+    if (bytes == null || bytes.isEmpty) {
+      throw TileLoadException(TileFailureKind.http,
+          'Map server rejected the request',
+          statusCode: response.statusCode);
+    }
     return FetchedDocument(
-      Uint8List.fromList(response.data!),
+      Uint8List.fromList(bytes),
       freshnessFromHeaders(
-        cacheControl: response.headers.value('cache-control'),
-        age: response.headers.value('age'),
+        cacheControl: _joinedHeader(response.headers, 'cache-control'),
+        age: _joinedHeader(response.headers, 'age'),
       ),
     );
   } on DioException catch (error) {
@@ -201,13 +207,25 @@ Future<FetchedDocument> downloadDocument(
           TileFailureKind.cancelled => 'Map request cancelled',
           _ => 'Unable to download map data',
         },
-        statusCode: error.response?.statusCode);
+        statusCode: error.response?.statusCode,
+        cause: error);
   } catch (error) {
     throw TileLoadException.from(error);
   } finally {
     handle?.detach();
     requestSession?.remove(cancel);
   }
+}
+
+/// Joins every value a response carries for [name]: servers may repeat a
+/// header — Cloudflare currently answers OpenFreeMap documents with
+/// `cache-control: max-age=…` next to its own `cache-control: public` — and
+/// dio's [Headers.value] throws on those. Joined values parse the same way:
+/// [freshnessFromHeaders] splits directives on commas.
+String? _joinedHeader(Headers headers, String name) {
+  final values = headers[name];
+  if (values == null || values.isEmpty) return null;
+  return values.join(', ');
 }
 
 /// Builds the canonical OSM tile URL for ([z], [x], [y]).
